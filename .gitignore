@@ -1,0 +1,8 @@
+.bsp
+.metals
+.vscode
+.xmake
+out/
+build/
+.mill-cache/
+.xmake/
