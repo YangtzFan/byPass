@@ -23,6 +23,13 @@ class EX extends Module {
     val redirect_addr = Output(UInt(32.W)) // 正确的 PC 目标地址
   })
 
+  // ---- BHT 更新端口：EX 阶段解析分支结果后更新 BHT ----
+  val bht_update = IO(new Bundle {
+    val valid = Output(Bool())        // 有 B-type 分支需要更新
+    val idx   = Output(UInt(6.W))     // PC[7:2] 索引
+    val taken = Output(Bool())        // 实际是否跳转
+  })
+
   val funct3 = in.bits.inst(14, 12)
   val rd = in.bits.inst(11, 7)
   val rs1 = in.bits.inst(19, 15)  // 当前指令的源寄存器 1 编号
@@ -118,6 +125,11 @@ class EX extends Module {
   val b_correct_addr = Mux(branch_taken, b_target_ex, in.bits.inst_addr + 4.U(32.W))
   flush_io.enable := in.valid && (b_mispredict || jalr)
   flush_io.redirect_addr := Mux(jalr, jalr_target, b_correct_addr)
+
+  // BHT 更新：每当 B-type 分支在 EX 阶段解析后，将实际结果写回 BHT
+  bht_update.valid := in.valid && bType
+  bht_update.idx   := in.bits.inst_addr(7, 2)  // PC[7:2] 索引 64 项
+  bht_update.taken := branch_taken              // 实际是否跳转
 
   in.ready := out.ready
   out.valid := in.valid

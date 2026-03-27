@@ -57,6 +57,12 @@ class myCPU extends Module {
   uREG.io.reg_wdata_i  := io.wb_reg_wdata
   uREG.io.reg_wen_i    := io.wb_reg_wen
 
+  // ---- BHT 动态分支预测器 ----
+  // 64 项 2-bit 饱和计数器，用 PC[7:2] 索引
+  val uBHT = Module(new BHT(64))
+  uBHT.io.read_idx := uIfIdDff.out.bits.inst_addr(7, 2) // ID 阶段用当前指令 PC 查询
+  uID.io.bht_predict_taken := uBHT.io.predict_taken      // BHT 预测结果传给 ID
+
   // ------------ ID - END ------------
 
   val uIdExDff = Module(new BaseDff(new ID_EX_Payload, supportFlush = true))
@@ -82,6 +88,11 @@ class myCPU extends Module {
 
   val uEX = Module(new EX)
   uEX.in <> uIdExDff.out
+
+  // BHT 更新：EX 阶段 B-type 分支解析结果写回 BHT
+  uBHT.io.update_valid := uEX.bht_update.valid
+  uBHT.io.update_idx   := uEX.bht_update.idx
+  uBHT.io.update_taken := uEX.bht_update.taken
 
   // ------------ EX - END ------------
 
