@@ -1,71 +1,78 @@
 import chisel3._
 import chisel3.util._
+import utils._
 
 class dram_driver extends Module {
   val io = IO(new Bundle {
-    val perip_addr = Input(UInt(18.W))
+    val perip_addr  = Input(UInt(18.W))
     val perip_wdata = Input(UInt(32.W))
-    val perip_mask = Input(UInt(3.W))
-    val dram_wen = Input(Bool())
+    val perip_mask  = Input(UInt(3.W))
+    val dram_wen    = Input(Bool())
     val perip_rdata = Output(UInt(32.W))
   })
 
-  val dramAddr = io.perip_addr(17, 2)
-  val offset = io.perip_addr(1, 0)
+  // ------------------------------
+  // 基础地址拆分
+  // ------------------------------
+  val wordAddr = io.perip_addr(17, 2) // 按字寻址
+  val byteOff  = io.perip_addr(1, 0)  // 字内字节偏移
 
+  val isByte     = io.perip_mask(1, 0) === "b00".U
+  val isHalf     = io.perip_mask(1, 0) === "b01".U
+  val isWord     = io.perip_mask(1, 0) === "b10".U
+  val isUnsigned = io.perip_mask(2) // 仅对读有效
+
+  // ------------------------------
+  // 小工具函数
+  // ------------------------------
+  private def extend(x: UInt, unsigned: Bool): UInt = Mux(unsigned, unsignExtend(x), signExtend(x)) 
+  private def toBytes(x: UInt): Vec[UInt] = // 把一个 32 位字拆成 4 个字节，bytes(0) 对应最低字节
+    VecInit.tabulate(4)(i => x(8 * i + 7, 8 * i))
+  private def fromBytes(bytes: Seq[UInt]): UInt = // 把 4 个字节重新拼成 32 位字，bytes(0) 放最低位
+    Cat(bytes.reverse)
+
+  // ------------------------------
+  // DRAM 实例
+  // ------------------------------
   val memDram = Module(new DRAM)
-  memDram.io.a := dramAddr
+  memDram.io.a  := wordAddr
   memDram.io.we := io.dram_wen
+  val rawData = memDram.io.spo // 读/写 状态下获得到的原始数据
 
-  val dramRdataRaw = memDram.io.spo
+  val dramBytes  = toBytes(rawData)
+  val writeBytes = toBytes(io.perip_wdata)
 
-  val lbLbuSb = io.perip_mask(1, 0) === "b00".U
-  val lhLhuSh = io.perip_mask(1, 0) === "b01".U
-  val lb = lbLbuSb && !io.perip_mask(2)
-  val lbu = lbLbuSb && io.perip_mask(2)
-  val lh = lhLhuSh && !io.perip_mask(2)
-  val lhu = lhLhuSh && io.perip_mask(2)
-  val lwSw = io.perip_mask(1, 0) === "b10".U
+  // ------------------------------
+  // 读数据路径
+  // ------------------------------
+  val selectedByte = dramBytes(byteOff)
+  val selectedHalf = Mux(byteOff(1), Cat(dramBytes(3), dramBytes(2)), Cat(dramBytes(1), dramBytes(0)))
+  val selectedWord = rawData
+  io.perip_rdata := MuxCase(0.U, Seq(
+    isByte -> extend(selectedByte, isUnsigned),
+    isHalf -> extend(selectedHalf, isUnsigned),
+    isWord -> selectedWord
+  ))
 
-  val offset00 = offset === "b00".U
-  val offset01 = offset === "b01".U
-  val offset10 = offset === "b10".U
-  val offset11 = offset === "b11".U
+  // ------------------------------
+  // 写数据路径（先默认保持原 DRAM 字节不变，按 SB / SH / SW 覆盖相应字节）
+  // ------------------------------
+  val mergedBytes = Wire(Vec(4, UInt(8.W)))
+  mergedBytes := dramBytes
 
-  val readdata8 = Mux1H(
-    Seq(
-      offset00 -> dramRdataRaw(7, 0),
-      offset01 -> dramRdataRaw(15, 8),
-      offset10 -> dramRdataRaw(23, 16),
-      offset11 -> dramRdataRaw(31, 24)
-    )
-  )
-  val extension24 = Mux(lb, Fill(24, readdata8(7)), Mux(lbu, 0.U(24.W), 0.U(24.W)))
+  when (isByte) {
+    mergedBytes(byteOff) := writeBytes(0)
+  } .elsewhen (isHalf) {
+    when (byteOff(1)) {
+      mergedBytes(2) := writeBytes(0)
+      mergedBytes(3) := writeBytes(1)
+    } .otherwise {
+      mergedBytes(0) := writeBytes(0)
+      mergedBytes(1) := writeBytes(1)
+    }
+  } .elsewhen (isWord) {
+    mergedBytes := writeBytes
+  }
 
-  val readdata16 = Mux(offset(1), dramRdataRaw(31, 16), dramRdataRaw(15, 0))
-  val extension16 = Mux(lh, Fill(16, readdata16(15)), Mux(lhu, 0.U(16.W), 0.U(16.W)))
-
-  val dout = Mux(lbLbuSb, Cat(extension24, readdata8), Mux(lhLhuSh, Cat(extension16, readdata16), Mux(lwSw, dramRdataRaw, 0.U)))
-  io.perip_rdata := dout
-
-  val dramDataSb = Mux1H(
-    Seq(
-      offset00 -> Cat(dramRdataRaw(31, 8), io.perip_wdata(7, 0)),
-      offset01 -> Cat(dramRdataRaw(31, 16), io.perip_wdata(7, 0), dramRdataRaw(7, 0)),
-      offset10 -> Cat(dramRdataRaw(31, 24), io.perip_wdata(7, 0), dramRdataRaw(15, 0)),
-      offset11 -> Cat(io.perip_wdata(7, 0), dramRdataRaw(23, 0))
-    )
-  )
-
-  val dramData = Mux(
-    lwSw,
-    io.perip_wdata,
-    Mux(
-      lhLhuSh,
-      Mux(offset(1), Cat(io.perip_wdata(15, 0), dramRdataRaw(15, 0)), Cat(dramRdataRaw(31, 16), io.perip_wdata(15, 0))),
-      dramDataSb
-    )
-  )
-
-  memDram.io.d := dramData
+  memDram.io.d := fromBytes(mergedBytes)
 }
