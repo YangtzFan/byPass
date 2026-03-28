@@ -1,6 +1,8 @@
+package mycpu.memory
+
 import chisel3._
 import chisel3.util._
-import utils._
+import mycpu.device.utils._
 
 class dram_driver extends Module {
   val io = IO(new Bundle {

@@ -1,4 +1,9 @@
+package mycpu
+
 import chisel3._
+import chisel3.util.log2Ceil
+import mycpu.dataLane._
+import mycpu.device._
 
 class myCPU extends Module {
   val io = IO(new Bundle {
@@ -42,7 +47,7 @@ class myCPU extends Module {
 
   val uIfIdDff = Module(new BaseDff(new IF_ID_Payload, supportFlush = true))
   uIfIdDff.in <> uIF.out // DecoupledIO 耦合上一级
-  uIfIdDff.flush.get := exPipelineFlushEnable || idJumpEnable // 预测跳转时，执行流水线冲刷，防止取一条不相关的指令
+  uIfIdDff.flush.get := exPipelineFlushEnable || idJumpEnable // 预测跳转时，冲刷本流水寄存器，防止取一条不相关的指令
 
   // ------------ ID - BEG ------------
 
@@ -57,11 +62,12 @@ class myCPU extends Module {
   uREG.io.reg_wdata_i  := io.wb_reg_wdata
   uREG.io.reg_wen_i    := io.wb_reg_wen
 
-  // ---- BHT 动态分支预测器 ----
-  // 64 项 2-bit 饱和计数器，用 PC[7:2] 索引
-  val uBHT = Module(new BHT(64))
-  uBHT.io.read_idx := uIfIdDff.out.bits.inst_addr(7, 2) // ID 阶段用当前指令 PC 查询
-  uID.io.bht_predict_taken := uBHT.io.predict_taken      // BHT 预测结果传给 ID
+  // ---- 分支预测器（根据 CPUConfig 选择性生成）----
+  val uBHT = Option.when(CPUConfig.useBHT)(Module(new BHT(CPUConfig.bhtEntries)))
+  if (CPUConfig.useBHT) {
+    uBHT.get.io.read_idx := uIfIdDff.out.bits.inst_addr(log2Ceil(CPUConfig.bhtEntries) + 1, 2)
+    uID.bht_predict_taken.get := uBHT.get.io.predict_taken
+  }
 
   // ------------ ID - END ------------
 
@@ -89,10 +95,12 @@ class myCPU extends Module {
   val uEX = Module(new EX)
   uEX.in <> uIdExDff.out
 
-  // BHT 更新：EX 阶段 B-type 分支解析结果写回 BHT
-  uBHT.io.update_valid := uEX.bht_update.valid
-  uBHT.io.update_idx   := uEX.bht_update.idx
-  uBHT.io.update_taken := uEX.bht_update.taken
+  // BHT 更新：EX 阶段 B-type 分支解析结果写回 BHT（仅 DynamicBHT 模式）
+  if(CPUConfig.useBHT){
+    uBHT.get.io.update_valid := uEX.bht_update.get.valid
+    uBHT.get.io.update_idx   := uEX.bht_update.get.idx
+    uBHT.get.io.update_taken := uEX.bht_update.get.taken
+  }
 
   // ------------ EX - END ------------
 

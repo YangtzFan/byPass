@@ -20,7 +20,7 @@ target("rtl", function()
             "-Dirom.bin.name=" .. selected_test,
             "-i",
             "chiselTemplate.runMain",
-            "GenerateVerilog",
+            "mycpu.GenerateVerilog",
             "--target",
             "systemverilog",
             "--split-verilog",

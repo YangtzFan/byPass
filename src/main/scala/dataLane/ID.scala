@@ -1,6 +1,9 @@
+package mycpu.dataLane
+
 import chisel3._
 import chisel3.util._
-import chisel3.util._
+import mycpu.CPUConfig
+import mycpu.device.SE
 
 class ID extends Module {
   val in = IO(Flipped(Decoupled(new IF_ID_Payload)))
@@ -14,8 +17,10 @@ class ID extends Module {
     val use_rs2_o = Output(Bool())
     val predict_jump = Output(Bool())       // 预测跳转使能
     val predict_target = Output(UInt(32.W)) // 预测跳转目标地址
-    val bht_predict_taken = Input(Bool())   // BHT 动态预测结果（B-type 用）
   })
+
+  // BHT 动态预测输入端口（仅当 CPUConfig.useBHT 时生成）
+  val bht_predict_taken = Option.when(CPUConfig.useBHT)(IO(Input(Bool())))
 
   val opcode = in.bits.inst(6, 0)
   val rd = in.bits.inst(11, 7)
@@ -60,15 +65,18 @@ class ID extends Module {
   out.bits.imm := uSE.io.imm_o
   out.bits.type_decode_together := type_decode_together
 
-  // ---- 动态分支预测 (2-bit BHT) 在 ID 阶段执行 ----
-  val jal_target = in.bits.inst_addr + uSE.io.imm_o // JAL 跳转目标 = PC + J_imm（SE 已计算出 JAL 立即数）
-  val b_target = in.bits.inst_addr + uSE.io.imm_o // B-type 跳转目标 = PC + B_imm
+  // ---- 分支预测（根据 CPUConfig 选择性生成）----
+  val jal_target = in.bits.inst_addr + uSE.io.imm_o // JAL 跳转目标 = PC + J_imm
+  val b_target = in.bits.inst_addr + uSE.io.imm_o   // B-type 跳转目标 = PC + B_imm
 
-  // 预测策略:
-  // - JAL: 无条件跳转，始终预测 taken
-  // - B-type: 使用 BHT 2-bit 饱和计数器动态预测（替代原来的 BTFN 静态策略）
-  // - JALR: 目标依赖寄存器值，不预测，在 EX 阶段解决
-  val b_predict_taken = bType && io.bht_predict_taken  // 用 BHT 动态预测替代 BTFN
+  // B-type 预测策略：
+  // - DynamicBHT: 使用 2-bit 饱和计数器动态预测
+  // - StaticBTFN: 向后跳转预测 taken，向前预测 not-taken
+  val b_predict_taken = if (CPUConfig.useBHT) {
+    bType && bht_predict_taken.get  // BHT 动态预测
+  } else {
+    bType && uSE.io.imm_o(31)      // BTFN: B_imm 符号位=1 → 向后跳转
+  }
   val predict_taken = jal || b_predict_taken // JAL 必定跳转
   io.predict_jump := predict_taken
   io.predict_target := Mux(jal, jal_target, b_target)

@@ -1,3 +1,5 @@
+package mycpu
+
 import chisel3.stage.ChiselGeneratorAnnotation
 import circt.stage.ChiselStage
 
@@ -11,7 +13,7 @@ object GenerateVerilog extends App {
     Option(System.getenv("IROM_BIN"))
       .map(_.trim)
       .filter(_.nonEmpty)
-      .getOrElse("andi")
+      .getOrElse("and")
 
   System.setProperty("irom.bin.name", selectedBin)
 

@@ -1,3 +1,5 @@
+package mycpu.device
+
 import chisel3._
 
 class REG extends Module {

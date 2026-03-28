@@ -1,3 +1,5 @@
+package mycpu.device
+
 import chisel3._
 import chisel3.util._
 import os.Source.WritableSource
@@ -12,11 +14,8 @@ import utils._
   * - S-type  : Store 类立即数
   * - L-type  : Load 类指令的 I-type 立即数
   * - I-type  : 算术/逻辑立即数
-  * - JAL     : 这里特殊处理为输出 4（用于写回 PC + 4）
-  * - JALR    : 这里特殊处理为输出 4（用于写回 PC + 4）
-  *
-  * 注意：JAL/JALR 并没有真正生成跳转偏移立即数，而是直接输出 4，用于 rd <- PC + 4 的写回数据。
-  * JAL/JALR 的跳转目标地址生成逻辑应当在别处完成。
+  * - JAL     : 分支偏移立即数
+  * - JALR    : I-type 偏移量
   */
 
 class SE extends Module {

@@ -1,4 +1,7 @@
+package mycpu
+
 import chisel3._
+import mycpu.memory._
 
 class SoC_Top extends Module {
   val io = IO(new Bundle {
