@@ -2,32 +2,33 @@ package mycpu.dataLane
 
 import chisel3._
 import chisel3.util._
+import mycpu.CPUConfig
 
+// ============================================================================
+// WB（写回阶段）—— 标记 ROB 表项完成
+// ============================================================================
+// 注意：这里 **不** 直接写寄存器堆！
+// WB 的职责是通知 ROB “这条指令已经执行完毕”，并将结果写入 ROB 表项
+// 真正写入寄存器堆的操作在 Commit 阶段完成（保证顺序提交语义）
+// ============================================================================
 class WB extends Module {
-  val in = IO(Flipped(Decoupled(new MEM_WB_Payload)))
-  val io = IO(new Bundle {
-    val inst_bubble_ifornot = Output(Bool())
-    val inst_addr = Output(UInt(32.W))
-    val inst_rd = Output(UInt(5.W))
-    val data = Output(UInt(32.W))
-    val reg_wen = Output(Bool())
-  })
+  val in = IO(Flipped(Decoupled(new MEM_WB_Payload)))  // 输入：来自 MEM/WB 流水线寄存器
+  val flush = IO(Input(Bool()))                         // 全局 flush 信号
 
-  val uType = in.bits.type_decode_together(8)
-  val jal = in.bits.type_decode_together(7)
-  val jalr = in.bits.type_decode_together(6)
-  val lType = in.bits.type_decode_together(4)
-  val iType = in.bits.type_decode_together(3)
-  val rType = in.bits.type_decode_together(1)
-  val other = in.bits.type_decode_together(0)
+  // ---- ROB 完成标记接口（使用打包 Bundle）----
+  val robWb = IO(new ROBWbIO)
 
-  // 必须用 in.valid 门控所有输出：当流水线中有气泡（valid=false）时，
-  // BaseDff 的 bitsReg 仍保留旧数据，不检查 valid 会输出过时的指令信息
-  io.inst_bubble_ifornot := in.valid && in.bits.type_decode_together(8, 0).orR
-  io.inst_addr := in.bits.inst_addr
-  io.inst_rd := in.bits.inst_rd
-  io.data := in.bits.data
-  io.reg_wen := in.valid && (uType || jal || jalr || lType || iType || rType)
+  // ROB 完成：组合逻辑直接透传（与 MEM/WB 输出同周期）
+  // flush 时不标记完成，防止错误路径的执行结果污染 ROB
+  robWb.valid := in.valid && !flush
+  robWb.idx := in.bits.robIdx
+  robWb.result := in.bits.data
+  robWb.actualTaken := in.bits.actual_taken
+  robWb.actualTarget := in.bits.actual_target
+  robWb.mispredict := in.bits.mispredict
+  robWb.storeAddr := in.bits.store_addr
+  robWb.storeData := in.bits.store_data
+  robWb.storeMask := in.bits.store_mask
 
-  in.ready := true.B
+  in.ready := true.B  // WB 始终准备好接收
 }

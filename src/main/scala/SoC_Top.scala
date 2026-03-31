@@ -3,49 +3,51 @@ package mycpu
 import chisel3._
 import mycpu.memory._
 
+// ============================================================================
+// SoC_Top —— 片上系统顶层模块
+// ============================================================================
+// 将 CPU 核心、指令存储器（IROM）、数据存储器驱动（DRAM driver）连接在一起
+// 并对外暴露 difftest 调试接口
+// ============================================================================
 class SoC_Top extends Module {
   val io = IO(new Bundle {
-    val debug_wb_have_inst = Output(Bool())
-    val debug_wb_pc = Output(UInt(32.W))
-    val debug_wb_ena = Output(Bool())
-    val debug_wb_reg = Output(UInt(5.W))
-    val debug_wb_value = Output(UInt(32.W))
+    // ---- difftest 调试观测端口（供仿真框架对比验证）----
+    val debug_wb_have_inst = Output(Bool())    // 本周期是否有指令提交
+    val debug_wb_pc = Output(UInt(32.W))       // 提交指令的 PC
+    val debug_wb_ena = Output(Bool())          // 是否写寄存器
+    val debug_wb_reg = Output(UInt(5.W))       // 写入的寄存器编号
+    val debug_wb_value = Output(UInt(32.W))    // 写入的数据值
   })
 
-  val instAddr = Wire(UInt(32.W))
-  val instData = Wire(UInt(32.W))
-
-  val dataAddr = Wire(UInt(32.W))
-  val dataWen = Wire(Bool())
-  val dataMask = Wire(UInt(3.W))
-  val dataW = Wire(UInt(32.W))
-  val dataR = Wire(UInt(32.W))
-
+  // CPU 核心实例
   val coreCpu = Module(new myCPU)
 
-  instAddr := coreCpu.io.inst_addr_o
-  coreCpu.io.inst_i := instData
-
-  dataAddr := coreCpu.io.ram_addr_o
-  dataWen := coreCpu.io.ram_wen_o
-  dataMask := coreCpu.io.ram_mask_o
-  dataW := coreCpu.io.ram_wdata_o
-  coreCpu.io.ram_rdata_i := dataR
-
-  io.debug_wb_have_inst := coreCpu.io.wb_inst_bubble_ifornot
-  io.debug_wb_pc := coreCpu.io.wb_inst_addr
-  io.debug_wb_ena := coreCpu.io.wb_reg_wen
-  io.debug_wb_reg := coreCpu.io.wb_reg_waddr
-  io.debug_wb_value := coreCpu.io.wb_reg_wdata
-
+  // ---- IROM（指令 ROM，只读）----
+  // 128 位宽单读端口，每次返回 4 条指令
   val memIrom = Module(new IROM)
-  memIrom.io.a := instAddr(17, 2)
-  instData := memIrom.io.spo
+  memIrom.io.a := coreCpu.io.inst_addr_o       // CPU 输出 14 位地址
+  coreCpu.io.inst_i := memIrom.io.spo          // IROM 返回 128 位指令数据
 
+  // ---- DRAM 驱动器（数据存储器读写控制）----
+  // DRAM 的读写端口被 Load 和 Store 共享，通过 MUX 切换
+  // Store 优先（Commit 阶段写入时，地址/掩码切换为 Store 的）
   val uDramDriver = Module(new dram_driver)
-  uDramDriver.io.perip_addr := dataAddr(17, 0)
-  uDramDriver.io.perip_wdata := dataW
-  uDramDriver.io.perip_mask := dataMask
-  uDramDriver.io.dram_wen := dataWen
-  dataR := uDramDriver.io.perip_rdata
+
+  // 地址和掩码：Store 优先于 Load
+  uDramDriver.io.perip_addr := Mux(coreCpu.io.commit_ram_wen_o,
+    coreCpu.io.commit_ram_addr_o(17, 0),       // Store 地址
+    coreCpu.io.ram_addr_o(17, 0))              // Load 地址
+  uDramDriver.io.perip_wdata := coreCpu.io.commit_ram_wdata_o  // Store 写数据
+  uDramDriver.io.perip_mask := Mux(coreCpu.io.commit_ram_wen_o,
+    coreCpu.io.commit_ram_mask_o,              // Store 宽度掩码
+    coreCpu.io.ram_mask_o)                     // Load 宽度掩码
+  uDramDriver.io.dram_wen := coreCpu.io.commit_ram_wen_o       // 写使能
+  coreCpu.io.ram_rdata_i := uDramDriver.io.perip_rdata         // DRAM 读回数据
+
+  // ---- Commit 阶段调试观测 ----
+  io.debug_wb_have_inst := coreCpu.io.commit_valid
+  io.debug_wb_pc := coreCpu.io.commit_pc
+  io.debug_wb_ena := coreCpu.io.commit_reg_wen
+  io.debug_wb_reg := coreCpu.io.commit_reg_waddr
+  io.debug_wb_value := coreCpu.io.commit_reg_wdata
 }

@@ -11,24 +11,19 @@ class BHT(entries: Int = 64) extends Module {
   val idxWidth = log2Ceil(entries)
 
   val io = IO(new Bundle {
-    // 读端口：ID 阶段用 PC 索引查询预测结果
+    // 读端口：Decode 阶段用 PC 索引查询预测结果
     val read_idx       = Input(UInt(idxWidth.W))
-    val predict_taken  = Output(Bool())
+    val predict_taken  = Output(UInt(2.W))
 
-    // 写端口：EX 阶段用分支实际结果更新计数器
+    // 写端口：Execute 阶段用分支实际结果更新计数器
     val update_valid   = Input(Bool())
     val update_idx     = Input(UInt(idxWidth.W))
     val update_taken   = Input(Bool())  // 实际是否跳转
   })
 
-  // 初始化为 01 (WNT: Weakly Not-Taken，格雷码)
-  val table = RegInit(VecInit(Seq.fill(entries)(1.U(2.W))))
-
-  // 读：格雷码高位 bit[1] = 1 则预测 taken (WT=11 或 ST=10)
-  io.predict_taken := table(io.read_idx)(1)
-
-  // 写：格雷码状态转移（纯组合逻辑，无加减法器）
-  when(io.update_valid) {
+  val table = RegInit(VecInit(Seq.fill(entries)(1.U(2.W)))) // 初始化为 01 (WNT: Weakly Not-Taken，格雷码)
+  io.predict_taken := table(io.read_idx) // 读：格雷码高位 bit[1] = 1 则预测 taken (WT=11 或 ST=10)
+  when(io.update_valid) { // 写：格雷码状态转移（纯组合逻辑，无加减法器）
     val cur = table(io.update_idx)
     table(io.update_idx) := Mux(io.update_taken,
       Cat(cur(1) | cur(0), !cur(1)),     // taken: SNT→WNT→WT→ST（向 ST 方向移动）

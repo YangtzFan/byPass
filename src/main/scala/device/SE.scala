@@ -24,7 +24,6 @@ class SE extends Module {
     val imm12  = Input(UInt(12.W))
     val imm20  = Input(UInt(20.W))
     val funct7 = Input(UInt(7.W))
-    val funct3 = Input(UInt(3.W)) // 当前版本未使用，保留接口
     val rd     = Input(UInt(5.W))
     val imm_o  = Output(UInt(32.W))
   })
@@ -56,14 +55,13 @@ class SE extends Module {
     0.U(1.W)           // imm[0] = 0
   ))
 
-  // 按优先级选择输出立即数
-  io.imm_o := PriorityMux(Seq(
+  // 输出立即数
+  io.imm_o := MuxCase(0.U(32.W), Seq(
     U_type             -> uImm,
     JAL                -> jImm,
     JALR               -> iImm,
     B_type             -> bImm,
     (L_type || I_type) -> iImm,
-    S_type             -> sImm,
-    true.B             -> 0.U(32.W)
+    S_type             -> sImm
   ))
 }

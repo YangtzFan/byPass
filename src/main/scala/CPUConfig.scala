@@ -1,5 +1,7 @@
 package mycpu
 
+import chisel3.util.log2Ceil
+
 // CPU 全局参数配置
 // 修改此文件中的参数即可切换不同的硬件生成方案
 
@@ -21,6 +23,14 @@ object CPUConfig {
   // 当前 BHT 表项大小（修改这里切换）
   val bhtSize: BHTSize = BHT64
   val bhtEntries: Int = bhtSize.entries
+
+  // ---- ROB 参数 ----
+  val robEntries: Int = 128        // ROB 表项数
+  val robIdxWidth: Int = log2Ceil(robEntries)
+
+  // ---- FetchBuffer 参数 ----
+  val fetchWidth: Int = 4          // 每周期取指宽度
+  val fetchBufferEntries: Int = 16 // FetchBuffer 容量
 
   // ---- 便捷方法 ----
   def useBHT: Boolean  = branchPredictor == DynamicBHT

@@ -1,4 +1,4 @@
-# Five-Stage Pipeline CPU Core in Chisel with cdp-test from HITSZ
+# Seven-Stage Pipeline CPU Core in Chisel with cdp-test verification framework from HITSZ
 
 ## Requirements
 
@@ -56,11 +56,5 @@ Batch simulation logs and summary are written to `build/sim-all`:
 ## Files
 
 - `build.sc`: Mill build definition
-- `src/main/scala/chiseltemplate/Adder.scala`: Example Chisel module
-- `src/main/scala/chiseltemplate/GenerateVerilog.scala`: RTL generation entry
-
-## Next Steps
-
-- Replace `Adder` with your own module
-- Add parameters and custom generators
-- Add tests with chiseltest when needed
+- `src/main/scala/GenerateVerilog.scala`: RTL generation entry
+- `src/main/scala/*`: source code files of Chisel project
