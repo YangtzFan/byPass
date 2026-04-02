@@ -26,11 +26,15 @@ object CPUConfig {
 
   // ---- ROB 参数 ----
   val robEntries: Int = 128        // ROB 表项数
-  val robIdxWidth: Int = log2Ceil(robEntries)
+  val robIdxWidth: Int = log2Ceil(robEntries)   // ROB 索引位宽（7 位）
+  val robPtrWidth: Int = robIdxWidth + 1        // ROB 指针位宽（含回绕位，8 位）
 
   // ---- FetchBuffer 参数 ----
   val fetchWidth: Int = 4          // 每周期取指宽度
   val fetchBufferEntries: Int = 16 // FetchBuffer 容量
+
+  // ---- RenameBuffer 参数 ----
+  val renameBufferEntries: Int = 16 // RenameBuffer 容量（4-in, 1-out）
 
   // ---- 便捷方法 ----
   def useBHT: Boolean  = branchPredictor == DynamicBHT

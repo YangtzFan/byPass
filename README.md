@@ -1,4 +1,4 @@
-# Seven-Stage Pipeline CPU Core in Chisel with cdp-test verification framework from HITSZ
+# Eight-Stage Pipeline CPU Core in Chisel with cdp-test verification framework from HITSZ
 
 ## Requirements
 

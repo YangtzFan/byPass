@@ -6,3 +6,5 @@ out/
 build/
 .mill-cache/
 .xmake/
+tmp
+AGENTS.md
