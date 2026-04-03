@@ -5,13 +5,13 @@ import chisel3.util._
 import mycpu.CPUConfig
 
 // ============================================================================
-// ROB（重排序缓冲区）—— 支持 4-wide 分配 + MEM 阶段回滚
+// ROB（重排序缓冲区）—— 支持 4-wide 分配 + Memory 阶段回滚
 // ============================================================================
-// 核心变更（相比之前）：
-//   - 分配接口从单发 ROBAllocIO 改为 4-wide ROBMultiAllocIO（支持 Rename 4 条/周期）
-//   - 新增 MEM 阶段回滚接口：MEM 检测到预测错误时，回滚 tail 到误预测指令之后，
-//     丢弃所有年轻的错误路径表项
-//   - 移除 Commit 阶段 flush 逻辑（重定向已由 MEM 阶段处理）
+// 变更：
+//   - 分配接口由 Dispatch 阶段驱动（原由 Rename 驱动）
+//   - 完成标记接口改为 ROBRefreshIO（Refresh 阶段标记完成）
+//   - 移除 Store 相关字段（Store 信息由 StoreBuffer 管理）
+//   - Commit 接口不再输出 Store 地址/数据/掩码
 // ============================================================================
 class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
   val idxW = CPUConfig.robIdxWidth  // 索引位宽（7）
@@ -20,13 +20,13 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
     val empty = Output(Bool())
     val full  = Output(Bool())
   })
-  val alloc    = IO(Flipped(new ROBMultiAllocIO)) // Rename 4-wide 分配接口
-  val rollback = IO(new Bundle {            // MEM 阶段回滚接口
+  val alloc    = IO(Flipped(new ROBMultiAllocIO)) // Dispatch 4-wide 分配接口
+  val rollback = IO(new Bundle {                  // Memory 阶段回滚接口
     val valid  = Input(Bool())                        // 回滚使能
     val robIdx = Input(UInt(CPUConfig.robPtrWidth.W)) // 误预测指令的 ROB 指针
   })
-  val wb     = IO(Flipped(new ROBWbIO))         // WB 完成标记接口
-  val commit = IO(new ROBCommitIO)              // 提交接口
+  val refresh = IO(Flipped(new ROBRefreshIO))     // Refresh 阶段完成标记接口
+  val commit  = IO(new ROBCommitIO)               // 提交接口
 
   // 存储阵列和指针
   val rob = RegInit(VecInit(Seq.fill(entries)(0.U.asTypeOf(new ROBEntry))))
@@ -41,7 +41,9 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
   io.empty := empty
   io.full  := full
 
-  alloc.canAlloc := entries.U - count >= alloc.request // 检查剩余空间是否足够分配 request 条表项
+  // canAlloc 不依赖 request，避免与 Dispatch 形成组合环路
+  // 只要空闲空间 >= 4（最大发射宽度），即可分配
+  alloc.canAlloc := count +& 4.U <= entries.U
   for (i <- 0 until 4) { // 返回连续的 ROB 指针（从当前 tail 开始）
     alloc.idxs(i) := tail + i.U
   }
@@ -60,9 +62,6 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
   commit.regWen       := headEntry.regWriteEnable && canCommit
   commit.result       := headEntry.result
   commit.isStore      := headEntry.isStore
-  commit.storeAddr    := headEntry.store_addr
-  commit.storeData    := headEntry.store_data
-  commit.storeMask    := headEntry.store_mask
   commit.isBranch     := headEntry.isBranch
   commit.isJump       := headEntry.isJump
   commit.mispredict   := headEntry.mispredict && canCommit
@@ -71,9 +70,9 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
   commit.predictTaken := headEntry.predict_taken
   commit.bhtMeta      := headEntry.bht_meta
 
-  // ===================== MEM 阶段回滚逻辑 =====================
-  // 当 MEM 检测到分支预测错误时，将 tail 回滚到误预测指令的下一位，
-  // 丢弃所有年轻的错误路径表项。误预测指令本身保留（等待 WB 标记 done 后正常提交）。
+  // ===================== Memory 阶段回滚逻辑 =====================
+  // 当 Memory 检测到分支预测错误时，将 tail 回滚到误预测指令的下一位，
+  // 丢弃所有年轻的错误路径表项。误预测指令本身保留（等待 Refresh 标记 done 后正常提交）。
   when(rollback.valid) {
     tail := rollback.robIdx + 1.U
   }.otherwise {
@@ -99,9 +98,6 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
           entry.actual_target  := 0.U
           entry.mispredict     := false.B
           entry.exception      := false.B
-          entry.store_addr     := 0.U
-          entry.store_data     := 0.U
-          entry.store_mask     := 0.U
           entry.bht_meta       := alloc.data(i).bhtMeta
         }
       }
@@ -109,17 +105,14 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
     }
   }
 
-  // ===================== WB 完成标记 =====================
-  when(wb.valid) {
-    val wbEntry = rob(idx(wb.idx))
-    wbEntry.done          := true.B
-    wbEntry.result        := wb.result
-    wbEntry.actual_taken  := wb.actualTaken
-    wbEntry.actual_target := wb.actualTarget
-    wbEntry.mispredict    := wb.mispredict
-    wbEntry.store_addr    := wb.storeAddr
-    wbEntry.store_data    := wb.storeData
-    wbEntry.store_mask    := wb.storeMask
+  // ===================== Refresh 阶段完成标记 =====================
+  when(refresh.valid) {
+    val refEntry = rob(idx(refresh.idx))
+    refEntry.done          := true.B
+    refEntry.result        := refresh.result
+    refEntry.actual_taken  := refresh.actualTaken
+    refEntry.actual_target := refresh.actualTarget
+    refEntry.mispredict    := refresh.mispredict
   }
 
   // ===================== 提交指针更新 =====================

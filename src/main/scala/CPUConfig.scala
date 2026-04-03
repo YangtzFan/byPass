@@ -33,8 +33,13 @@ object CPUConfig {
   val fetchWidth: Int = 4          // 每周期取指宽度
   val fetchBufferEntries: Int = 16 // FetchBuffer 容量
 
-  // ---- RenameBuffer 参数 ----
-  val renameBufferEntries: Int = 16 // RenameBuffer 容量（4-in, 1-out）
+  // ---- IssueQueue 参数 ----
+  val issueQueueEntries: Int = 16  // IssueQueue 容量（4-in, 4-out 预留，当前单发射仅用 1-out）
+
+  // ---- StoreBuffer 参数 ----
+  val sbEntries: Int = 32                          // StoreBuffer 深度
+  val sbIdxWidth: Int = log2Ceil(sbEntries)        // StoreBuffer 索引位宽（5 位）
+  val sbPtrWidth: Int = sbIdxWidth + 1             // StoreBuffer 指针位宽（含回绕位，6 位）
 
   // ---- 便捷方法 ----
   def useBHT: Boolean  = branchPredictor == DynamicBHT

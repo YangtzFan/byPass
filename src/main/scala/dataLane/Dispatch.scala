@@ -5,80 +5,124 @@ import chisel3.util._
 import mycpu.CPUConfig
 
 // ============================================================================
-// Dispatch（派发阶段）—— 宽度 1
+// Dispatch（派发阶段）—— 4-wide，负责 ROB 分配 + StoreBuffer 分配
 // ============================================================================
-// 从 RenameBuffer 取出 1 条已分配 ROB 索引的指令，读取寄存器堆，
-// 然后传给 Execute 阶段。
+// 从 RenDisDff 接收最多 4 条指令，为每条指令分配 ROB 表项，
+// 为 Store 指令分配 StoreBuffer 表项，然后输出到 IssueQueue。
 //
-// 变更（相比之前）：
-//   - 输入从 Decode_Dispatch_Payload 改为 RenameEntry（含 robIdx、regWriteEnable）
-//   - ROB 分配已移至 Rename 阶段，Dispatch 不再分配 ROB
-//   - Load-Use 冒险检测从 Decode 移至此处，检测到时对 RenameBuffer 施加背压
+// 派遣数量计算：
+//   dispatch_n = min(valid_rename_n, rob_free_n, iq_free_n)
+//   其中 valid_rename_n 是上游有效指令数，
+//   rob_free_n 是 ROB 空闲表项数（由 ROB 的 canAlloc 间接保证），
+//   iq_free_n 是 IssueQueue 空闲槽位数。
+//
+// 停顿条件：
+//   - ROB 无法分配足够表项
+//   - IssueQueue 空间不足
+//   - StoreBuffer 空间不足（当有 Store 指令时）
 // ============================================================================
 class Dispatch extends Module {
-  val in  = IO(Flipped(Decoupled(new RenameEntry)))     // 输入：来自 RenameBuffer
-  val out = IO(Decoupled(new Dispatch_Execute_Payload)) // 输出：派发结果
-  val flush = IO(Input(Bool()))                         // 流水线冲刷信号
+  val in  = IO(Flipped(Decoupled(new Rename_Dispatch_Payload)))   // 输入：来自 RenDisDff
+  val out = IO(Decoupled(new DispatchPacket))                     // 输出：送入 IssueQueue
+  val flush = IO(Input(Bool()))                                   // 流水线冲刷信号
 
-  // ---- 寄存器堆读取接口 ----
-  val regRead = IO(new Bundle {
-    val raddr1 = Output(UInt(5.W))   // 读 rs1 地址
-    val raddr2 = Output(UInt(5.W))   // 读 rs2 地址
-    val rdata1 = Input(UInt(32.W))   // rs1 数据
-    val rdata2 = Input(UInt(32.W))   // rs2 数据
+  // ---- ROB 4-wide 分配接口 ----
+  val robAlloc = IO(new ROBMultiAllocIO)
+
+  // ---- StoreBuffer 分配接口 ----
+  val sbAlloc = IO(new Bundle {
+    val request  = Output(UInt(3.W))                                  // 请求分配的 StoreBuffer 表项数量
+    val canAlloc = Input(Bool())                                      // StoreBuffer 是否有足够空间
+    val idxs     = Input(Vec(4, UInt(CPUConfig.sbPtrWidth.W)))        // StoreBuffer 返回的分配指针
   })
 
-  // ---- Load-Use 冒险检测接口 ----
-  // 从 DispExDff 获取正在执行的指令信息，检测是否存在 Load-Use 数据依赖
-  val hazard = IO(new Bundle {
-    val ex_rd     = Input(UInt(5.W))    // Execute 阶段指令的目标寄存器编号
-    val ex_isLoad = Input(Bool())       // 该指令是否为 Load
-    val ex_valid  = Input(Bool())       // 该流水级是否有有效指令
-  })
+  // ---- IssueQueue 空间查询接口 ----
+  val iqFreeCount = IO(Input(UInt((log2Ceil(CPUConfig.issueQueueEntries) + 1).W)))
 
-  // ---- 指令字段提取 ----
-  val inst = in.bits.inst
-  val rs1  = inst(19, 15)
-  val rs2  = inst(24, 20)
+  // ---- 统计当前批次中 Store 指令的数量 ----
+  val storeCount = Wire(UInt(3.W))
+  val isStoreVec = Wire(Vec(4, Bool()))
+  for (i <- 0 until 4) {
+    isStoreVec(i) := in.bits.valid(i) && in.bits.entries(i).type_decode_together(2) // td(2) = sType
+  }
+  storeCount := PopCount(isStoreVec)
 
-  // ---- 指令类型提取（从 9 位独热编码）----
-  val td    = in.bits.type_decode_together
-  val jalr  = td(6)
-  val bType = td(5)
-  val lType = td(4)
-  val iType = td(3)
-  val sType = td(2)
-  val rType = td(1)
+  val validCount = in.bits.count // 有效指令数量
 
-  // ---- Load-Use 冒险检测 ----
-  // 当 DispExDff 中的指令是 Load，且当前指令的源寄存器依赖该 Load 的 rd 时，
-  // 必须暂停一个周期，等待 Load 数据从 MEM 阶段通过旁路转发可用。
-  val use_rs1 = jalr || bType || iType || sType || rType || lType
-  val use_rs2 = bType || sType || rType
-  val loadUseStall = hazard.ex_valid && hazard.ex_isLoad && (hazard.ex_rd =/= 0.U) &&
-    ((use_rs1 && (rs1 === hazard.ex_rd)) ||
-     (use_rs2 && (rs2 === hazard.ex_rd)))
+  // ---- 派遣条件判断 ----
+  // ROB 是否可以容纳所有有效指令
+  val robCanAlloc = robAlloc.canAlloc
+  // IssueQueue 是否有足够空间
+  val iqCanAlloc = iqFreeCount >= validCount
+  // StoreBuffer 是否有足够空间（仅当有 Store 指令时才需要检查）
+  val sbCanAlloc = sbAlloc.canAlloc
+  // 所有资源充足才能派遣
+  val canDispatch = robCanAlloc && iqCanAlloc && sbCanAlloc
 
-  // ---- 寄存器堆读取 ----
-  regRead.raddr1 := Mux(use_rs1, rs1, 0.U)
-  regRead.raddr2 := Mux(use_rs2, rs2, 0.U)
+  // ---- 向 ROB 发送分配请求 ----
+  robAlloc.request := Mux(in.valid && canDispatch && !flush, validCount, 0.U)
 
-  // ---- 输出结果打包 ----
-  out.bits.pc                   := in.bits.pc
-  out.bits.inst                 := in.bits.inst
-  out.bits.robIdx               := in.bits.robIdx            // 由 Rename 阶段分配
-  out.bits.src1Data             := regRead.rdata1            // Dispatch 阶段读取的 rs1 值
-  out.bits.src2Data             := regRead.rdata2            // Dispatch 阶段读取的 rs2 值
-  out.bits.imm                  := in.bits.imm
-  out.bits.type_decode_together := td
-  out.bits.predict_taken        := in.bits.predict_taken
-  out.bits.predict_target       := in.bits.predict_target
-  out.bits.bht_meta             := in.bits.bht_meta
-  out.bits.regWriteEnable       := in.bits.regWriteEnable    // 由 Rename 阶段计算
+  // ---- 向 StoreBuffer 发送分配请求 ----
+  sbAlloc.request := Mux(in.valid && canDispatch && !flush, storeCount, 0.U)
+
+  // ---- 计算每条 Store 指令在 StoreBuffer 分配返回指针中的偏移 ----
+  // sbAlloc.idxs(0..3) 是连续分配的 StoreBuffer 指针，
+  // 需要将它们按 Store 指令出现的先后顺序映射
+  val sbOffsets = Wire(Vec(4, UInt(3.W)))
+  sbOffsets(0) := 0.U
+  for (i <- 1 until 4) {
+    sbOffsets(i) := sbOffsets(i - 1) +& Mux(isStoreVec(i - 1), 1.U, 0.U)
+  }
+
+  // ---- 逐路处理：生成 DispatchEntry + ROBAllocData ----
+  for (i <- 0 until 4) {
+    val entry = in.bits.entries(i)
+    val td    = entry.type_decode_together
+
+    val uType = td(8)
+    val jal   = td(7)
+    val jalr  = td(6)
+    val bType = td(5)
+    val lType = td(4)
+    val iType = td(3)
+    val sType = td(2)
+    val rType = td(1)
+
+    val rd = entry.inst(11, 7) // 目标寄存器编号
+
+    // ---- ROB 分配数据 ----
+    robAlloc.data(i).pc            := entry.pc
+    robAlloc.data(i).inst          := entry.inst
+    robAlloc.data(i).regWen        := entry.regWriteEnable
+    robAlloc.data(i).rd            := rd
+    robAlloc.data(i).isLoad        := lType
+    robAlloc.data(i).isStore       := sType
+    robAlloc.data(i).isBranch      := bType
+    robAlloc.data(i).isJump        := jal || jalr
+    robAlloc.data(i).predictTaken  := entry.predict_taken
+    robAlloc.data(i).predictTarget := entry.predict_target
+    robAlloc.data(i).bhtMeta       := entry.bht_meta
+
+    // ---- 向下游输出 DispatchEntry ----
+    out.bits.entries(i).pc                   := entry.pc
+    out.bits.entries(i).inst                 := entry.inst
+    out.bits.entries(i).imm                  := entry.imm
+    out.bits.entries(i).type_decode_together := td
+    out.bits.entries(i).predict_taken        := entry.predict_taken
+    out.bits.entries(i).predict_target       := entry.predict_target
+    out.bits.entries(i).bht_meta             := entry.bht_meta
+    out.bits.entries(i).robIdx               := robAlloc.idxs(i)  // ROB 返回的指针
+    out.bits.entries(i).regWriteEnable       := entry.regWriteEnable
+    out.bits.entries(i).sbIdx                := sbAlloc.idxs(sbOffsets(i)(1, 0)) // StoreBuffer 返回的指针
+    out.bits.entries(i).isSbAlloc            := sType && in.bits.valid(i) // 仅 Store 指令分配了 StoreBuffer
+  }
+
+  // validMask 和 count 透传
+  out.bits.valid := in.bits.valid
+  out.bits.count := validCount
 
   // ---- 握手信号 ----
-  // Load-Use 停顿时：不从 RenameBuffer 消费、不向 Execute 输出（插入气泡）
-  // flush 时：抑制 out.valid
-  in.ready  := out.ready && !loadUseStall
-  out.valid := in.valid && !loadUseStall && !flush
+  // 任何资源不足时反压上游；flush 时抑制输出
+  in.ready  := out.ready && canDispatch
+  out.valid := in.valid && canDispatch && !flush
 }

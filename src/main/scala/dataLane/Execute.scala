@@ -9,33 +9,43 @@ import mycpu.device.ALU
 // Execute（执行阶段）
 // ============================================================================
 // 主要功能：
-//   1. 数据旁路转发（Forwarding）—— 从 4 个来源获取最新的寄存器值
+//   1. 数据旁路转发（Forwarding）—— 从 3 个来源获取最新的寄存器值
 //   2. ALU 计算 —— 算术/逻辑/地址计算
-//   3. 分支验证 —— 比较 Decode 阶段的预测与实际结果，检测 mispredict
+//   3. 分支验证 —— 比较 Fetch 阶段的预测与实际结果，检测 mispredict
 //   4. BHT 更新 —— 将分支实际结果回写 BHT
+//   5. Store 指令：将地址和数据写入 StoreBuffer（通过顶层连接）
 //
 // 数据旁路优先级（距离 Execute 最近的优先）：
-//   MEM 级 > WB 级 > Commit 级 > Dispatch 阶段读取的寄存器值
+//   Memory 级 > Refresh 级 > Commit 级 > ReadReg 阶段读取的寄存器值（兜底）
 // ============================================================================
 class Execute extends Module {
-  val in = IO(Flipped(Decoupled(new Dispatch_Execute_Payload)))  // 输入：来自 Dispatch
-  val out = IO(Decoupled(new Execute_MEM_Payload))        // 输出：送往 MEM
+  val in = IO(Flipped(Decoupled(new ReadReg_Execute_Payload)))  // 输入：来自 RRExDff（ReadReg 阶段）
+  val out = IO(Decoupled(new Execute_Memory_Payload))           // 输出：送往 ExMemDff → Memory
 
   // ---- 数据旁路转发输入端口 ----
   // 共 3 个转发来源，由 myCPU 顶层连接
   val fwd = IO(new Bundle {
-    // 第 1 级：来自 Execute/MEM 流水线寄存器（Execute 前 1 条指令）
+    // 第 1 级：来自 ExMemDff（Execute 前 1 条指令，即 Memory 阶段正在处理的指令）
     val mem_rd   = Input(UInt(5.W))     // 目标寄存器编号
     val mem_data = Input(UInt(32.W))    // 转发数据
     val mem_wen  = Input(Bool())        // 转发使能
-    // 第 2 级：来自 MEM/WB 流水线寄存器（Execute 前 2 条指令，Load 数据已可用）
-    val wb_rd   = Input(UInt(5.W))
-    val wb_data = Input(UInt(32.W))
-    val wb_wen  = Input(Bool())
+    // 第 2 级：来自 MemRefDff（Memory → Refresh 流水线寄存器，Load 数据已可用）
+    val ref_rd   = Input(UInt(5.W))
+    val ref_data = Input(UInt(32.W))
+    val ref_wen  = Input(Bool())
     // 第 3 级：ROB Commit（同周期正在提交的指令）
     val commit_rd   = Input(UInt(5.W))
     val commit_data = Input(UInt(32.W))
     val commit_wen  = Input(Bool())
+  })
+
+  // ---- StoreBuffer 写入端口（Execute 阶段将 Store 地址和数据写入 StoreBuffer）----
+  val sbWrite = IO(new Bundle {
+    val valid = Output(Bool())                           // 写入使能
+    val idx   = Output(UInt(CPUConfig.sbPtrWidth.W))     // 要写入的 StoreBuffer 表项指针
+    val addr  = Output(UInt(32.W))                       // Store 地址
+    val data  = Output(UInt(32.W))                       // Store 数据
+    val mask  = Output(UInt(3.W))                        // Store 宽度掩码
   })
 
   // ---- BHT 更新端口（仅 useBHT 时生成）----
@@ -69,28 +79,28 @@ class Execute extends Module {
   // ============================================================
   // 数据旁路转发选择 MUX
   // ============================================================
-  // 兜底值来自 Dispatch 阶段的寄存器堆读取（仅 1 拍延迟，经 DispExDff 传入）
+  // 兜底值来自 ReadReg 阶段的寄存器堆读取（经 RRExDff 传入）
 
   // rs1 的旁路匹配检测（按优先级从高到低）
   val fwd_rs1_from_mem = fwd.mem_wen && (fwd.mem_rd =/= 0.U) && (fwd.mem_rd === rs1)
-  val fwd_rs1_from_wb = fwd.wb_wen && (fwd.wb_rd =/= 0.U) && (fwd.wb_rd === rs1)
+  val fwd_rs1_from_ref = fwd.ref_wen && (fwd.ref_rd =/= 0.U) && (fwd.ref_rd === rs1)
   val fwd_rs1_from_commit = fwd.commit_wen && (fwd.commit_rd =/= 0.U) && (fwd.commit_rd === rs1)
   val actual_rdata1 = PriorityMux(Seq(
-    fwd_rs1_from_mem    -> fwd.mem_data,       // 优先级最高：MEM 级
-    fwd_rs1_from_wb     -> fwd.wb_data,        // 第 2 优先
-    fwd_rs1_from_commit -> fwd.commit_data,    // 第 3 优先
-    true.B              -> in.bits.src1Data    // 兜底：Dispatch 阶段读取的值
+    fwd_rs1_from_mem    -> fwd.mem_data,       // 优先级最高：Memory 级
+    fwd_rs1_from_ref    -> fwd.ref_data,       // 第 2 优先：Refresh 级
+    fwd_rs1_from_commit -> fwd.commit_data,    // 第 3 优先：Commit 级
+    true.B              -> in.bits.src1Data    // 兜底：ReadReg 阶段读取的值
   ))
 
   // rs2 的旁路匹配检测（同样优先级规则）
   val fwd_rs2_from_mem = fwd.mem_wen && (fwd.mem_rd =/= 0.U) && (fwd.mem_rd === rs2)
-  val fwd_rs2_from_wb = fwd.wb_wen && (fwd.wb_rd =/= 0.U) && (fwd.wb_rd === rs2)
+  val fwd_rs2_from_ref = fwd.ref_wen && (fwd.ref_rd =/= 0.U) && (fwd.ref_rd === rs2)
   val fwd_rs2_from_commit = fwd.commit_wen && (fwd.commit_rd =/= 0.U) && (fwd.commit_rd === rs2)
   val actual_rdata2 = PriorityMux(Seq(
     fwd_rs2_from_mem    -> fwd.mem_data,
-    fwd_rs2_from_wb     -> fwd.wb_data,
+    fwd_rs2_from_ref    -> fwd.ref_data,
     fwd_rs2_from_commit -> fwd.commit_data,
-    true.B              -> in.bits.src2Data    // 兜底：Dispatch 阶段读取的值
+    true.B              -> in.bits.src2Data    // 兜底：ReadReg 阶段读取的值
   ))
 
   // ============================================================
@@ -148,6 +158,15 @@ class Execute extends Module {
   }
 
   // ============================================================
+  // StoreBuffer 写入（Execute 阶段计算出 Store 地址和数据后写入 StoreBuffer）
+  // ============================================================
+  sbWrite.valid := in.valid && sType && in.bits.isSbAlloc
+  sbWrite.idx   := in.bits.sbIdx
+  sbWrite.addr  := uALU.io.result                // Store 地址 = rs1 + 立即数（ALU 计算结果）
+  sbWrite.data  := actual_rdata2                  // Store 数据 = rs2 的值
+  sbWrite.mask  := funct3                         // Store 宽度掩码 = funct3
+
+  // ============================================================
   // 输出结果
   // ============================================================
   out.bits.pc := in.bits.pc
@@ -158,7 +177,7 @@ class Execute extends Module {
     (auipc || lType || sType || iType || rType) -> uALU.io.result, // ALU 结果
     (jal || jalr) -> (in.bits.pc + 4.U(32.W))              // JAL/JALR：链接地址 = PC+4
   ))
-  out.bits.reg_rdata2 := Mux(sType, actual_rdata2, 0.U)    // Store 的写入数据
+  out.bits.reg_rdata2 := Mux(sType, actual_rdata2, 0.U)    // Store 的写入数据（保留用于后续阶段）
   out.bits.type_decode_together := in.bits.type_decode_together
   out.bits.robIdx := in.bits.robIdx
   out.bits.regWriteEnable := in.bits.regWriteEnable
@@ -170,6 +189,8 @@ class Execute extends Module {
   out.bits.actual_target := actual_target_addr
   out.bits.mispredict := isMispredict
   out.bits.bht_meta := in.bits.bht_meta
+  out.bits.sbIdx := in.bits.sbIdx
+  out.bits.isSbAlloc := in.bits.isSbAlloc
 
   in.ready := out.ready
   out.valid := in.valid
