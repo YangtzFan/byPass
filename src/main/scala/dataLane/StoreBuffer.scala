@@ -122,7 +122,8 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   //
   // 简化实现：遍历从 head 到 tail 的所有有效项，检查 robIdx < query.robIdx
   // 找到最年轻的命中项进行转发（最接近 Load 的那个 Store）
-  val hitVec = Wire(Vec(depth, Bool()))   // 每个表项是否地址命中
+  val hitVec = Wire(Vec(depth, Bool()))     // 每个表项是否地址命中
+  val pendingVec = Wire(Vec(depth, Bool())) // 是否有地址还未确定的表项（需要等待）
   for (i <- 0 until depth) {
     // 判断该表项是否是比 Load 更老的有效 Store
     // 使用简单的 robIdx 比较：ROB 指针的差值判断新旧关系
