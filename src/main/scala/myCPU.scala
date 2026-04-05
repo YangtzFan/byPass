@@ -247,7 +247,6 @@ class myCPU extends Module {
   // ---- StoreBuffer 查询连接（Memory 阶段 Load 指令查询 Store-to-Load 转发）----
   uStoreBuffer.query.valid       := uMemory.sbQuery.valid
   uStoreBuffer.query.addr        := uMemory.sbQuery.addr
-  uStoreBuffer.query.robIdx      := uMemory.sbQuery.robIdx
   uMemory.sbQuery.hit            := uStoreBuffer.query.hit
   uMemory.sbQuery.data           := uStoreBuffer.query.data
 

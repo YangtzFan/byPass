@@ -49,7 +49,6 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   val query = IO(new Bundle {
     val valid       = Input(Bool())                          // 是否进行查询（Load 指令有效时）
     val addr        = Input(UInt(32.W))                      // Load 的地址
-    val robIdx      = Input(UInt(CPUConfig.robPtrWidth.W))   // Load 指令的 ROB 指针
     val hit         = Output(Bool())                         // 是否有更老的 Store 地址命中
     val data        = Output(UInt(32.W))                     // 命中时转发的数据
   })

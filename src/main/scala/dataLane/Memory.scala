@@ -54,7 +54,6 @@ class Memory extends Module {
   val sbQuery = IO(new Bundle {
     val valid       = Output(Bool())                   // 是否进行 StoreBuffer 查询（Load 指令有效时）
     val addr        = Output(UInt(32.W))               // Load 的地址
-    val robIdx      = Output(UInt(CPUConfig.robPtrWidth.W))  // Load 指令的 ROB 指针（用于判断年龄）
     val hit         = Input(Bool())                    // StoreBuffer 中是否有更老的 Store 命中
     val data        = Input(UInt(32.W))                // StoreBuffer 转发的数据
   })
@@ -78,7 +77,6 @@ class Memory extends Module {
   // ---- StoreBuffer 查询（Load 指令）----
   sbQuery.valid  := in.valid && lType
   sbQuery.addr   := in.bits.data       // Load 地址 = ALU 计算结果
-  sbQuery.robIdx := in.bits.robIdx
 
   // ---- Store-to-Load 冒险检测：存在更老 Store 地址未知时停顿 ----
   val sbStall = in.valid && lType && !sbQuery.hit
