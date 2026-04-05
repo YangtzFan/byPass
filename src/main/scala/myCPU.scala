@@ -250,7 +250,6 @@ class myCPU extends Module {
   uStoreBuffer.query.robIdx      := uMemory.sbQuery.robIdx
   uMemory.sbQuery.hit            := uStoreBuffer.query.hit
   uMemory.sbQuery.data           := uStoreBuffer.query.data
-  uMemory.sbQuery.addrUnknown    := uStoreBuffer.query.addrUnknown
 
   // Memory 阶段重定向信号
   memRedirectValid   := uMemory.redirect.valid

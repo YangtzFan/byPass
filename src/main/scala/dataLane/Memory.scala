@@ -57,7 +57,6 @@ class Memory extends Module {
     val robIdx      = Output(UInt(CPUConfig.robPtrWidth.W))  // Load 指令的 ROB 指针（用于判断年龄）
     val hit         = Input(Bool())                    // StoreBuffer 中是否有更老的 Store 命中
     val data        = Input(UInt(32.W))                // StoreBuffer 转发的数据
-    val addrUnknown = Input(Bool())                    // 是否有更老的 Store 地址尚未计算
   })
 
   // 从类型编码中提取各指令类型
@@ -82,7 +81,7 @@ class Memory extends Module {
   sbQuery.robIdx := in.bits.robIdx
 
   // ---- Store-to-Load 冒险检测：存在更老 Store 地址未知时停顿 ----
-  val sbStall = in.valid && lType && sbQuery.addrUnknown
+  val sbStall = in.valid && lType && !sbQuery.hit
 
   // DRAM 读端口：只有 Load 指令且不从 StoreBuffer 转发时才需要读 DRAM
   io.ram_addr_o := Mux(lType && !sbQuery.hit, in.bits.data, 0.U)

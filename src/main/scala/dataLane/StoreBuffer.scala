@@ -52,7 +52,6 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     val robIdx      = Input(UInt(CPUConfig.robPtrWidth.W))   // Load 指令的 ROB 指针
     val hit         = Output(Bool())                         // 是否有更老的 Store 地址命中
     val data        = Output(UInt(32.W))                     // 命中时转发的数据
-    val addrUnknown = Output(Bool())                         // 是否有更老的 Store 地址尚未计算
   })
 
   // ---- 提交接口（Commit 阶段使用：将 Store 写入内存）----
@@ -123,33 +122,30 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   //
   // 简化实现：遍历从 head 到 tail 的所有有效项，检查 robIdx < query.robIdx
   // 找到最年轻的命中项进行转发（最接近 Load 的那个 Store）
-  val hitVec         = Wire(Vec(depth, Bool()))   // 每个表项是否地址命中
-  val addrUnknownVec = Wire(Vec(depth, Bool()))   // 每个表项是否地址未知
-
+  val hitVec = Wire(Vec(depth, Bool()))   // 每个表项是否地址命中
   for (i <- 0 until depth) {
     // 判断该表项是否是比 Load 更老的有效 Store
     // 使用简单的 robIdx 比较：ROB 指针的差值判断新旧关系
-    hitVec(i)         := buffer(i).valid && buffer(i).addrValid && (buffer(i).addr === query.addr)
-    addrUnknownVec(i) := buffer(i).valid && !buffer(i).addrValid
+    hitVec(i) := buffer(i).valid && buffer(i).addrValid && (buffer(i).addr === query.addr)
   }
 
   // 查找命中的最年轻的表项（优先转发最近的 Store）
   // 简化：使用 OR-reduce 判断是否有命中
-  query.hit         := query.valid && hitVec.asUInt.orR
-  query.addrUnknown := query.valid && addrUnknownVec.asUInt.orR
+  query.hit := query.valid && hitVec.asUInt.orR
 
-  // 选择最年轻的命中表项的数据进行转发
-  // 遍历从 tail-1 到 head（逆序），第一个命中的就是最年轻的
-  val hitData = Wire(UInt(32.W))
-  hitData := 0.U
-  // 从最年轻到最老遍历，最后一次写入的就是最老的命中，但我们要最年轻的
-  // 所以从最老到最年轻遍历，最后写入的是最年轻的命中
-  for (i <- 0 until depth) {
-    when(hitVec(i)) {
-      hitData := buffer(i).data
-    }
+  // 选择“最年轻命中”的 Store 数据进行转发
+  // 逻辑年龄顺序：tail-1 (最年轻) -> ... -> head (最老)
+  val orderedHit  = Wire(Vec(depth, Bool()))
+  val orderedData = Wire(Vec(depth, UInt(32.W)))
+    for (k <- 0 until depth) {
+    val ptr    = tail - 1.U - k.U          // 从最年轻往最老走
+    val bufIdx = idx(ptr)                  // 环形回绕到物理下标
+    val inRange = k.U < count              // 只检查当前有效窗口 [head, tail)
+    orderedHit(k)  := inRange && hitVec(bufIdx)
+    orderedData(k) := buffer(bufIdx).data
   }
-  query.data := hitData
+  // PriorityMux 取 orderedHit 中“第一个为真”的项，对应最年轻命中
+  query.data := Mux(query.hit, PriorityMux(orderedHit, orderedData), 0.U)
 
   // ===================== 提交逻辑（Commit 阶段）=====================
   // 队首项已完成且有效时可以提交
@@ -161,7 +157,7 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
 
   when(commit.valid) {
     // 释放队首表项
-    headEntry.valid     := false.B
+    headEntry.valid := false.B
     head := head + 1.U
   }
 
