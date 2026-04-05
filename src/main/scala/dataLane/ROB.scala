@@ -51,10 +51,9 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
   // 用于判断是否真正进行分配（request > 0 且空间充足且无回滚）
   val doAlloc = alloc.request > 0.U && alloc.canAlloc && !rollback.valid
 
+  // ===================== 提交输出（组合逻辑，始终驱动）=====================
   val headEntry = rob(idx(head))
   val canCommit = !empty && headEntry.done
-
-  // ===================== 提交输出（组合逻辑，始终驱动）=====================
   commit.valid        := canCommit
   commit.pc           := headEntry.pc
   commit.inst         := headEntry.inst

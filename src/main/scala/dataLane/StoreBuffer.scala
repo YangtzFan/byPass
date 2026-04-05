@@ -137,11 +137,9 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   // 逻辑年龄顺序：tail-1 (最年轻) -> ... -> head (最老)
   val orderedHit  = Wire(Vec(depth, Bool()))
   val orderedData = Wire(Vec(depth, UInt(32.W)))
-    for (k <- 0 until depth) {
-    val ptr    = tail - 1.U - k.U          // 从最年轻往最老走
-    val bufIdx = idx(ptr)                  // 环形回绕到物理下标
-    val inRange = k.U < count              // 只检查当前有效窗口 [head, tail)
-    orderedHit(k)  := inRange && hitVec(bufIdx)
+  for (k <- 0 until depth) {
+    val bufIdx = idx(tail - 1.U - k.U)    // 从最年轻往最老走，环形回绕到物理下标
+    orderedHit(k)  := hitVec(bufIdx)
     orderedData(k) := buffer(bufIdx).data
   }
   // PriorityMux 取 orderedHit 中“第一个为真”的项，对应最年轻命中
