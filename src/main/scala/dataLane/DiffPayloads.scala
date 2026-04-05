@@ -216,7 +216,7 @@ class ROBEntry extends Bundle {
   val inst            = UInt(32.W)       // 原始指令（调试用）
   val rd              = UInt(5.W)        // 目标寄存器编号
   val regWriteEnable  = Bool()           // 是否需要写回寄存器
-  val result          = UInt(32.W)       // 计算结果
+  val regWBData       = UInt(32.W)       // 写回寄存器的结果（Store 指令为 0，Commit 由 StoreBuffer 实现）
   val isLoad          = Bool()           // 是否为 Load 指令
   val isStore         = Bool()           // 是否为 Store 指令
   val isBranch        = Bool()           // 是否为分支指令
@@ -263,7 +263,7 @@ class ROBMultiAllocIO extends Bundle {
 class ROBRefreshIO extends Bundle {
   val valid        = Output(Bool())
   val idx          = Output(UInt(CPUConfig.robPtrWidth.W))    // 完成的 ROB 指针（含回绕位）
-  val result       = Output(UInt(32.W))
+  val regWBData    = Output(UInt(32.W))
   val actualTaken  = Output(Bool())
   val actualTarget = Output(UInt(32.W))
   val mispredict   = Output(Bool())
@@ -277,7 +277,7 @@ class ROBCommitIO extends Bundle {
   val inst         = Output(UInt(32.W))
   val rd           = Output(UInt(5.W))
   val regWen       = Output(Bool())     // 是否写寄存器
-  val result       = Output(UInt(32.W))
+  val regWBData    = Output(UInt(32.W)) // 写回寄存器的结果（Store 指令为 0，Commit 由 StoreBuffer 实现）
   val isStore      = Output(Bool())     // 是否为 Store 指令（通知 StoreBuffer 提交）
   val isBranch     = Output(Bool())     // 用于 BHT 训练（预留）
   val isJump       = Output(Bool())

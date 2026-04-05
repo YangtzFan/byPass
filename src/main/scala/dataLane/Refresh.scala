@@ -23,7 +23,7 @@ class Refresh extends Module {
   // ROB 完成：组合逻辑直接透传
   robRefresh.valid        := in.valid
   robRefresh.idx          := in.bits.robIdx
-  robRefresh.result       := in.bits.data
+  robRefresh.regWBData    := in.bits.data
   robRefresh.actualTaken  := in.bits.actual_taken
   robRefresh.actualTarget := in.bits.actual_target
   robRefresh.mispredict   := in.bits.mispredict

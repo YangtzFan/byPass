@@ -44,18 +44,17 @@ class myCPU extends Module {
     val ram_mask_o  = Output(UInt(3.W))
     val ram_rdata_i = Input(UInt(32.W))
 
-    // ---- DRAM 写端口（仅 Commit 阶段 Store 才写入，通过 StoreBuffer）----
-    val commit_ram_wen_o   = Output(Bool())
-    val commit_ram_addr_o  = Output(UInt(32.W))
-    val commit_ram_wdata_o = Output(UInt(32.W))
-    val commit_ram_mask_o  = Output(UInt(3.W))
-
     // ---- Commit 阶段观测端口（用于 difftest 对比仿真）----
     val commit_valid     = Output(Bool())
     val commit_pc        = Output(UInt(32.W))
     val commit_reg_wen   = Output(Bool())
     val commit_reg_waddr = Output(UInt(5.W))
     val commit_reg_wdata = Output(UInt(32.W))
+    // ---- DRAM 写端口（仅 Commit 阶段 Store 才写入，通过 StoreBuffer）----
+    val commit_ram_wen   = Output(Bool())
+    val commit_ram_waddr  = Output(UInt(32.W))
+    val commit_ram_wdata = Output(UInt(32.W))
+    val commit_ram_wmask  = Output(UInt(3.W))
   })
 
   // =====================================================
@@ -285,7 +284,7 @@ class myCPU extends Module {
   // =====================================================
   // 寄存器写回（Commit 时更新架构状态）
   uREG.io.reg_waddr_i := uROB.commit.rd
-  uREG.io.reg_wdata_i := uROB.commit.result
+  uREG.io.reg_wdata_i := uROB.commit.regWBData
   uREG.io.reg_wen_i   := uROB.commit.regWen
 
   // Store 写回内存（通过 StoreBuffer 提交）
@@ -294,17 +293,17 @@ class myCPU extends Module {
   uStoreBuffer.commit.valid := storeCommitValid
 
   // DRAM 写端口：由 StoreBuffer 提供地址/数据/掩码
-  io.commit_ram_wen_o   := storeCommitValid && uStoreBuffer.commit.canCommit
-  io.commit_ram_addr_o  := uStoreBuffer.commit.addr
-  io.commit_ram_wdata_o := uStoreBuffer.commit.data
-  io.commit_ram_mask_o  := uStoreBuffer.commit.mask
+  io.commit_ram_wen   := storeCommitValid && uStoreBuffer.commit.canCommit
+  io.commit_ram_waddr := uStoreBuffer.commit.addr
+  io.commit_ram_wdata := uStoreBuffer.commit.data
+  io.commit_ram_wmask := uStoreBuffer.commit.mask
 
   // Commit 观测信号（供 difftest 使用）
   io.commit_valid     := uROB.commit.valid
   io.commit_pc        := uROB.commit.pc
   io.commit_reg_wen   := uROB.commit.regWen
   io.commit_reg_waddr := uROB.commit.rd
-  io.commit_reg_wdata := uROB.commit.result
+  io.commit_reg_wdata := uROB.commit.regWBData
 
   // =====================================================
   // ============ 数据旁路转发连接（Forwarding）============
@@ -330,6 +329,6 @@ class myCPU extends Module {
 
   // 第 3 级旁路：Commit 级（同周期 ROB 正在提交的指令结果）
   uExecute.fwd.commit_rd   := uROB.commit.rd
-  uExecute.fwd.commit_data := uROB.commit.result
+  uExecute.fwd.commit_data := uROB.commit.regWBData
   uExecute.fwd.commit_wen  := uROB.commit.regWen
 }
