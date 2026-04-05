@@ -39,15 +39,6 @@ class Execute extends Module {
     val commit_wen  = Input(Bool())
   })
 
-  // ---- StoreBuffer 写入端口（Execute 阶段将 Store 地址和数据写入 StoreBuffer）----
-  val sbWrite = IO(new Bundle {
-    val valid = Output(Bool())                           // 写入使能
-    val idx   = Output(UInt(CPUConfig.sbPtrWidth.W))     // 要写入的 StoreBuffer 表项指针
-    val addr  = Output(UInt(32.W))                       // Store 地址
-    val data  = Output(UInt(32.W))                       // Store 数据
-    val mask  = Output(UInt(3.W))                        // Store 宽度掩码
-  })
-
   // ---- BHT 更新端口（仅 useBHT 时生成）----
   private val bhtIdxWidth = log2Ceil(CPUConfig.bhtEntries)
   val bht_update = Option.when(CPUConfig.useBHT){IO(new Bundle {
@@ -156,15 +147,6 @@ class Execute extends Module {
     bht_update.get.idx   := in.bits.pc(bhtIdxWidth + 1, 2) // 用 PC 低位索引
     bht_update.get.taken := branch_taken                   // 实际跳转结果
   }
-
-  // ============================================================
-  // StoreBuffer 写入（Execute 阶段计算出 Store 地址和数据后写入 StoreBuffer）
-  // ============================================================
-  sbWrite.valid := in.valid && sType && in.bits.isSbAlloc
-  sbWrite.idx   := in.bits.sbIdx
-  sbWrite.addr  := uALU.io.result                // Store 地址 = rs1 + 立即数（ALU 计算结果）
-  sbWrite.data  := actual_rdata2                  // Store 数据 = rs2 的值
-  sbWrite.mask  := funct3                         // Store 宽度掩码 = funct3
 
   // ============================================================
   // 输出结果

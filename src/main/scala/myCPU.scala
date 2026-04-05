@@ -25,8 +25,8 @@ import mycpu.device._
 //   6. IssueQueue：16 深环形缓冲区，4-in/4-out（当前仅用 1-out）
 //   7. Issue 1-wide：从 IssueQueue 队首顺序取 1 条指令，含 Load-Use 冒险检测
 //   8. ReadReg：专用阶段读取寄存器堆，获取 rs1/rs2 值作为旁路兜底
-//   9. Execute：ALU 计算 + 分支验证 + Store 数据写入 StoreBuffer
-//  10. Memory：Load 访存 + StoreBuffer 转发 + 分支纠错重定向（冲刷前级 + ROB 回滚）
+//   9. Execute：ALU 计算 + 分支验证
+//  10. Memory：Load 访存 + + Store 数据写入 StoreBuffer + 分支纠错重定向（冲刷前级 + ROB 回滚）
 //  11. Refresh：更新 ROB 完成状态和结果字段，不更新架构状态
 //  12. Commit：从 ROB 头部提交 —— 写寄存器堆 + 通知 StoreBuffer 将 Store 写入内存
 //  13. 数据旁路（Forwarding）3 级：Memory / Refresh / Commit → Execute，兜底来自 ReadReg
@@ -214,13 +214,6 @@ class myCPU extends Module {
   val uExecute = Module(new Execute)
   uExecute.in <> uRRExDff.out
 
-  // ---- StoreBuffer 写入连接（Execute 阶段将 Store 地址和数据写入 StoreBuffer）----
-  uStoreBuffer.write.valid := uExecute.sbWrite.valid
-  uStoreBuffer.write.idx   := uExecute.sbWrite.idx
-  uStoreBuffer.write.addr  := uExecute.sbWrite.addr
-  uStoreBuffer.write.data  := uExecute.sbWrite.data
-  uStoreBuffer.write.mask  := uExecute.sbWrite.mask
-
   // ---- BHT 更新：Execute 阶段得到分支实际结果后回写 BHT ----
   if (CPUConfig.useBHT) {
     // Memory redirect 时抑制更新，防止错误路径的分支污染 BHT
@@ -244,6 +237,13 @@ class myCPU extends Module {
   io.ram_addr_o := uMemory.io.ram_addr_o
   io.ram_mask_o := uMemory.io.ram_mask_o
   uMemory.io.ram_rdata_i := io.ram_rdata_i
+
+  // ---- StoreBuffer 写入连接（Memory 阶段将 Store 地址和数据写入 StoreBuffer）----
+  uStoreBuffer.write.valid := uMemory.sbWrite.valid
+  uStoreBuffer.write.idx   := uMemory.sbWrite.idx
+  uStoreBuffer.write.addr  := uMemory.sbWrite.addr
+  uStoreBuffer.write.data  := uMemory.sbWrite.data
+  uStoreBuffer.write.mask  := uMemory.sbWrite.mask
 
   // ---- StoreBuffer 查询连接（Memory 阶段 Load 指令查询 Store-to-Load 转发）----
   uStoreBuffer.query.valid       := uMemory.sbQuery.valid

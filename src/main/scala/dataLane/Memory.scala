@@ -41,6 +41,15 @@ class Memory extends Module {
     val robIdx = Output(UInt(CPUConfig.robPtrWidth.W)) // 误预测指令的 ROB 指针（用于回滚）
   })
 
+  // ---- StoreBuffer 写入端口（将 Store 地址和数据写入 StoreBuffer）----
+  val sbWrite = IO(new Bundle {
+    val valid = Output(Bool())                           // 写入使能
+    val idx   = Output(UInt(CPUConfig.sbPtrWidth.W))     // 要写入的 StoreBuffer 表项指针
+    val addr  = Output(UInt(32.W))                       // Store 地址
+    val data  = Output(UInt(32.W))                       // Store 数据
+    val mask  = Output(UInt(3.W))                        // Store 宽度掩码
+  })
+
   // ---- StoreBuffer 查询接口（Load 指令需要检查 Store-to-Load 转发）----
   val sbQuery = IO(new Bundle {
     val valid       = Output(Bool())                   // 是否进行 StoreBuffer 查询（Load 指令有效时）
@@ -60,7 +69,14 @@ class Memory extends Module {
   val sType = in.bits.type_decode_together(2)  // Store
   val rType = in.bits.type_decode_together(1)
 
-  // ---- StoreBuffer 查询（Load 指令时进行）----
+  // ---- StoreBuffer 写入（Store 指令）
+  sbWrite.valid := in.valid && sType && in.bits.isSbAlloc
+  sbWrite.idx   := in.bits.sbIdx
+  sbWrite.addr  := in.bits.data                // Store 地址 = rs1 + 立即数（ALU 计算结果）
+  sbWrite.data  := in.bits.reg_rdata2          // Store 数据 = rs2 的值
+  sbWrite.mask  := in.bits.inst_funct3         // Store 宽度掩码 = funct3
+
+  // ---- StoreBuffer 查询（Load 指令）----
   sbQuery.valid  := in.valid && lType
   sbQuery.addr   := in.bits.data       // Load 地址 = ALU 计算结果
   sbQuery.robIdx := in.bits.robIdx

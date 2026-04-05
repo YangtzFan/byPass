@@ -36,7 +36,7 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     val idxs     = Output(Vec(4, UInt(ptrWidth.W)))          // 分配的 StoreBuffer 指针
   })
 
-  // ---- 写入接口（Execute 阶段使用：写入 Store 地址和数据）----
+  // ---- 写入接口（Memory 阶段使用：写入 Store 地址和数据）----
   val write = IO(new Bundle {
     val valid = Input(Bool())                                // 写入使能
     val idx   = Input(UInt(ptrWidth.W))                      // 要写的 StoreBuffer 指针
