@@ -79,11 +79,14 @@ class Memory extends Module {
   sbQuery.valid  := in.valid && lType
   sbQuery.addr   := in.bits.data       // Load 地址 = ALU 计算结果
 
-  // ---- Store-to-Load 冒险检测：存在更老 Store 地址未知时停顿 ----
-  // 只有当 StoreBuffer 中存在地址未知的 Store 项（pending=true）时才停顿
-  // 如果所有 Store 的地址都已确定，即使没有地址匹配（hit=false），
-  // Load 也可以安全地从 DRAM 读取数据，无需停顿
-  val sbStall = sbQuery.pending
+  // ---- Store-to-Load 冒险检测 ----
+  // 当 Load 在 StoreBuffer 中找到地址匹配的 Store 时（hit=true），需要停顿。
+  // 原因：StoreBuffer 中存储的是完整寄存器值，直接转发无法处理字节/半字的提取和符号扩展，
+  //       而 DRAM 端的 dram_driver 会正确处理字节/半字的读取。
+  // 策略：停顿等待匹配的 Store 提交到 DRAM 后 SB 表项释放（hit 变为 false），
+  //       然后 Load 从 DRAM 读取正确的数据（包含字节选择和符号扩展）。
+  // 注意：当 hit=false 时，Load 地址在 SB 中无匹配，可以安全地直接从 DRAM 读取。
+  val sbStall = sbQuery.hit
 
   // DRAM 读端口：只有 Load 指令且不从 StoreBuffer 转发时才需要读 DRAM
   io.ram_addr_o := Mux(lType && !sbQuery.hit, in.bits.data, 0.U)
