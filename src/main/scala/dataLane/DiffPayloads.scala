@@ -198,7 +198,6 @@ class Memory_Refresh_Payload extends Bundle {
 class StoreBufferEntry extends Bundle {
   val valid     = Bool()           // 表项是否有效（已分配）
   val addrValid = Bool()           // 地址是否已写入（Execute 阶段写入地址和数据）
-  val committed = Bool()           // 是否已提交（Commit 阶段标记）
   val addr      = UInt(32.W)       // Store 地址
   val data      = UInt(32.W)       // Store 数据
   val mask      = UInt(3.W)        // Store 宽度掩码（funct3）

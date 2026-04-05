@@ -36,7 +36,7 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     val idxs     = Output(Vec(4, UInt(ptrWidth.W)))          // 分配的 StoreBuffer 指针
   })
 
-  // ---- 写入接口（Memory 阶段使用：写入 Store 地址和数据）----
+  // ---- Store 写入接口（Memory 阶段使用：写入 Store 地址和数据）----
   val write = IO(new Bundle {
     val valid = Input(Bool())                                // 写入使能
     val idx   = Input(UInt(ptrWidth.W))                      // 要写的 StoreBuffer 指针
@@ -98,7 +98,6 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
         val entry = buffer(idx(allocPtr))
         entry.valid     := true.B
         entry.addrValid := false.B   // 地址尚未计算（等 Execute 阶段写入）
-        entry.committed := false.B
         entry.addr      := 0.U
         entry.data      := 0.U
         entry.mask      := 0.U
@@ -108,7 +107,7 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     tail := tail + alloc.request
   }
 
-  // ===================== 写入逻辑（Execute 阶段）=====================
+  // ===================== 写入逻辑（Memory 阶段 Store 指令）=====================
   // Execute 阶段计算出 Store 地址和数据后，写入对应的 StoreBuffer 表项
   when(write.valid) {
     val wEntry = buffer(idx(write.idx))
@@ -128,13 +127,10 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   val addrUnknownVec = Wire(Vec(depth, Bool()))   // 每个表项是否地址未知
 
   for (i <- 0 until depth) {
-    val entry = buffer(i)
     // 判断该表项是否是比 Load 更老的有效 Store
     // 使用简单的 robIdx 比较：ROB 指针的差值判断新旧关系
-    val isOlder = entry.valid && !entry.committed
-
-    hitVec(i)         := isOlder && entry.addrValid && (entry.addr === query.addr)
-    addrUnknownVec(i) := isOlder && !entry.addrValid
+    hitVec(i)         := buffer(i).valid && buffer(i).addrValid && (buffer(i).addr === query.addr)
+    addrUnknownVec(i) := buffer(i).valid && !buffer(i).addrValid
   }
 
   // 查找命中的最年轻的表项（优先转发最近的 Store）
@@ -166,7 +162,6 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   when(commit.valid) {
     // 释放队首表项
     headEntry.valid     := false.B
-    headEntry.committed := true.B
     head := head + 1.U
   }
 
@@ -184,7 +179,7 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     tail := head
     // 清除所有未提交的表项
     for (i <- 0 until depth) {
-      when(buffer(i).valid && !buffer(i).committed) {
+      when(buffer(i).valid) {
         buffer(i).valid := false.B
       }
     }
