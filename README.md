@@ -16,42 +16,22 @@ mill -i chiselTemplate.runMain chiseltemplate.GenerateVerilog
 ## XMake Workflow
 
 ```bash
-# Initialize submodules
+# 初始化子模块
 xmake run init
 
-# Compile Scala/Chisel
+# 编译 Scala/Chisel
 xmake run comp
 
-# Format Scala sources
+# 格式化 Scala 源码
 xmake run fmt
 
-# Generate RTL to build/rtl
+# 生成 RTL 到 build/rtl（IROM 不再在编译期加载测试程序）
 xmake run rtl
-
-# Build simulator (Verilator output in build/obj_dir)
-xmake run sim-build
-
-# Run one test (default uses IROM_BIN=and)
-xmake run sim-run
-
-# Run a specific test program
-IROM_BIN=add xmake run sim-run
-
-# Run all bin programs and print summary
-xmake run sim-all
 ```
 
-Generated RTL will be emitted to `build/rtl`.
+生成的 RTL 输出到 `build/rtl` 目录。
 
-Waveform output is written to `build/waveform`.
-
-Batch simulation logs and summary are written to `build/sim-all`:
-- `build/sim-all/<case>.log`: full log for each case
-- `build/sim-all/summary.txt`: pass/fail list
-
-`sim-all` uses the following pass criteria per case:
-- Process exit code is `0`
-- Log contains `Test Point Pass!`
+> **注意**: IROM 指令加载已移至 [difftest](../) 框架中实现，切换测试用例无需重新编译 RTL。
 
 ## Files
 
