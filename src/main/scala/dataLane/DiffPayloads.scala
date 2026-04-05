@@ -204,6 +204,52 @@ class StoreBufferEntry extends Bundle {
   val robIdx    = UInt(CPUConfig.robPtrWidth.W) // 对应的 ROB 指针（用于判断年龄）
 }
 
+// ==========================================================================
+// StoreBuffer IO Bundle 定义
+// ==========================================================================
+// 以下 Bundle 定义了 StoreBuffer 的各个接口，方向统一以"使用者侧"（Dispatch/
+// Execute/Memory/myCPU）为基准。StoreBuffer 内部使用 Flipped() 翻转方向。
+
+// ---- 分配接口（Dispatch 阶段请求分配 Store 表项）----
+class SBAllocIO extends Bundle {
+  val request  = Output(UInt(3.W))                          // 请求分配的 Store 表项数（0~4）
+  val canAlloc = Input(Bool())                              // StoreBuffer 是否有足够空间
+  val idxs     = Input(Vec(4, UInt(CPUConfig.sbPtrWidth.W))) // 分配的 StoreBuffer 指针
+}
+
+// ---- 写入接口（Execute 阶段写入 Store 地址和数据）----
+class SBWriteIO extends Bundle {
+  val valid = Output(Bool())                                // 写入使能
+  val idx   = Output(UInt(CPUConfig.sbPtrWidth.W))          // 要写的 StoreBuffer 指针
+  val addr  = Output(UInt(32.W))                            // Store 地址
+  val data  = Output(UInt(32.W))                            // Store 数据
+  val mask  = Output(UInt(3.W))                             // Store 宽度掩码
+}
+
+// ---- 查询接口（Memory 阶段 Load 指令查询 Store-to-Load 转发）----
+class SBQueryIO extends Bundle {
+  val valid   = Output(Bool())                              // 是否进行查询（Load 有效时）
+  val addr    = Output(UInt(32.W))                          // Load 的地址
+  val hit     = Input(Bool())                               // 是否有更老的 Store 地址命中
+  val data    = Input(UInt(32.W))                           // 命中时转发的 Store 数据
+  val pending = Input(Bool())                               // 是否有地址未知的 Store（需要停顿）
+}
+
+// ---- 提交接口（Commit 阶段将已提交的 Store 写入内存）----
+class SBCommitIO extends Bundle {
+  val valid     = Output(Bool())                            // 本周期是否提交一条 Store 指令
+  val canCommit = Input(Bool())                             // 队首是否有已完成的 Store 可提交
+  val addr      = Input(UInt(32.W))                         // 提交的 Store 地址
+  val data      = Input(UInt(32.W))                         // 提交的 Store 数据
+  val mask      = Input(UInt(3.W))                          // 提交的 Store 宽度掩码
+}
+
+// ---- 回滚接口（Memory 重定向时回滚 StoreBuffer）----
+class SBRollbackIO extends Bundle {
+  val valid  = Output(Bool())                               // 回滚使能
+  val robIdx = Output(UInt(CPUConfig.robPtrWidth.W))        // 误预测指令的 ROB 指针
+}
+
 // ============================================================================
 // ROBEntry —— ROB 中每个表项存储的字段
 // ============================================================================

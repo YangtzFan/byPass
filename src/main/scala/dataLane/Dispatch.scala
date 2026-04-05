@@ -30,11 +30,7 @@ class Dispatch extends Module {
   val robAlloc = IO(new ROBMultiAllocIO)
 
   // ---- StoreBuffer 分配接口 ----
-  val sbAlloc = IO(new Bundle {
-    val request  = Output(UInt(3.W))                                  // 请求分配的 StoreBuffer 表项数量
-    val canAlloc = Input(Bool())                                      // StoreBuffer 是否有足够空间
-    val idxs     = Input(Vec(4, UInt(CPUConfig.sbPtrWidth.W)))        // StoreBuffer 返回的分配指针
-  })
+  val sbAlloc = IO(new SBAllocIO)
 
   // ---- IssueQueue 空间查询接口 ----
   val iqFreeCount = IO(Input(UInt((log2Ceil(CPUConfig.issueQueueEntries) + 1).W)))

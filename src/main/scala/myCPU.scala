@@ -148,10 +148,8 @@ class myCPU extends Module {
   val uStoreBuffer = Module(new StoreBuffer)
   // ---- Dispatch ↔ ROB 分配连接 ----
   uROB.alloc <> uDisp.robAlloc
-  // ---- Dispatch ↔ StoreBuffer 分配连接 ----
-  uDisp.sbAlloc.canAlloc := uStoreBuffer.alloc.canAlloc
-  uDisp.sbAlloc.idxs     := uStoreBuffer.alloc.idxs
-  uStoreBuffer.alloc.request := uDisp.sbAlloc.request
+  // ---- Dispatch ↔ StoreBuffer 分配连接（使用 <> 自动连接）----
+  uStoreBuffer.alloc <> uDisp.sbAlloc
 
   // =====================================================
   // ============ IssueQueue（4-in / 4-out 环形缓冲区）============
@@ -237,19 +235,11 @@ class myCPU extends Module {
   io.ram_mask_o := uMemory.io.ram_mask_o
   uMemory.io.ram_rdata_i := io.ram_rdata_i
 
-  // ---- StoreBuffer 写入连接（Memory 阶段将 Store 地址和数据写入 StoreBuffer）----
-  uStoreBuffer.write.valid := uMemory.sbWrite.valid
-  uStoreBuffer.write.idx   := uMemory.sbWrite.idx
-  uStoreBuffer.write.addr  := uMemory.sbWrite.addr
-  uStoreBuffer.write.data  := uMemory.sbWrite.data
-  uStoreBuffer.write.mask  := uMemory.sbWrite.mask
+  // ---- StoreBuffer 写入连接（Memory 阶段将 Store 地址和数据写入 StoreBuffer，使用 <> 自动连接）----
+  uStoreBuffer.write <> uMemory.sbWrite
 
-  // ---- StoreBuffer 查询连接（Memory 阶段 Load 指令查询 Store-to-Load 转发）----
-  uStoreBuffer.query.valid       := uMemory.sbQuery.valid
-  uStoreBuffer.query.addr        := uMemory.sbQuery.addr
-  uMemory.sbQuery.hit            := uStoreBuffer.query.hit
-  uMemory.sbQuery.data           := uStoreBuffer.query.data
-  uMemory.sbQuery.pending        := uStoreBuffer.query.pending  // 是否有地址未知的 Store（Load 需要停顿等待）
+  // ---- StoreBuffer 查询连接（Memory 阶段 Load 指令查询 Store-to-Load 转发，使用 <> 自动连接）----
+  uStoreBuffer.query <> uMemory.sbQuery
 
   // Memory 阶段重定向信号
   memRedirectValid   := uMemory.redirect.valid

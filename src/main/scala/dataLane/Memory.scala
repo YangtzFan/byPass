@@ -13,7 +13,7 @@ import mycpu.CPUConfig
 //        b) 如果有更老的 Store 但地址未知 → 流水线停顿（等待 Store 地址计算完成）
 //        c) 没有匹配 → 从 DRAM 读取数据
 //     2. 最终输出 Load 读回的数据
-// - Store 指令：**不在此阶段写入** DRAM，Store 数据已在 Execute 阶段写入 StoreBuffer，
+// - Store 指令：在此阶段写入DRAM
 //   延迟到 Commit 阶段才实际写入内存
 // - 其他指令：直接透传 Execute 阶段的结果
 //
@@ -42,22 +42,10 @@ class Memory extends Module {
   })
 
   // ---- StoreBuffer 写入端口（将 Store 地址和数据写入 StoreBuffer）----
-  val sbWrite = IO(new Bundle {
-    val valid = Output(Bool())                           // 写入使能
-    val idx   = Output(UInt(CPUConfig.sbPtrWidth.W))     // 要写入的 StoreBuffer 表项指针
-    val addr  = Output(UInt(32.W))                       // Store 地址
-    val data  = Output(UInt(32.W))                       // Store 数据
-    val mask  = Output(UInt(3.W))                        // Store 宽度掩码
-  })
+  val sbWrite = IO(new SBWriteIO)
 
   // ---- StoreBuffer 查询接口（Load 指令需要检查 Store-to-Load 转发）----
-  val sbQuery = IO(new Bundle {
-    val valid       = Output(Bool())                   // 是否进行 StoreBuffer 查询（Load 指令有效时）
-    val addr        = Output(UInt(32.W))               // Load 的地址
-    val hit         = Input(Bool())                    // StoreBuffer 中是否有更老的 Store 命中
-    val data        = Input(UInt(32.W))                // StoreBuffer 转发的数据
-    val pending     = Input(Bool())                    // StoreBuffer 中是否有地址未知的 Store（需要停顿）
-  })
+  val sbQuery = IO(new SBQueryIO)
 
   // 从类型编码中提取各指令类型
   val uType = in.bits.type_decode_together(8)

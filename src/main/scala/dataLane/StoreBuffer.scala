@@ -30,44 +30,19 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   private val ptrWidth = CPUConfig.sbPtrWidth
 
   // ---- 分配接口（Dispatch 阶段使用）----
-  val alloc = IO(new Bundle {
-    val request  = Input(UInt(3.W))                          // 请求分配的 Store 表项数（0~4）
-    val canAlloc = Output(Bool())                            // 是否有足够空间
-    val idxs     = Output(Vec(4, UInt(ptrWidth.W)))          // 分配的 StoreBuffer 指针
-  })
+  val alloc = IO(Flipped(new SBAllocIO))
 
-  // ---- Store 写入接口（Memory 阶段使用：写入 Store 地址和数据）----
-  val write = IO(new Bundle {
-    val valid = Input(Bool())                                // 写入使能
-    val idx   = Input(UInt(ptrWidth.W))                      // 要写的 StoreBuffer 指针
-    val addr  = Input(UInt(32.W))                            // Store 地址
-    val data  = Input(UInt(32.W))                            // Store 数据
-    val mask  = Input(UInt(3.W))                             // Store 宽度掩码
-  })
+  // ---- Store 写入接口（Execute 阶段使用：写入 Store 地址和数据）----
+  val write = IO(Flipped(new SBWriteIO))
 
   // ---- Load 查询接口（Memory 阶段使用：Store-to-Load 转发）----
-  val query = IO(new Bundle {
-    val valid       = Input(Bool())                          // 是否进行查询（Load 指令有效时）
-    val addr        = Input(UInt(32.W))                      // Load 的地址
-    val hit         = Output(Bool())                         // 是否有更老的 Store 地址命中
-    val data        = Output(UInt(32.W))                     // 命中时转发的数据
-    val pending     = Output(Bool())                         // 是否有有效但地址未知的 Store 项（需要停顿等待）
-  })
+  val query = IO(Flipped(new SBQueryIO))
 
   // ---- 提交接口（Commit 阶段使用：将 Store 写入内存）----
-  val commit = IO(new Bundle {
-    val valid      = Input(Bool())                           // 本周期是否提交一条 Store 指令
-    val canCommit  = Output(Bool())                          // 队首是否有已完成的 Store 可提交
-    val addr       = Output(UInt(32.W))                      // 提交的 Store 地址
-    val data       = Output(UInt(32.W))                      // 提交的 Store 数据
-    val mask       = Output(UInt(3.W))                       // 提交的 Store 宽度掩码
-  })
+  val commit = IO(Flipped(new SBCommitIO))
 
   // ---- 回滚接口（Memory 重定向时使用）----
-  val rollback = IO(new Bundle {
-    val valid  = Input(Bool())                               // 回滚使能
-    val robIdx = Input(UInt(CPUConfig.robPtrWidth.W))        // 误预测指令的 ROB 指针
-  })
+  val rollback = IO(Flipped(new SBRollbackIO))
 
   // ---- 存储阵列 ----
   val buffer = RegInit(VecInit(Seq.fill(depth)(0.U.asTypeOf(new StoreBufferEntry))))
