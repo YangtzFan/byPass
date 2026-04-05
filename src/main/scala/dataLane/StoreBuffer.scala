@@ -51,6 +51,7 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     val addr        = Input(UInt(32.W))                      // Load 的地址
     val hit         = Output(Bool())                         // 是否有更老的 Store 地址命中
     val data        = Output(UInt(32.W))                     // 命中时转发的数据
+    val pending     = Output(Bool())                         // 是否有有效但地址未知的 Store 项（需要停顿等待）
   })
 
   // ---- 提交接口（Commit 阶段使用：将 Store 写入内存）----
@@ -126,14 +127,14 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     // 判断该表项是否是比 Load 更老的有效 Store
     // 使用简单的 robIdx 比较：ROB 指针的差值判断新旧关系
     hitVec(i) := buffer(i).valid && buffer(i).addrValid && (buffer(i).addr === query.addr)
+    // 遍历所有表项，检查是否存在 valid=true 但 addrValid=false 的 Store 项
+    // 如果存在，说明有 Store 的地址尚未计算完成，可能与当前 Load 地址冲突，此时停顿流水线
+    pendingVec(i) := buffer(i).valid && !buffer(i).addrValid
   }
-
-  // 查找命中的最年轻的表项（优先转发最近的 Store）
-  // 简化：使用 OR-reduce 判断是否有命中
   query.hit := query.valid && hitVec.asUInt.orR
+  query.pending := query.valid && pendingVec.asUInt.orR
 
-  // 选择“最年轻命中”的 Store 数据进行转发
-  // 逻辑年龄顺序：tail-1 (最年轻) -> ... -> head (最老)
+  // 选择“最年轻命中”的 Store 数据进行转发。逻辑年龄顺序：tail-1 (最年轻) -> ... -> head (最老)
   val orderedHit  = Wire(Vec(depth, Bool()))
   val orderedData = Wire(Vec(depth, UInt(32.W)))
   for (k <- 0 until depth) {

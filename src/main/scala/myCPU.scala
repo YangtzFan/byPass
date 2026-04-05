@@ -249,6 +249,7 @@ class myCPU extends Module {
   uStoreBuffer.query.addr        := uMemory.sbQuery.addr
   uMemory.sbQuery.hit            := uStoreBuffer.query.hit
   uMemory.sbQuery.data           := uStoreBuffer.query.data
+  uMemory.sbQuery.pending        := uStoreBuffer.query.pending  // 是否有地址未知的 Store（Load 需要停顿等待）
 
   // Memory 阶段重定向信号
   memRedirectValid   := uMemory.redirect.valid

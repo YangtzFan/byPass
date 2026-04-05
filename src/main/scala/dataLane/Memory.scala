@@ -56,6 +56,7 @@ class Memory extends Module {
     val addr        = Output(UInt(32.W))               // Load 的地址
     val hit         = Input(Bool())                    // StoreBuffer 中是否有更老的 Store 命中
     val data        = Input(UInt(32.W))                // StoreBuffer 转发的数据
+    val pending     = Input(Bool())                    // StoreBuffer 中是否有地址未知的 Store（需要停顿）
   })
 
   // 从类型编码中提取各指令类型
@@ -79,7 +80,10 @@ class Memory extends Module {
   sbQuery.addr   := in.bits.data       // Load 地址 = ALU 计算结果
 
   // ---- Store-to-Load 冒险检测：存在更老 Store 地址未知时停顿 ----
-  val sbStall = in.valid && lType && !sbQuery.hit
+  // 只有当 StoreBuffer 中存在地址未知的 Store 项（pending=true）时才停顿
+  // 如果所有 Store 的地址都已确定，即使没有地址匹配（hit=false），
+  // Load 也可以安全地从 DRAM 读取数据，无需停顿
+  val sbStall = sbQuery.pending
 
   // DRAM 读端口：只有 Load 指令且不从 StoreBuffer 转发时才需要读 DRAM
   io.ram_addr_o := Mux(lType && !sbQuery.hit, in.bits.data, 0.U)
