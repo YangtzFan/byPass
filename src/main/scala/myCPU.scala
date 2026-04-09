@@ -57,9 +57,7 @@ class myCPU extends Module {
     val commit_ram_wmask  = Output(UInt(3.W))
   })
 
-  // =====================================================
-  // ============ 全局控制信号 ============
-  // =====================================================
+  // ---- 全局控制信号 ----
   val memRedirectValid   = Wire(Bool())     // Memory 阶段重定向使能（分支预测错误）
   val memRedirectAddr    = Wire(UInt(32.W)) // Memory 阶段重定向地址
   val memRedirectRobIdx  = Wire(UInt(CPUConfig.robPtrWidth.W)) // 误预测指令的 ROB 指针
@@ -73,7 +71,7 @@ class myCPU extends Module {
   val uPc = Module(new PC)
   uPc.in.mem_redirect_enable  := memRedirectValid
   uPc.in.mem_redirect_addr    := memRedirectAddr
-  uPc.in.fetch_predict_enable := fetchPredictJump && !memRedirectValid
+  uPc.in.fetch_predict_enable := fetchPredictJump
   uPc.in.fetch_predict_addr   := fetchPredictTarget
 
   // =====================================================
@@ -83,7 +81,6 @@ class myCPU extends Module {
   uFetch.in <> uPc.out
   io.inst_addr_o := uFetch.rom.inst_addr_o
   uFetch.rom.inst_i := io.inst_i
-
   // ---- BHT 顶层实例化并连接到 Fetch ----
   val uBHT = Option.when(CPUConfig.useBHT)(Module(new BHT(CPUConfig.bhtEntries)))
   if (CPUConfig.useBHT) {
@@ -92,16 +89,14 @@ class myCPU extends Module {
       uFetch.bht.get.predict(i) := uBHT.get.io.predict(i)
     }
   }
-
   // Fetch BPU 预测跳转信号（输出到 PC 和 FetchBuffer flush）
   fetchPredictJump   := uFetch.predict.jump
   fetchPredictTarget := uFetch.predict.target
 
   // =====================================================
-  // ============ Fetch → Decode 流水寄存器 ============
+  // ============ Fetch → Decode 流水寄存器（FetchBuffer）============
   // =====================================================
-  // 注意：Fetch BPU 预测跳转时 **不** 冲刷 FetchBuffer
-  // FetchBuffer 仅在 Memory 重定向时冲刷（清除错误路径指令）。
+  // 注意：Fetch BPU 预测跳转时不冲刷 FetchBuffer 仅在 Memory 重定向时冲刷（清除错误路径指令）
   val uFetchBuffer = Module(new FetchBuffer)
   uFetchBuffer.enq <> uFetch.out
   uFetchBuffer.flush := memRedirectValid
@@ -116,7 +111,7 @@ class myCPU extends Module {
   // =====================================================
   // ============ Decode → Rename 流水寄存器（DecRenDff）============
   // =====================================================
-  val uDecRenDff = Module(new BaseDff(new Decode_Rename_Payload, supportFlush = true))
+  val uDecRenDff = Module(new BaseDff(Vec(4, new DecodedInst), supportFlush = true))
   uDecRenDff.in <> uDecode.out
   uDecRenDff.flush.get := memRedirectValid
 
@@ -141,8 +136,7 @@ class myCPU extends Module {
   val uDisp = Module(new Dispatch)
   uDisp.in <> uRenDisDff.out
   uDisp.flush := memRedirectValid
-
-  // ---- ROB 实例化 ----
+  // ---- ROB 实例化与 Dispatch 连接 ----
   val uROB = Module(new ROB)
   // ---- StoreBuffer 实例化 ----
   val uStoreBuffer = Module(new StoreBuffer)
@@ -158,19 +152,14 @@ class myCPU extends Module {
   uIssueQueue.enq <> uDisp.out
   uIssueQueue.flush := memRedirectValid
 
-  // ---- IssueQueue 空闲槽位数量反馈到 Dispatch 做流控 ----
-  uDisp.iqFreeCount := uIssueQueue.freeCount
-
   // =====================================================
   // ============ Issue（当前 1-wide，Load-Use 冒险检测）============
   // =====================================================
   val uIssue = Module(new Issue)
   // IssueQueue 4-wide 出队 ↔ Issue 控制接口
-  uIssue.iq.entries := uIssueQueue.deq.entries
-  uIssue.iq.valid   := uIssueQueue.deq.valid
-  uIssueQueue.deq.deqCount := uIssue.iq.deqCount
-  uIssueQueue.deq.ready    := uIssue.iq.ready
   uIssue.flush := memRedirectValid
+  uIssue.in := uIssueQueue.deq
+  uIssueQueue.deqCount := uIssue.fetchCount
 
   // =====================================================
   // ============ Issue → ReadReg 流水线寄存器（IssRRDff）============
@@ -178,13 +167,16 @@ class myCPU extends Module {
   val uIssRRDff = Module(new BaseDff(new Issue_ReadReg_Payload, supportFlush = true))
   uIssRRDff.in <> uIssue.out
   uIssRRDff.flush.get := memRedirectValid
+  // ---- Load-Use 冒险检测信号连接 ----
+  // Issue 阶段需要知道紧邻的指令 IssRRDff 寄存器中是否是 Load
+  uIssue.hazard.rd          := uIssRRDff.out.bits.inst(11, 7)
+  uIssue.hazard.isValidLoad := uIssRRDff.out.valid && uIssRRDff.out.bits.type_decode_together(4)
 
   // =====================================================
   // ============ ReadReg（读取寄存器堆）============
   // =====================================================
   val uReadReg = Module(new ReadReg)
   uReadReg.in <> uIssRRDff.out
-
   // ---- 寄存器堆（32 个 32 位通用寄存器）----
   val uREG = Module(new REG)
   uREG.io.reg_raddr1_i := uReadReg.regRead.raddr1
@@ -198,12 +190,6 @@ class myCPU extends Module {
   val uRRExDff = Module(new BaseDff(new ReadReg_Execute_Payload, supportFlush = true))
   uRRExDff.in <> uReadReg.out
   uRRExDff.flush.get := memRedirectValid
-
-  // ---- Load-Use 冒险检测信号连接 ----
-  // Issue 阶段需要知道 RRExDff 中正在进入 Execute 的指令是否是 Load
-  uIssue.hazard.ex_rd     := uRRExDff.out.bits.inst(11, 7)
-  uIssue.hazard.ex_isLoad := uRRExDff.out.bits.type_decode_together(4)
-  uIssue.hazard.ex_valid  := uRRExDff.out.valid
 
   // =====================================================
   // ============ Execute（执行，ALU + 分支验证 + StoreBuffer 写入）============

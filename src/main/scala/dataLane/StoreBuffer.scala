@@ -48,23 +48,19 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   val buffer = RegInit(VecInit(Seq.fill(depth)(0.U.asTypeOf(new StoreBufferEntry))))
 
   // ---- 头尾指针 ----
-  val head = RegInit(0.U(ptrWidth.W))   // 头指针（最老的表项）
-  val tail = RegInit(0.U(ptrWidth.W))   // 尾指针（下一个空闲位置）
+  val head = RegInit(0.U(ptrWidth.W)) // 头指针（最老的表项）
+  val tail = RegInit(0.U(ptrWidth.W)) // 尾指针（下一个空闲位置）
   private def idx(ptr: UInt) = ptr(idxWidth - 1, 0)
-
   val count = tail - head
-  val freeCount = depth.U - count
 
   // ===================== 分配逻辑（Dispatch 阶段）=====================
-  // canAlloc 不依赖 request，避免与 Dispatch 形成组合环路
-  // 只要空闲空间 >= 4（最多 4 条 Store），即可分配
-  alloc.canAlloc := freeCount >= 4.U
+  // canAlloc 不依赖 request，避免与 Dispatch 形成组合环路。空闲空间 >= 4 才能分配
+  alloc.canAlloc := count +& 4.U <= depth.U 
   for (i <- 0 until 4) {
     alloc.idxs(i) := tail + i.U  // 返回连续的指针
   }
 
-  // 实际执行分配
-  val doAlloc = alloc.request > 0.U && alloc.canAlloc && !rollback.valid
+  val doAlloc = alloc.request > 0.U && !rollback.valid // 判断是否真正进行分配（request > 0 且无回滚）
   when(doAlloc) {
     for (i <- 0 until 4) {
       when(i.U < alloc.request) {

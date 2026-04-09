@@ -10,18 +10,14 @@ object CPUConfig {
   sealed trait BranchPredictorType
   case object StaticBTFN extends BranchPredictorType   // 静态 BTFN (Backward Taken, Forward Not-taken)
   case object DynamicBHT extends BranchPredictorType   // 动态 2-bit 饱和计数器 (格雷码编码)
-
-  // 当前使用的分支预测策略（修改这里切换）
-  val branchPredictor: BranchPredictorType = DynamicBHT
+  val branchPredictor: BranchPredictorType = DynamicBHT // 当前使用的分支预测策略（修改这里切换）
 
   // ---- BHT 参数（仅 DynamicBHT 时有效）----
   sealed trait BHTSize { val entries: Int }
   case object BHT64  extends BHTSize { val entries = 64 }   // PC[7:2] 索引
   case object BHT128 extends BHTSize { val entries = 128 }  // PC[8:2] 索引
   case object BHT256 extends BHTSize { val entries = 256 }  // PC[9:2] 索引
-
-  // 当前 BHT 表项大小（修改这里切换）
-  val bhtSize: BHTSize = BHT64
+  val bhtSize: BHTSize = BHT64 // 当前 BHT 表项大小（修改这里切换）
   val bhtEntries: Int = bhtSize.entries
 
   // ---- ROB 参数 ----
@@ -30,11 +26,10 @@ object CPUConfig {
   val robPtrWidth: Int = robIdxWidth + 1        // ROB 指针位宽（含回绕位，8 位）
 
   // ---- FetchBuffer 参数 ----
-  val fetchWidth: Int = 4          // 每周期取指宽度
   val fetchBufferEntries: Int = 16 // FetchBuffer 容量
 
   // ---- IssueQueue 参数 ----
-  val issueQueueEntries: Int = 16  // IssueQueue 容量（4-in, 4-out 预留，当前单发射仅用 1-out）
+  val issueQueueEntries: Int = 16  // IssueQueue 容量（4-in, 4-out）
 
   // ---- StoreBuffer 参数 ----
   val sbEntries: Int = 32                          // StoreBuffer 深度

@@ -23,24 +23,19 @@ class Issue extends Module {
   val flush = IO(Input(Bool()))                               // 流水线冲刷信号
 
   // ---- IssueQueue 4-wide 出队接口 ----
-  val iq = IO(new Bundle {
-    val entries  = Input(Vec(4, new DispatchEntry))   // 4 路出队数据
-    val valid    = Input(Vec(4, Bool()))               // 4 路有效位
-    val deqCount = Output(UInt(3.W))                   // 通知 IssueQueue 实际出队数量
-    val ready    = Output(Bool())                      // 是否可以接收数据
-  })
+  val in = IO(Input(Vec(4, new DispatchEntry)))
+  val fetchCount = IO(Output(UInt(3.W)))
 
   // ---- Load-Use 冒险检测接口 ----
   // 从 RRExDff（ReadReg → Execute 流水线寄存器）获取正在进入 Execute 的指令信息
   val hazard = IO(new Bundle {
-    val ex_rd     = Input(UInt(5.W))    // Execute 阶段指令的目标寄存器编号
-    val ex_isLoad = Input(Bool())       // 该指令是否为 Load
-    val ex_valid  = Input(Bool())       // 该流水级是否有有效指令
+    val rd          = Input(UInt(5.W)) // Execute 阶段指令的目标寄存器编号
+    val isValidLoad = Input(Bool())    // 该指令是否为 Load
   })
 
   // ---- 当前版本只看第 0 路（队首指令）----
-  val entry = iq.entries(0)
-  val entryValid = iq.valid(0)
+  val entry = in(0)
+  val entryValid = in(0).valid
 
   // ---- 指令字段提取 ----
   val inst = entry.inst
@@ -61,9 +56,9 @@ class Issue extends Module {
   // 如果依赖，Load 数据要到 Memory 阶段才能通过旁路转发可用，因此需要暂停 1 拍
   val use_rs1 = jalr || bType || iType || sType || rType || lType
   val use_rs2 = bType || sType || rType
-  val loadUseStall = hazard.ex_valid && hazard.ex_isLoad && (hazard.ex_rd =/= 0.U) &&
-    ((use_rs1 && (rs1 === hazard.ex_rd)) ||
-     (use_rs2 && (rs2 === hazard.ex_rd)))
+  val loadUseStall = hazard.isValidLoad && (hazard.rd =/= 0.U) &&
+    ((use_rs1 && (rs1 === hazard.rd)) ||
+     (use_rs2 && (rs2 === hazard.rd)))
 
   // ---- 是否可以发射当前指令 ----
   val canIssue = entryValid && !loadUseStall && !flush
@@ -84,7 +79,6 @@ class Issue extends Module {
   // ---- 握手信号 ----
   out.valid := canIssue
 
-  // 通知 IssueQueue 实际出队数量：当前版本只出队 0 或 1 条
-  iq.deqCount := Mux(canIssue && out.ready, 1.U, 0.U)
-  iq.ready    := out.ready && !loadUseStall
+  // 通知 IssueQueue 实际出队数量：当前版本只出队 0 或 1 条，出队 0 条相当于 ready 反压
+  fetchCount := Mux(canIssue && out.ready, 1.U, 0.U)
 }
