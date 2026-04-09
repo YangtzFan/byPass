@@ -64,8 +64,8 @@ class Memory extends Module {
   sbWrite.mask  := in.bits.inst_funct3         // Store 宽度掩码 = funct3
 
   // ---- StoreBuffer 查询（Load 指令）----
-  sbQuery.valid  := in.valid && lType
-  sbQuery.addr   := in.bits.data       // Load 地址 = ALU 计算结果
+  sbQuery.valid := in.valid && lType
+  sbQuery.addr  := in.bits.data       // Load 地址 = ALU 计算结果
 
   // ---- Store-to-Load 冒险检测 ----
   // 当 Load 在 StoreBuffer 中找到地址匹配的 Store 时（hit=true），需要停顿。

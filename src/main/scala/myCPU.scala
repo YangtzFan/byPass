@@ -192,11 +192,10 @@ class myCPU extends Module {
   uRRExDff.flush.get := memRedirectValid
 
   // =====================================================
-  // ============ Execute（执行，ALU + 分支验证 + StoreBuffer 写入）============
+  // ============ Execute（执行，ALU + 分支验证）============
   // =====================================================
   val uExecute = Module(new Execute)
   uExecute.in <> uRRExDff.out
-
   // ---- BHT 更新：Execute 阶段得到分支实际结果后回写 BHT ----
   if (CPUConfig.useBHT) {
     // Memory redirect 时抑制更新，防止错误路径的分支污染 BHT

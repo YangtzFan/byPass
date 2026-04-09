@@ -27,9 +27,9 @@ class Issue extends Module {
   val fetchCount = IO(Output(UInt(3.W)))
 
   // ---- Load-Use 冒险检测接口 ----
-  // 从 RRExDff（ReadReg → Execute 流水线寄存器）获取正在进入 Execute 的指令信息
+  // 从 IssRRDff（Issue → ReadReg 流水寄存器）获取正在进入 ReadReg 的指令信息
   val hazard = IO(new Bundle {
-    val rd          = Input(UInt(5.W)) // Execute 阶段指令的目标寄存器编号
+    val rd          = Input(UInt(5.W)) // ReadReg 阶段指令的目标寄存器编号
     val isValidLoad = Input(Bool())    // 该指令是否为 Load
   })
 

@@ -23,7 +23,7 @@ class FetchBufferEntry extends Bundle {
   val predict_taken  = Bool()     // Fetch 阶段 BPU 预测结果
   val predict_target = UInt(32.W) // 预测跳转目标
   val bht_meta       = UInt(2.W)  // BHT 状态快照
-  val valid          = Bool() // 有效指示位
+  val valid = Bool()              // 有效指示位
 }
 
 // ==========================================================================
@@ -78,17 +78,17 @@ class DispatchPacket extends Bundle {
 // Issue 阶段从 IssueQueue 取出 1 条指令，传给 ReadReg 阶段读取寄存器
 // ==========================================================================
 class Issue_ReadReg_Payload extends Bundle {
-  val pc                   = UInt(32.W)
-  val inst                 = UInt(32.W)
-  val imm                  = UInt(32.W)
-  val type_decode_together = UInt(9.W)
-  val predict_taken        = Bool()
-  val predict_target       = UInt(32.W)
-  val bht_meta             = UInt(2.W)
-  val robIdx               = UInt(CPUConfig.robPtrWidth.W)
-  val regWriteEnable       = Bool()
-  val sbIdx                = UInt(CPUConfig.sbPtrWidth.W)
-  val isSbAlloc            = Bool()
+  val pc             = UInt(32.W) // 指令 PC
+  val inst           = UInt(32.W) // 32 位指令
+  val imm                  = UInt(32.W)       // 符号扩展后的立即数
+  val type_decode_together = UInt(9.W)        // 指令类型独热编码 {U,JAL,JALR,B,L,I,S,R,Other}
+  val robIdx         = UInt(CPUConfig.robPtrWidth.W) // 分配到的 ROB 指针（含回绕位）
+  val regWriteEnable = Bool()                        // 是否需要写回寄存器
+  val sbIdx          = UInt(CPUConfig.sbPtrWidth.W)  // 分配到的 StoreBuffer 指针（仅 Store 有效）
+  val isSbAlloc      = Bool()                        // 是否在 StoreBuffer 中分配了表项
+  val predict_taken  = Bool()     // Fetch 阶段 BPU 预测结果
+  val predict_target = UInt(32.W) // 预测跳转目标
+  val bht_meta       = UInt(2.W)  // BHT 状态快照
 }
 
 // ==========================================================================
@@ -96,20 +96,9 @@ class Issue_ReadReg_Payload extends Bundle {
 // ==========================================================================
 // ReadReg 阶段读取寄存器堆获得 rs1/rs2 的值，作为旁路链的兜底值
 // ==========================================================================
-class ReadReg_Execute_Payload extends Bundle {
-  val pc                   = UInt(32.W)
-  val inst                 = UInt(32.W)
-  val robIdx               = UInt(CPUConfig.robPtrWidth.W)
-  val src1Data             = UInt(32.W)       // ReadReg 阶段读到的 rs1 数据（转发链兜底值）
-  val src2Data             = UInt(32.W)       // ReadReg 阶段读到的 rs2 数据（转发链兜底值）
-  val imm                  = UInt(32.W)       // 立即数
-  val type_decode_together = UInt(9.W)        // 指令类型独热编码
-  val predict_taken        = Bool()
-  val predict_target       = UInt(32.W)
-  val bht_meta             = UInt(2.W)
-  val regWriteEnable       = Bool()           // 该指令是否需要写回寄存器
-  val sbIdx                = UInt(CPUConfig.sbPtrWidth.W)
-  val isSbAlloc            = Bool()
+class ReadReg_Execute_Payload extends Issue_ReadReg_Payload {
+  val src1Data = UInt(32.W) // ReadReg 阶段读到的 rs1 数据（转发链兜底值）
+  val src2Data = UInt(32.W) // ReadReg 阶段读到的 rs2 数据（转发链兜底值）
 }
 
 // ==========================================================================
@@ -117,23 +106,23 @@ class ReadReg_Execute_Payload extends Bundle {
 // ==========================================================================
 class Execute_Memory_Payload extends Bundle {
   val pc                   = UInt(32.W)
-  val inst_funct3          = UInt(3.W)        // Load/Store 的 funct3
-  val inst_rd              = UInt(5.W)        // 目标寄存器
-  val data                 = UInt(32.W)       // ALU 结果 / 地址 / 链接地址等
-  val reg_rdata2           = UInt(32.W)       // Store 的写入数据（rs2 的值）
+  val inst_funct3          = UInt(3.W)  // Load/Store 的 funct3
+  val inst_rd              = UInt(5.W)  // 目标寄存器
+  val data                 = UInt(32.W) // ALU 结果 / 地址 / 链接地址等
+  val reg_rdata2           = UInt(32.W) // Store 的写入数据（rs2 的值）
   val type_decode_together = UInt(9.W)
   val robIdx               = UInt(CPUConfig.robPtrWidth.W)
   val regWriteEnable       = Bool()
-  val isBranch             = Bool()           // 是否为分支指令
-  val isJump               = Bool()           // 是否为 JAL/JALR
-  val predict_taken        = Bool()           // Fetch 阶段的预测
-  val predict_target       = UInt(32.W)
-  val actual_taken         = Bool()           // Execute 阶段计算出的实际结果
-  val actual_target        = UInt(32.W)       // 实际跳转目标
-  val mispredict           = Bool()           // 是否预测错误
+  val isBranch             = Bool()     // 是否为分支指令
+  val isJump               = Bool()     // 是否为 JAL/JALR
+  val predict_taken        = Bool()     // Fetch 阶段预测是否跳转
+  val predict_target       = UInt(32.W) // Fetch 阶段的跳转目标
+  val actual_taken         = Bool()     // Execute 阶段计算出的实际结果
+  val actual_target        = UInt(32.W) // 实际跳转目标
+  val mispredict           = Bool()     // 是否预测错误
   val bht_meta             = UInt(2.W)
-  val sbIdx                = UInt(CPUConfig.sbPtrWidth.W)   // StoreBuffer 指针
-  val isSbAlloc            = Bool()                         // 是否分配了 StoreBuffer 表项
+  val isSbAlloc            = Bool()     // 是否分配了 StoreBuffer 表项
+  val sbIdx                = UInt(CPUConfig.sbPtrWidth.W) // StoreBuffer 指针
 }
 
 // ==========================================================================
@@ -142,7 +131,7 @@ class Execute_Memory_Payload extends Bundle {
 class Memory_Refresh_Payload extends Bundle {
   val pc                   = UInt(32.W)
   val inst_rd              = UInt(5.W)
-  val data                 = UInt(32.W)       // 最终数据（ALU 结果或 Load 读回值）
+  val data                 = UInt(32.W) // 最终数据（ALU 结果或 Load 读回值）
   val type_decode_together = UInt(9.W)
   val robIdx               = UInt(CPUConfig.robPtrWidth.W)
   val regWriteEnable       = Bool()
@@ -160,11 +149,11 @@ class Memory_Refresh_Payload extends Bundle {
 // StoreBufferEntry：StoreBuffer 中每个表项存储的字段
 // ==========================================================================
 class StoreBufferEntry extends Bundle {
-  val valid     = Bool()           // 表项是否有效（已分配）
-  val addrValid = Bool()           // 地址是否已写入（Execute 阶段写入地址和数据）
-  val addr      = UInt(32.W)       // Store 地址
-  val data      = UInt(32.W)       // Store 数据
-  val mask      = UInt(3.W)        // Store 宽度掩码（funct3）
+  val valid     = Bool()     // 表项是否有效（已分配）
+  val addrValid = Bool()     // 地址是否已写入（Execute 阶段写入地址和数据）
+  val addr      = UInt(32.W) // Store 地址
+  val data      = UInt(32.W) // Store 数据
+  val mask      = UInt(3.W)  // Store 宽度掩码（funct3）
   val robIdx    = UInt(CPUConfig.robPtrWidth.W) // 对应的 ROB 指针（用于判断年龄）
 }
 
@@ -172,7 +161,7 @@ class StoreBufferEntry extends Bundle {
 // StoreBuffer IO Bundle 定义
 // ==========================================================================
 // 以下 Bundle 定义了 StoreBuffer 的各个接口，方向统一以"使用者侧"（Dispatch/
-// Execute/Memory/myCPU）为基准。StoreBuffer 内部使用 Flipped() 翻转方向。
+// Memory/myCPU）为基准。StoreBuffer 内部使用 Flipped() 翻转方向。
 
 // ---- 分配接口（Dispatch 阶段请求分配 Store 表项）----
 class SBAllocIO extends Bundle {
@@ -181,7 +170,7 @@ class SBAllocIO extends Bundle {
   val idxs     = Input(Vec(4, UInt(CPUConfig.sbPtrWidth.W))) // 分配的 StoreBuffer 指针
 }
 
-// ---- 写入接口（Execute 阶段写入 Store 地址和数据）----
+// ---- 写入接口（Memory 阶段写入 Store 地址和数据）----
 class SBWriteIO extends Bundle {
   val valid = Output(Bool())                                // 写入使能
   val idx   = Output(UInt(CPUConfig.sbPtrWidth.W))          // 要写的 StoreBuffer 指针

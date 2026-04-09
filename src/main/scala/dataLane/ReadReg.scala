@@ -55,8 +55,8 @@ class ReadReg extends Module {
   out.bits.pc                   := in.bits.pc
   out.bits.inst                 := in.bits.inst
   out.bits.robIdx               := in.bits.robIdx
-  out.bits.src1Data             := regRead.rdata1   // 寄存器堆读取的 rs1 值（旁路链兜底值）
-  out.bits.src2Data             := regRead.rdata2   // 寄存器堆读取的 rs2 值（旁路链兜底值）
+  out.bits.src1Data             := regRead.rdata1 // 寄存器堆读取的 rs1 值（旁路链兜底值）
+  out.bits.src2Data             := regRead.rdata2 // 寄存器堆读取的 rs2 值（旁路链兜底值）
   out.bits.imm                  := in.bits.imm
   out.bits.type_decode_together := td
   out.bits.predict_taken        := in.bits.predict_taken

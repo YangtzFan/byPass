@@ -42,9 +42,9 @@ class Execute extends Module {
   // ---- BHT 更新端口（仅 useBHT 时生成）----
   private val bhtIdxWidth = log2Ceil(CPUConfig.bhtEntries)
   val bht_update = Option.when(CPUConfig.useBHT){IO(new Bundle {
-    val valid = Output(Bool())           // 是否更新 BHT
+    val valid = Output(Bool()) // 是否更新 BHT
     val idx   = Output(UInt(bhtIdxWidth.W)) // BHT 表项索引
-    val taken = Output(Bool())           // 实际跳转结果
+    val taken = Output(Bool()) // 实际跳转结果
   })}
 
   // ---- 指令字段提取 ----
@@ -53,19 +53,18 @@ class Execute extends Module {
   val rs1 = in.bits.inst(19, 15)
   val rs2 = in.bits.inst(24, 20)
 
-  // ---- 指令类型提取（从 9 位独热编码中取各位）----
-  val uType = in.bits.type_decode_together(8)   // LUI / AUIPC
-  val jal = in.bits.type_decode_together(7)     // JAL
-  val jalr = in.bits.type_decode_together(6)    // JALR
-  val bType = in.bits.type_decode_together(5)   // B 型分支
-  val lType = in.bits.type_decode_together(4)   // Load
-  val iType = in.bits.type_decode_together(3)   // I 型算术/逻辑
-  val sType = in.bits.type_decode_together(2)   // Store
-  val rType = in.bits.type_decode_together(1)   // R 型算术/逻辑
-  val other = in.bits.type_decode_together(0)   // FENCE / ECALL
-
-  val lui = uType && in.bits.inst(5)            // LUI（opcode bit5=1）
-  val auipc = uType && !in.bits.inst(5)         // AUIPC（opcode bit5=0）
+  // ---- 指令类型 ----
+  val uType = in.bits.type_decode_together(8) // LUI / AUIPC
+  val jal   = in.bits.type_decode_together(7) // JAL
+  val jalr  = in.bits.type_decode_together(6) // JALR
+  val bType = in.bits.type_decode_together(5) // B 型分支
+  val lType = in.bits.type_decode_together(4) // Load
+  val iType = in.bits.type_decode_together(3) // I 型算术/逻辑
+  val sType = in.bits.type_decode_together(2) // Store
+  val rType = in.bits.type_decode_together(1) // R 型算术/逻辑
+  val other = in.bits.type_decode_together(0) // FENCE / ECALL
+  val lui = uType && in.bits.inst(5)          // LUI（opcode bit5=1）
+  val auipc = uType && !in.bits.inst(5)       // AUIPC（opcode bit5=0）
 
   // ============================================================
   // 数据旁路转发选择 MUX
@@ -154,25 +153,25 @@ class Execute extends Module {
   out.bits.pc := in.bits.pc
   out.bits.inst_funct3 := Mux(lType || sType, funct3, 0.U) // Load/Store 需要 funct3
   out.bits.inst_rd := Mux(uType || jal || jalr || lType || iType || rType, rd, 0.U) // 有写回的指令
-  out.bits.data := MuxCase(0.U(32.W), Seq(
+  out.bits.data := MuxCase(0.U(32.W), Seq(                 // 传入下一级的数据
     lui -> in.bits.imm,                                    // LUI：直接输出高 20 位立即数
     (auipc || lType || sType || iType || rType) -> uALU.io.result, // ALU 结果
     (jal || jalr) -> (in.bits.pc + 4.U(32.W))              // JAL/JALR：链接地址 = PC+4
   ))
-  out.bits.reg_rdata2 := Mux(sType, actual_rdata2, 0.U)    // Store 的写入数据（保留用于后续阶段）
+  out.bits.reg_rdata2           := Mux(sType, actual_rdata2, 0.U) // Store 的写入数据（保留用于后续阶段）
   out.bits.type_decode_together := in.bits.type_decode_together
-  out.bits.robIdx := in.bits.robIdx
-  out.bits.regWriteEnable := in.bits.regWriteEnable
-  out.bits.isBranch := bType
-  out.bits.isJump := jal || jalr
-  out.bits.predict_taken := in.bits.predict_taken
-  out.bits.predict_target := in.bits.predict_target
-  out.bits.actual_taken := actual_taken_val
-  out.bits.actual_target := actual_target_addr
-  out.bits.mispredict := isMispredict
-  out.bits.bht_meta := in.bits.bht_meta
-  out.bits.sbIdx := in.bits.sbIdx
-  out.bits.isSbAlloc := in.bits.isSbAlloc
+  out.bits.robIdx               := in.bits.robIdx
+  out.bits.regWriteEnable       := in.bits.regWriteEnable
+  out.bits.isBranch             := bType
+  out.bits.isJump               := jal || jalr
+  out.bits.predict_taken        := in.bits.predict_taken
+  out.bits.predict_target       := in.bits.predict_target
+  out.bits.actual_taken         := actual_taken_val
+  out.bits.actual_target        := actual_target_addr
+  out.bits.mispredict           := isMispredict
+  out.bits.bht_meta             := in.bits.bht_meta
+  out.bits.isSbAlloc            := in.bits.isSbAlloc
+  out.bits.sbIdx                := in.bits.sbIdx
 
   in.ready := out.ready
   out.valid := in.valid

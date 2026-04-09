@@ -21,9 +21,9 @@ object CPUConfig {
   val bhtEntries: Int = bhtSize.entries
 
   // ---- ROB 参数 ----
-  val robEntries: Int = 128        // ROB 表项数
-  val robIdxWidth: Int = log2Ceil(robEntries)   // ROB 索引位宽（7 位）
-  val robPtrWidth: Int = robIdxWidth + 1        // ROB 指针位宽（含回绕位，8 位）
+  val robEntries: Int = 128 // ROB 表项数
+  val robIdxWidth: Int = log2Ceil(robEntries) // ROB 索引位宽（7 位）
+  val robPtrWidth: Int = robIdxWidth + 1      // ROB 指针位宽（含回绕位，8 位）
 
   // ---- FetchBuffer 参数 ----
   val fetchBufferEntries: Int = 16 // FetchBuffer 容量

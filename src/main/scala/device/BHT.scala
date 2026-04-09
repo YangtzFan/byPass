@@ -7,7 +7,6 @@ import chisel3.util._
 // 使用格雷码状态机编码，相邻状态仅 1 bit 翻转，降低翻转功耗、改善时序
 //   SNT(00) ←→ WNT(01) ←→ WT(11) ←→ ST(10)
 //   predict_taken = counter[1]（高位为 1 表示预测跳转，即 WT/ST 状态）
-//
 // 支持 4 个并行读端口（供 Fetch 阶段 4-wide BPU 使用）和 1 个写端口（Execute 更新）
 class BHT(entries: Int = 64, readPorts: Int = 4) extends Module {
   val idxWidth = log2Ceil(entries)

@@ -9,7 +9,7 @@ import mycpu.CPUConfig
 // ============================================================================
 // 核心职责：
 //   1. Dispatch 阶段为 Store 指令分配表项（设置 valid=true, addrValid=false）
-//   2. Execute 阶段写入 Store 地址和数据信息（设置 addrValid=true）
+//   2. Memory 阶段写入 Store 地址和数据信息（设置 addrValid=true）
 //   3. Memory 阶段 Load 指令查询：
 //      a) 检查所有更老且未提交的 StoreBuffer 项
 //      b) 若存在更老 Store 且地址命中 → 从 StoreBuffer 转发数据
@@ -32,17 +32,17 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   // ---- 分配接口（Dispatch 阶段使用）----
   val alloc = IO(Flipped(new SBAllocIO))
 
-  // ---- Store 写入接口（Execute 阶段使用：写入 Store 地址和数据）----
+  // ---- Store 写入接口（Memory 阶段使用：写入 Store 地址和数据）----
   val write = IO(Flipped(new SBWriteIO))
 
   // ---- Load 查询接口（Memory 阶段使用：Store-to-Load 转发）----
   val query = IO(Flipped(new SBQueryIO))
 
-  // ---- 提交接口（Commit 阶段使用：将 Store 写入内存）----
-  val commit = IO(Flipped(new SBCommitIO))
-
   // ---- 回滚接口（Memory 重定向时使用）----
   val rollback = IO(Flipped(new SBRollbackIO))
+
+  // ---- 提交接口（Commit 阶段使用：将 Store 写入内存）----
+  val commit = IO(Flipped(new SBCommitIO))
 
   // ---- 存储阵列 ----
   val buffer = RegInit(VecInit(Seq.fill(depth)(0.U.asTypeOf(new StoreBufferEntry))))
@@ -65,20 +65,20 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     for (i <- 0 until 4) {
       when(i.U < alloc.request) {
         val allocPtr = tail + i.U
-        val entry = buffer(idx(allocPtr))
-        entry.valid     := true.B
-        entry.addrValid := false.B   // 地址尚未计算（等 Execute 阶段写入）
-        entry.addr      := 0.U
-        entry.data      := 0.U
-        entry.mask      := 0.U
-        entry.robIdx    := 0.U      // ROB 索引由 Dispatch 在写入时填入
+        val aEntry = buffer(idx(allocPtr))
+        aEntry.valid     := true.B
+        aEntry.addrValid := false.B // 地址尚未计算（等 Memory 阶段写入）
+        aEntry.addr      := 0.U
+        aEntry.data      := 0.U
+        aEntry.mask      := 0.U
+        aEntry.robIdx    := 0.U     // ROB 索引由 Dispatch 在写入时填入（ TODO: 但是并没有写入）
       }
     }
     tail := tail + alloc.request
   }
 
   // ===================== 写入逻辑（Memory 阶段 Store 指令）=====================
-  // Execute 阶段计算出 Store 地址和数据后，写入对应的 StoreBuffer 表项
+  // Memory 阶段计算出 Store 地址和数据后，写入对应的 StoreBuffer 表项
   when(write.valid) {
     val wEntry = buffer(idx(write.idx))
     wEntry.addrValid := true.B
@@ -96,12 +96,13 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   val hitVec = Wire(Vec(depth, Bool()))     // 每个表项是否地址命中
   val pendingVec = Wire(Vec(depth, Bool())) // 是否有地址还未确定的表项（需要等待）
   for (i <- 0 until depth) {
-    // 判断该表项是否是比 Load 更老的有效 Store
+    val lEntry = buffer(i)
+    // 判断该表项是否是比 Load 更老的有效 Store // TODO
     // 使用简单的 robIdx 比较：ROB 指针的差值判断新旧关系
-    hitVec(i) := buffer(i).valid && buffer(i).addrValid && (buffer(i).addr === query.addr)
+    hitVec(i) := lEntry.valid && lEntry.addrValid && (lEntry.addr === query.addr)
     // 遍历所有表项，检查是否存在 valid=true 但 addrValid=false 的 Store 项
     // 如果存在，说明有 Store 的地址尚未计算完成，可能与当前 Load 地址冲突，此时停顿流水线
-    pendingVec(i) := buffer(i).valid && !buffer(i).addrValid
+    pendingVec(i) := lEntry.valid && !lEntry.addrValid
   }
   query.hit := query.valid && hitVec.asUInt.orR
   query.pending := query.valid && pendingVec.asUInt.orR
