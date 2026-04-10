@@ -36,9 +36,11 @@ class Memory extends Module {
 
   // ---- Memory 阶段重定向输出 ----
   val redirect = IO(new Bundle {
-    val valid  = Output(Bool())                        // 需要重定向
-    val addr   = Output(UInt(32.W))                    // 正确的跳转目标地址
-    val robIdx = Output(UInt(CPUConfig.robPtrWidth.W)) // 误预测指令的 ROB 指针（用于回滚）
+    val valid        = Output(Bool())                              // 需要重定向
+    val addr         = Output(UInt(32.W))                          // 正确的跳转目标地址
+    val robIdx       = Output(UInt(CPUConfig.robPtrWidth.W))       // 误预测指令的 ROB 指针（用于 ROB 回滚）
+    val storeSeqSnap = Output(UInt(CPUConfig.storeSeqWidth.W))     // 误预测指令的 storeSeqSnap（用于 StoreBuffer 精确回滚）
+    val checkpointIdx = Output(UInt(CPUConfig.ckptPtrWidth.W)) // 误预测指令的 checkpoint 全指针（含回绕位，用于 BCT 恢复）
   })
 
   // ---- StoreBuffer 写入端口（将 Store 地址和数据写入 StoreBuffer）----
@@ -46,6 +48,9 @@ class Memory extends Module {
 
   // ---- StoreBuffer 查询接口（Load 指令需要检查 Store-to-Load 转发）----
   val sbQuery = IO(new SBQueryIO)
+
+  // ---- 外部 Store drain 信号：当 drain 正在写 DRAM 时，Load 不能读 DRAM（端口冲突）----
+  val drainActive = IO(Input(Bool()))
 
   // 从类型编码中提取各指令类型
   val uType = in.bits.type_decode_together(8)
@@ -64,17 +69,24 @@ class Memory extends Module {
   sbWrite.mask  := in.bits.inst_funct3         // Store 宽度掩码 = funct3
 
   // ---- StoreBuffer 查询（Load 指令）----
-  sbQuery.valid := in.valid && lType
-  sbQuery.addr  := in.bits.data       // Load 地址 = ALU 计算结果
+  sbQuery.valid        := in.valid && lType
+  sbQuery.addr         := in.bits.data       // Load 地址 = ALU 计算结果
+  sbQuery.storeSeqSnap := in.bits.storeSeqSnap  // 只查 storeSeq < snap 的更老 Store
 
   // ---- Store-to-Load 冒险检测 ----
-  // 当 Load 在 StoreBuffer 中找到地址匹配的 Store 时（hit=true），需要停顿。
-  // 原因：StoreBuffer 中存储的是完整寄存器值，直接转发无法处理字节/半字的提取和符号扩展，
-  //       而 DRAM 端的 dram_driver 会正确处理字节/半字的读取。
-  // 策略：停顿等待匹配的 Store 提交到 DRAM 后 SB 表项释放（hit 变为 false），
-  //       然后 Load 从 DRAM 读取正确的数据（包含字节选择和符号扩展）。
-  // 注意：当 hit=false 时，Load 地址在 SB 中无匹配，可以安全地直接从 DRAM 读取。
-  val sbStall = sbQuery.hit
+  // 停顿条件（hit 或 pending 任一成立）：
+  //   hit=true：有更老 Store 地址命中但当前不支持字节/半字提取的转发，需等 Store drain 后读 DRAM
+  //   pending=true：有更老 Store 地址未知，可能冲突，需等 Store 地址写入后重新检查
+  val sbStall = sbQuery.hit || sbQuery.pending
+
+  // ---- DRAM 端口冲突停顿 ----
+  // 当 Store drain 正在占用 DRAM 端口时，Load 必须停顿（否则读到 Store 地址对应的数据）
+  // 只有 Load 指令需要 DRAM 端口，其他指令不受影响
+  val dramConflict = lType && drainActive
+
+  // 综合停顿信号：SB 停顿或 DRAM 端口冲突（仅 Load 时有效）
+  val memStall = sbStall || dramConflict
+
 
   // DRAM 读端口：只有 Load 指令且不从 StoreBuffer 转发时才需要读 DRAM
   io.ram_addr_o := Mux(lType && !sbQuery.hit, in.bits.data, 0.U)
@@ -82,9 +94,11 @@ class Memory extends Module {
 
   // ---- 重定向逻辑 ----
   // 当 Execute 阶段检测到分支预测错误时，Memory 阶段发出重定向信号
-  redirect.valid  := in.valid && in.bits.mispredict && !sbStall
-  redirect.addr   := in.bits.actual_target
-  redirect.robIdx := in.bits.robIdx
+  redirect.valid        := in.valid && in.bits.mispredict && !memStall
+  redirect.addr         := in.bits.actual_target
+  redirect.robIdx       := in.bits.robIdx
+  redirect.storeSeqSnap := in.bits.storeSeqSnap  // 传递给 StoreBuffer 用于精确回滚
+  redirect.checkpointIdx := in.bits.checkpointIdx // 传递 checkpoint 索引用于 BCT 恢复
 
   // ---- Load 数据来源选择 ----
   // 优先级：StoreBuffer 转发 > DRAM 读取
@@ -93,6 +107,7 @@ class Memory extends Module {
   // ---- 输出结果打包 ----
   out.bits.pc := in.bits.pc
   out.bits.inst_rd := Mux(uType || jal || jalr || lType || iType || rType, in.bits.inst_rd, 0.U)
+  out.bits.pdst := Mux(uType || jal || jalr || lType || iType || rType, in.bits.pdst, 0.U) // 物理目的寄存器透传
   out.bits.data := MuxCase(0.U, Seq(
     (uType || jal || jalr || iType || rType) -> in.bits.data,  // 非访存指令：透传 ALU 结果
     lType -> loadData                                           // Load：StoreBuffer 转发或 DRAM 读回
@@ -111,6 +126,6 @@ class Memory extends Module {
 
   // ---- 握手信号 ----
   // StoreBuffer 地址未知停顿时：不消费输入，不输出
-  in.ready  := out.ready && !sbStall
-  out.valid := in.valid && !sbStall
+  in.ready  := out.ready && !memStall
+  out.valid := in.valid && !memStall
 }

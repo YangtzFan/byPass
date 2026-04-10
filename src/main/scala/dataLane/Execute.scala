@@ -23,18 +23,23 @@ class Execute extends Module {
   val out = IO(Decoupled(new Execute_Memory_Payload))           // 输出：送往 ExMemDff → Memory
 
   // ---- 数据旁路转发输入端口 ----
-  // 共 3 个转发来源，由 myCPU 顶层连接
+  // 共 4 个转发来源，由 myCPU 顶层连接
+  // 使用物理寄存器编号 pdst 进行匹配（替代逻辑寄存器编号）
   val fwd = IO(new Bundle {
     // 第 1 级：来自 ExMemDff（Execute 前 1 条指令，即 Memory 阶段正在处理的指令）
-    val mem_rd   = Input(UInt(5.W))     // 目标寄存器编号
-    val mem_data = Input(UInt(32.W))    // 转发数据
-    val mem_wen  = Input(Bool())        // 转发使能
+    val mem_pdst = Input(UInt(CPUConfig.prfAddrWidth.W))  // 物理目的寄存器编号
+    val mem_data = Input(UInt(32.W))                       // 转发数据
+    val mem_wen  = Input(Bool())                           // 转发使能
     // 第 2 级：来自 MemRefDff（Memory → Refresh 流水线寄存器，Load 数据已可用）
-    val ref_rd   = Input(UInt(5.W))
+    val ref_pdst = Input(UInt(CPUConfig.prfAddrWidth.W))
     val ref_data = Input(UInt(32.W))
     val ref_wen  = Input(Bool())
-    // 第 3 级：ROB Commit（同周期正在提交的指令）
-    val commit_rd   = Input(UInt(5.W))
+    // 第 3 级：Refresh 结果缓存（上一周期从 MemRefDff 流出的结果，覆盖 MemRefDff → Commit 之间的转发空窗）
+    val refBuf_pdst = Input(UInt(CPUConfig.prfAddrWidth.W))
+    val refBuf_data = Input(UInt(32.W))
+    val refBuf_wen  = Input(Bool())
+    // 第 4 级：ROB Commit（同周期正在提交的指令）
+    val commit_pdst = Input(UInt(CPUConfig.prfAddrWidth.W))
     val commit_data = Input(UInt(32.W))
     val commit_wen  = Input(Bool())
   })
@@ -52,6 +57,10 @@ class Execute extends Module {
   val funct3 = in.bits.inst(14, 12)
   val rs1 = in.bits.inst(19, 15)
   val rs2 = in.bits.inst(24, 20)
+  // 物理寄存器编号（用于旁路匹配）
+  val psrc1 = in.bits.psrc1
+  val psrc2 = in.bits.psrc2
+  val pdst  = in.bits.pdst
 
   // ---- 指令类型 ----
   val uType = in.bits.type_decode_together(8) // LUI / AUIPC
@@ -71,27 +80,55 @@ class Execute extends Module {
   // ============================================================
   // 兜底值来自 ReadReg 阶段的寄存器堆读取（经 RRExDff 传入）
 
-  // rs1 的旁路匹配检测（按优先级从高到低）
-  val fwd_rs1_from_mem = fwd.mem_wen && (fwd.mem_rd =/= 0.U) && (fwd.mem_rd === rs1)
-  val fwd_rs1_from_ref = fwd.ref_wen && (fwd.ref_rd =/= 0.U) && (fwd.ref_rd === rs1)
-  val fwd_rs1_from_commit = fwd.commit_wen && (fwd.commit_rd =/= 0.U) && (fwd.commit_rd === rs1)
+  // rs1 的旁路匹配检测（使用物理寄存器编号，按优先级从高到低）
+  val fwd_rs1_from_mem = fwd.mem_wen && (fwd.mem_pdst =/= 0.U) && (fwd.mem_pdst === psrc1)
+  val fwd_rs1_from_ref = fwd.ref_wen && (fwd.ref_pdst =/= 0.U) && (fwd.ref_pdst === psrc1)
+  val fwd_rs1_from_commit = fwd.commit_wen && (fwd.commit_pdst =/= 0.U) && (fwd.commit_pdst === psrc1)
+  val fwd_rs1_from_refBuf = fwd.refBuf_wen && (fwd.refBuf_pdst =/= 0.U) && (fwd.refBuf_pdst === psrc1)
   val actual_rdata1 = PriorityMux(Seq(
-    fwd_rs1_from_mem    -> fwd.mem_data,       // 优先级最高：Memory 级
-    fwd_rs1_from_ref    -> fwd.ref_data,       // 第 2 优先：Refresh 级
-    fwd_rs1_from_commit -> fwd.commit_data,    // 第 3 优先：Commit 级
-    true.B              -> in.bits.src1Data    // 兜底：ReadReg 阶段读取的值
+    fwd_rs1_from_mem    -> fwd.mem_data,       // 优先级最高：Memory 级（非 Load）
+    fwd_rs1_from_ref    -> fwd.ref_data,       // 第 2 优先：Refresh 级（MemRefDff，含 Load 数据）
+    fwd_rs1_from_commit -> fwd.commit_data,    // 第 3 优先：Commit 级（当前周期正在提交的指令）
+    fwd_rs1_from_refBuf -> fwd.refBuf_data,    // 第 4 优先：Refresh 结果缓存（覆盖 MemRefDff→Commit 空窗）
+    true.B              -> in.bits.src1Data    // 兜底：ReadReg 阶段从 PRF 读取的值
   ))
 
-  // rs2 的旁路匹配检测（同样优先级规则）
-  val fwd_rs2_from_mem = fwd.mem_wen && (fwd.mem_rd =/= 0.U) && (fwd.mem_rd === rs2)
-  val fwd_rs2_from_ref = fwd.ref_wen && (fwd.ref_rd =/= 0.U) && (fwd.ref_rd === rs2)
-  val fwd_rs2_from_commit = fwd.commit_wen && (fwd.commit_rd =/= 0.U) && (fwd.commit_rd === rs2)
+  // rs2 的旁路匹配检测（使用物理寄存器编号，同样优先级规则）
+  val fwd_rs2_from_mem = fwd.mem_wen && (fwd.mem_pdst =/= 0.U) && (fwd.mem_pdst === psrc2)
+  val fwd_rs2_from_ref = fwd.ref_wen && (fwd.ref_pdst =/= 0.U) && (fwd.ref_pdst === psrc2)
+  val fwd_rs2_from_commit = fwd.commit_wen && (fwd.commit_pdst =/= 0.U) && (fwd.commit_pdst === psrc2)
+  val fwd_rs2_from_refBuf = fwd.refBuf_wen && (fwd.refBuf_pdst =/= 0.U) && (fwd.refBuf_pdst === psrc2)
   val actual_rdata2 = PriorityMux(Seq(
     fwd_rs2_from_mem    -> fwd.mem_data,
     fwd_rs2_from_ref    -> fwd.ref_data,
     fwd_rs2_from_commit -> fwd.commit_data,
-    true.B              -> in.bits.src2Data    // 兜底：ReadReg 阶段读取的值
+    fwd_rs2_from_refBuf -> fwd.refBuf_data,
+    true.B              -> in.bits.src2Data    // 兜底：ReadReg 阶段从 PRF 读取的值
   ))
+
+  // ============================================================
+  // Execute 级 Load-Use 冒险检测
+  // ============================================================
+  // 当 ExMemDff 中的指令是 Load（mem_wen=false，因为 Load 数据不可用），
+  // 且当前 Execute 指令依赖该 Load 的 rd 时，需要额外停顿 1 周期。
+  //
+  // 正常情况下，Issue 级的 Load-Use 冒险检测已经保证了 Load 和依赖指令间有 1 周期间隔。
+  // 但如果 Memory 阶段因 StoreBuffer 停顿或 DRAM 端口冲突而额外停顿，
+  // 流水线会"压缩"，导致 Load 和依赖指令同时到达 Memory 和 Execute
+  // （Load 在 ExMemDff 出口 / Memory 阶段，依赖指令在 Execute 阶段），
+  // 此时 Load 数据尚未计算完成，旁路转发无法提供正确数据。
+  //
+  // 解决方案：在 Execute 级额外检测 ExMemDff 中的 Load 是否与当前指令有 RAW 冒险。
+  // 使用 fwd.mem_rd（ExMemDff 中指令的 rd）和 fwd.mem_wen（是否可旁路转发）判断。
+  // 如果 fwd.mem_wen=false 且 fwd.mem_rd 匹配 rs1 或 rs2 → 停顿。
+  // 注意：需要排除 rd=x0 的情况（x0 不会被写入）。
+  val memLoadIsValid = IO(Input(Bool()))  // ExMemDff.out.valid（ExMemDff 是否有有效数据）
+  val memLoadIsLoad  = IO(Input(Bool()))  // ExMemDff 中的指令是否是 Load（type_decode_together(4)）
+
+  // 检测 ExMemDff 中的 Load 是否与当前 Execute 指令有 RAW 冒险
+  // 使用物理寄存器编号匹配
+  val exLoadUseHazard = memLoadIsValid && memLoadIsLoad && (fwd.mem_pdst =/= 0.U) && in.valid &&
+    ((fwd.mem_pdst === psrc1) || (fwd.mem_pdst === psrc2))
 
   // ============================================================
   // ALU 输入选择
@@ -152,7 +189,8 @@ class Execute extends Module {
   // ============================================================
   out.bits.pc := in.bits.pc
   out.bits.inst_funct3 := Mux(lType || sType, funct3, 0.U) // Load/Store 需要 funct3
-  out.bits.inst_rd := Mux(uType || jal || jalr || lType || iType || rType, rd, 0.U) // 有写回的指令
+  out.bits.inst_rd := Mux(uType || jal || jalr || lType || iType || rType, rd, 0.U) // 逻辑目标寄存器（difftest 用）
+  out.bits.pdst := Mux(uType || jal || jalr || lType || iType || rType, pdst, 0.U) // 物理目的寄存器（旁路转发匹配用）
   out.bits.data := MuxCase(0.U(32.W), Seq(                 // 传入下一级的数据
     lui -> in.bits.imm,                                    // LUI：直接输出高 20 位立即数
     (auipc || lType || sType || iType || rType) -> uALU.io.result, // ALU 结果
@@ -172,7 +210,11 @@ class Execute extends Module {
   out.bits.bht_meta             := in.bits.bht_meta
   out.bits.isSbAlloc            := in.bits.isSbAlloc
   out.bits.sbIdx                := in.bits.sbIdx
+  out.bits.storeSeqSnap         := in.bits.storeSeqSnap  // 传递 storeSeq 快照到 Memory 阶段
+  out.bits.checkpointIdx        := in.bits.checkpointIdx // 分支 checkpoint 索引透传到 Memory 阶段
 
-  in.ready := out.ready
-  out.valid := in.valid
+  // ---- 握手信号 ----
+  // Load-Use 冒险时停顿 Execute（不消费输入，不产生输出）
+  in.ready := out.ready && !exLoadUseHazard
+  out.valid := in.valid && !exLoadUseHazard
 }

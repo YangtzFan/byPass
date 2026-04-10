@@ -21,12 +21,14 @@ class Refresh extends Module {
   val robRefresh = IO(new ROBRefreshIO)
 
   // ROB 完成：组合逻辑直接透传
-  robRefresh.valid        := in.valid
-  robRefresh.idx          := in.bits.robIdx
-  robRefresh.regWBData    := in.bits.data
-  robRefresh.actualTaken  := in.bits.actual_taken
-  robRefresh.actualTarget := in.bits.actual_target
-  robRefresh.mispredict   := in.bits.mispredict
+  robRefresh.valid          := in.valid
+  robRefresh.idx            := in.bits.robIdx
+  robRefresh.regWBData      := in.bits.data
+  robRefresh.actualTaken    := in.bits.actual_taken
+  robRefresh.actualTarget   := in.bits.actual_target
+  robRefresh.mispredict     := in.bits.mispredict
+  robRefresh.pdst           := in.bits.pdst           // 物理目的寄存器（PRF 写入 + ReadyTable 标记 ready）
+  robRefresh.regWriteEnable := in.bits.regWriteEnable // 是否需要写回
 
   in.ready := true.B  // Refresh 始终准备好接收
 }

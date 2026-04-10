@@ -1,37 +1,28 @@
 package mycpu
 
 import chisel3._
-import chisel3.util.log2Ceil
+import chisel3.util._
 import mycpu.dataLane._
 import mycpu.device._
 
 // ============================================================================
-// myCPU —— 10 级流水线 RISC-V RV32I 处理器核心（乱序四发射过渡版本）
+// myCPU —— 10 级流水线 RISC-V RV32I 处理器核心（乱序四发射过渡版本 + 统一 PRF 方案）
 // ============================================================================
 // 流水线结构（从前到后）：
 //   Fetch(4,BPU) → [FetchBuffer(4in/4out)] → Decode(4) → [DecRenDff]
-//   → Rename(4) → [RenDisDff] → Dispatch(4,ROB alloc) → [IssueQueue(4in/4out)]
-//   → Issue(1,load-use) → [IssRRDff] → ReadReg(1) → [RRExDff]
+//   → Rename(4,PRF/RAT) → [RenDisDff] → Dispatch(4,ROB alloc) → [IssueQueue(4in/4out)]
+//   → Issue(1,load-use) → [IssRRDff] → ReadReg(1,PRF read) → [RRExDff]
 //   → Execute(1,branch verify) → [ExMemDff] → Memory(1,redirect) → [MemRefDff]
-//   → Refresh(1) → Commit(ROB)
+//   → Refresh(1,PRF write) → Commit(ROB,RRAT update)
 //
 // 关键设计点：
-//   1. Fetch 每周期从 IROM 取 4 条指令（128 bit），BPU 在 Fetch 内完成轻量预译码和分支预测
-//   2. Decode 4-wide：4 路并行译码，输出 Decode_Rename_Payload
-//   3. Rename 4-wide：纯打拍占位级（后续实现寄存器重命名），计算 regWriteEnable
-//   4. RenDisDff：4-wide 普通流水寄存器（替代原 RenameBuffer）
-//   5. Dispatch 4-wide：ROB 4-wide 分配 + StoreBuffer 分配；
-//      dispatch_n = min(valid_rename_n, rob_free_n, iq_free_n, sb_free_n)
-//   6. IssueQueue：16 深环形缓冲区，4-in/4-out（当前仅用 1-out）
-//   7. Issue 1-wide：从 IssueQueue 队首顺序取 1 条指令，含 Load-Use 冒险检测
-//   8. ReadReg：专用阶段读取寄存器堆，获取 rs1/rs2 值作为旁路兜底
-//   9. Execute：ALU 计算 + 分支验证
-//  10. Memory：Load 访存 + + Store 数据写入 StoreBuffer + 分支纠错重定向（冲刷前级 + ROB 回滚）
-//  11. Refresh：更新 ROB 完成状态和结果字段，不更新架构状态
-//  12. Commit：从 ROB 头部提交 —— 写寄存器堆 + 通知 StoreBuffer 将 Store 写入内存
-//  13. 数据旁路（Forwarding）3 级：Memory / Refresh / Commit → Execute，兜底来自 ReadReg
-//  14. StoreBuffer（深度 32）：Dispatch 分配、Execute 写入地址/数据、Memory Load 查询转发、Commit 写存
-//  15. Mispredict 时冲刷：FetchBuffer / DecRenDff / RenDisDff / IssueQueue / IssRRDff / RRExDff / ExMemDff + ROB/SB 回滚
+//   1. 统一 PRF 方案：128 个物理寄存器（p0~p127），p0 硬编码为 0
+//   2. Rename 4-wide：RAT 查询 + FreeList 分配 + rename bypass + checkpoint 保存
+//   3. ReadReg：从 PRF 按物理寄存器编号读取操作数
+//   4. Refresh：执行结果写入 PRF，ReadyTable 标记 ready
+//   5. Commit：更新 RRAT，释放 stalePdst 到 FreeList
+//   6. 分支恢复：从 BranchCheckpointTable 恢复 RAT/FreeList/ReadyTable
+//   7. 数据旁路使用物理寄存器编号 pdst 进行匹配
 // ============================================================================
 class myCPU extends Module {
   val io = IO(new Bundle {
@@ -58,9 +49,10 @@ class myCPU extends Module {
   })
 
   // ---- 全局控制信号 ----
-  val memRedirectValid   = Wire(Bool())     // Memory 阶段重定向使能（分支预测错误）
-  val memRedirectAddr    = Wire(UInt(32.W)) // Memory 阶段重定向地址
-  val memRedirectRobIdx  = Wire(UInt(CPUConfig.robPtrWidth.W)) // 误预测指令的 ROB 指针
+  val memRedirectValid        = Wire(Bool())     // Memory 阶段重定向使能（分支预测错误）
+  val memRedirectAddr         = Wire(UInt(32.W)) // Memory 阶段重定向地址
+  val memRedirectRobIdx       = Wire(UInt(CPUConfig.robPtrWidth.W)) // 误预测指令的 ROB 指针
+  val memRedirectStoreSeqSnap = Wire(UInt(CPUConfig.storeSeqWidth.W)) // 误预测指令的 storeSeqSnap（用于 SB 精确回滚）
 
   val fetchPredictJump   = Wire(Bool())       // Fetch 阶段 BPU 预测跳转使能
   val fetchPredictTarget = Wire(UInt(32.W))   // Fetch 阶段 BPU 预测跳转目标
@@ -116,11 +108,89 @@ class myCPU extends Module {
   uDecRenDff.flush.get := memRedirectValid
 
   // =====================================================
-  // ============ Rename（4-wide 纯打拍占位级）============
+  // ============ Rename（4-wide 寄存器重命名）============
   // =====================================================
   val uRename = Module(new Rename)
   uRename.in <> uDecRenDff.out
   uRename.flush := memRedirectValid
+
+  // ---- PRF（物理寄存器堆，128 x 32-bit）----
+  val uPRF = Module(new PRF)
+  // ---- RAT（投机态映射表）----
+  val uRAT = Module(new RAT)
+  // ---- FreeList（空闲物理寄存器 FIFO）----
+  val uFreeList = Module(new FreeList)
+  // ---- ReadyTable（物理寄存器就绪状态表）----
+  val uReadyTable = Module(new ReadyTable)
+  // ---- BranchCheckpointTable（分支 checkpoint 管理）----
+  val uBCT = Module(new BranchCheckpointTable)
+
+  // ---- Rename ↔ RAT 连接 ----
+  uRAT.io.raddr      := uRename.rat.raddr
+  uRename.rat.rdata   := uRAT.io.rdata
+  uRAT.io.staleRaddr := uRename.rat.staleRaddr
+  uRename.rat.staleRdata := uRAT.io.staleRdata
+  uRAT.io.wen        := uRename.rat.wen
+  uRAT.io.waddr      := uRename.rat.waddr
+  uRAT.io.wdata      := uRename.rat.wdata
+
+  // ---- Rename ↔ FreeList 连接 ----
+  uFreeList.io.allocReq := uRename.freeList.allocReq
+  uRename.freeList.canAlloc := uFreeList.io.canAlloc
+  uRename.freeList.allocPdst := uFreeList.io.allocPdst
+  uFreeList.io.doAlloc := uRename.freeList.doAlloc
+  // checkpoint 专用分配数量（第一个 checkpoint）：仅统计第一个分支及之前 lane 的分配
+  uFreeList.io.snapAllocReq := uRename.checkpoint.ckptAllocCount
+  // checkpoint 专用分配数量（第二个 checkpoint）：统计第二个分支及之前 lane 的分配
+  uFreeList.io.snapAllocReq2 := uRename.checkpoint.ckptAllocCount2
+
+  // ---- Rename ↔ ReadyTable 连接（置 busy）----
+  uReadyTable.io.busyVen  := uRename.readyTable.busyVen
+  uReadyTable.io.busyAddr := uRename.readyTable.busyAddr
+  // ReadyTable 读端口暂时未使用（将来用于 IssueQueue wakeup），先绑 0
+  for (i <- 0 until 8) { uReadyTable.io.raddr(i) := 0.U }
+
+  // ---- Rename ↔ BranchCheckpointTable 连接（保存 checkpoint）----
+  // 第一个 checkpoint 保存
+  uBCT.io.saveValid        := uRename.checkpoint.saveValid
+  uRename.checkpoint.saveIdx := uBCT.io.saveIdx
+  uRename.checkpoint.canSave1 := uBCT.io.canSave1
+  uRename.checkpoint.canSave2 := uBCT.io.canSave2
+  // 第二个 checkpoint 保存
+  uBCT.io.saveValid2         := uRename.checkpoint.saveValid2
+  uRename.checkpoint.saveIdx2 := uBCT.io.saveIdx2
+
+  // ---- 第一个 Checkpoint RAT 快照构建 ----
+  // 只叠加 ckptLaneMask 为 true 的 lane 的写入（到第一个被预测分支为止）
+  val postRenameRAT = Wire(Vec(CPUConfig.archRegs, UInt(CPUConfig.prfAddrWidth.W)))
+  for (r <- 0 until CPUConfig.archRegs) {
+    postRenameRAT(r) := uRAT.io.snapData(r)
+  }
+  for (i <- 0 until 4) {
+    when(uRename.checkpoint.ckptLaneMask(i) && uRename.rat.wen(i) && uRename.rat.waddr(i) =/= 0.U) {
+      postRenameRAT(uRename.rat.waddr(i)) := uRename.rat.wdata(i)
+    }
+  }
+  uBCT.io.saveRAT   := postRenameRAT
+  uBCT.io.saveFLHead := uFreeList.io.snapHead
+  uBCT.io.saveFLTail := uFreeList.io.snapTail
+  uBCT.io.saveReady  := uReadyTable.io.snapData
+
+  // ---- 第二个 Checkpoint RAT 快照构建 ----
+  // 叠加 ckptLaneMask2 为 true 的 lane 的写入（到第二个被预测分支为止）
+  val postRenameRAT2 = Wire(Vec(CPUConfig.archRegs, UInt(CPUConfig.prfAddrWidth.W)))
+  for (r <- 0 until CPUConfig.archRegs) {
+    postRenameRAT2(r) := uRAT.io.snapData(r)
+  }
+  for (i <- 0 until 4) {
+    when(uRename.checkpoint.ckptLaneMask2(i) && uRename.rat.wen(i) && uRename.rat.waddr(i) =/= 0.U) {
+      postRenameRAT2(uRename.rat.waddr(i)) := uRename.rat.wdata(i)
+    }
+  }
+  uBCT.io.saveRAT2   := postRenameRAT2
+  uBCT.io.saveFLHead2 := uFreeList.io.snapHead2
+  uBCT.io.saveFLTail2 := uFreeList.io.snapTail
+  uBCT.io.saveReady2  := uReadyTable.io.snapData
 
   // =====================================================
   // ============ Rename → Dispatch 流水寄存器（RenDisDff）============
@@ -146,20 +216,24 @@ class myCPU extends Module {
   uStoreBuffer.alloc <> uDisp.sbAlloc
 
   // =====================================================
-  // ============ IssueQueue（4-in / 4-out 环形缓冲区）============
+  // ============ IssueQueue（Vec + FreeList + instSeq 架构）============
   // =====================================================
   val uIssueQueue = Module(new IssueQueue)
-  uIssueQueue.enq <> uDisp.out
+  // ---- Dispatch ↔ IssueQueue 分配连接（参照 StoreBuffer 的分配模式）----
+  uIssueQueue.alloc <> uDisp.iqAlloc
+  // ---- Dispatch → IssueQueue 写入连接 ----
+  uIssueQueue.write.valid   := uDisp.out.valid
+  uIssueQueue.write.entries := uDisp.out.entries
+  uIssueQueue.write.count   := uDisp.out.validCount
   uIssueQueue.flush := memRedirectValid
 
   // =====================================================
   // ============ Issue（当前 1-wide，Load-Use 冒险检测）============
   // =====================================================
   val uIssue = Module(new Issue)
-  // IssueQueue 4-wide 出队 ↔ Issue 控制接口
+  // IssueQueue 发射选择接口 ↔ Issue 控制接口
   uIssue.flush := memRedirectValid
-  uIssue.in := uIssueQueue.deq
-  uIssueQueue.deqCount := uIssue.fetchCount
+  uIssue.iqIssue <> uIssueQueue.issue
 
   // =====================================================
   // ============ Issue → ReadReg 流水线寄存器（IssRRDff）============
@@ -169,20 +243,20 @@ class myCPU extends Module {
   uIssRRDff.flush.get := memRedirectValid
   // ---- Load-Use 冒险检测信号连接 ----
   // Issue 阶段需要知道紧邻的指令 IssRRDff 寄存器中是否是 Load
-  uIssue.hazard.rd          := uIssRRDff.out.bits.inst(11, 7)
+  // 使用物理目的寄存器 pdst 进行冒险匹配
+  uIssue.hazard.pdst        := uIssRRDff.out.bits.pdst
   uIssue.hazard.isValidLoad := uIssRRDff.out.valid && uIssRRDff.out.bits.type_decode_together(4)
 
   // =====================================================
-  // ============ ReadReg（读取寄存器堆）============
+  // ============ ReadReg（从 PRF 读取物理寄存器值）============
   // =====================================================
   val uReadReg = Module(new ReadReg)
   uReadReg.in <> uIssRRDff.out
-  // ---- 寄存器堆（32 个 32 位通用寄存器）----
-  val uREG = Module(new REG)
-  uREG.io.reg_raddr1_i := uReadReg.regRead.raddr1
-  uREG.io.reg_raddr2_i := uReadReg.regRead.raddr2
-  uReadReg.regRead.rdata1 := uREG.io.reg_rdata1_o
-  uReadReg.regRead.rdata2 := uREG.io.reg_rdata2_o
+  // ---- PRF 读端口连接（按物理寄存器编号读取操作数）----
+  uPRF.io.raddr1 := uReadReg.prfRead.raddr1
+  uPRF.io.raddr2 := uReadReg.prfRead.raddr2
+  uReadReg.prfRead.rdata1 := uPRF.io.rdata1
+  uReadReg.prfRead.rdata2 := uPRF.io.rdata2
 
   // =====================================================
   // ============ ReadReg → Execute 流水线寄存器（RRExDff）============
@@ -226,18 +300,24 @@ class myCPU extends Module {
   // ---- StoreBuffer 查询连接（Memory 阶段 Load 指令查询 Store-to-Load 转发，使用 <> 自动连接）----
   uStoreBuffer.query <> uMemory.sbQuery
 
+  // ---- Memory 阶段 DRAM 端口冲突信号：drain 正在写时 Load 需要停顿 ----
+  // drain.valid 在 effectiveCommitted 旁路下可以在 Store commit 同周期为 true
+  // 此时 Load 不能读 DRAM，必须等 drain 完成后重试
+  uMemory.drainActive := uStoreBuffer.drain.valid
+
   // Memory 阶段重定向信号
-  memRedirectValid   := uMemory.redirect.valid
-  memRedirectAddr    := uMemory.redirect.addr
-  memRedirectRobIdx  := uMemory.redirect.robIdx
+  memRedirectValid        := uMemory.redirect.valid
+  memRedirectAddr         := uMemory.redirect.addr
+  memRedirectRobIdx       := uMemory.redirect.robIdx
+  memRedirectStoreSeqSnap := uMemory.redirect.storeSeqSnap
 
   // ROB 回滚：Memory redirect 时将 tail 回滚到误预测指令之后
   uROB.rollback.valid  := memRedirectValid
   uROB.rollback.robIdx := memRedirectRobIdx
 
-  // StoreBuffer 回滚：Memory redirect 时回滚
-  uStoreBuffer.rollback.valid  := memRedirectValid
-  uStoreBuffer.rollback.robIdx := memRedirectRobIdx
+  // StoreBuffer 回滚：Memory redirect 时按 storeSeqSnap 精确回滚
+  uStoreBuffer.rollback.valid        := memRedirectValid
+  uStoreBuffer.rollback.storeSeqSnap := memRedirectStoreSeqSnap
 
   // =====================================================
   // ============ Memory → Refresh 流水线寄存器（MemRefDff）============
@@ -256,28 +336,89 @@ class myCPU extends Module {
   // =====================================================
   // ============ Commit（提交，从 ROB 头部取）============
   // =====================================================
-  // 寄存器写回（Commit 时更新架构状态）
-  uREG.io.reg_waddr_i := uROB.commit.rd
-  uREG.io.reg_wdata_i := uROB.commit.regWBData
-  uREG.io.reg_wen_i   := uROB.commit.regWen
+  // ---- RRAT（提交态映射表）----
+  // Commit 时更新 RRAT[ldst] = pdst，作为架构状态的映射记录
+  // RRAT 不需要单独的模块，用简单寄存器实现即可
+  val rrat = RegInit(VecInit((0 until CPUConfig.archRegs).map(i => i.U(CPUConfig.prfAddrWidth.W))))
 
-  // Store 写回内存（通过 StoreBuffer 提交）
-  // 当 ROB 提交一条 Store 指令时，通知 StoreBuffer 将该 Store 写入内存
+  // Commit 时更新 RRAT 和释放 stalePdst
+  val commitRegWen = uROB.commit.regWen && uROB.commit.ldst =/= 0.U
+  when(commitRegWen) {
+    rrat(uROB.commit.ldst) := uROB.commit.pdst
+  }
+
+  // ---- PRF 写端口（Refresh 阶段写回执行结果，而非 Commit 阶段）----
+  // PRF 在 Refresh 阶段写入，这里连接 ROB refresh 接口输出
+  val refreshValid = uRefresh.robRefresh.valid && uRefresh.robRefresh.regWriteEnable
+  uPRF.io.wen   := refreshValid
+  uPRF.io.waddr := uRefresh.robRefresh.pdst
+  uPRF.io.wdata := uRefresh.robRefresh.regWBData
+
+  // ---- ReadyTable 置 ready（Refresh 阶段标记物理寄存器就绪）----
+  uReadyTable.io.readyVen  := refreshValid
+  uReadyTable.io.readyAddr := uRefresh.robRefresh.pdst
+
+  // ---- FreeList 释放（Commit 时将 stalePdst 归还）----
+  // 条件：指令写寄存器 && ldst != x0（x0 不产生真正的物理寄存器分配）
+  uFreeList.io.freeValid := commitRegWen
+  uFreeList.io.freePdst  := uROB.commit.stalePdst
+
+  // ---- BranchCheckpointTable 释放（分支提交时释放最老的 checkpoint）----
+  // 只有实际保存了 checkpoint 的指令（bType || jalr）在提交时释放 BCT 表项
+  // JAL 是无条件跳转，不保存 checkpoint，因此不能释放
+  val commitBranch = uROB.commit.valid && uROB.commit.hasCheckpoint
+  uBCT.io.freeValid := commitBranch
+
+  // Store 提交标记（通过 StoreBuffer 标记 committed）
   val storeCommitValid = uROB.commit.valid && uROB.commit.isStore && !uROB.commit.mispredict
-  uStoreBuffer.commit.valid := storeCommitValid
+  uStoreBuffer.commit.valid    := storeCommitValid
+  uStoreBuffer.commit.storeSeq := uROB.commit.storeSeq
 
-  // DRAM 写端口：由 StoreBuffer 提供地址/数据/掩码
-  io.commit_ram_wen   := storeCommitValid && uStoreBuffer.commit.canCommit
-  io.commit_ram_waddr := uStoreBuffer.commit.addr
-  io.commit_ram_wdata := uStoreBuffer.commit.data
-  io.commit_ram_wmask := uStoreBuffer.commit.mask
+  // DRAM 写端口：由 StoreBuffer 的 Drain 逻辑驱动
+  io.commit_ram_wen   := uStoreBuffer.drain.valid
+  io.commit_ram_waddr := uStoreBuffer.drain.addr
+  io.commit_ram_wdata := uStoreBuffer.drain.data
+  io.commit_ram_wmask := uStoreBuffer.drain.mask
 
   // Commit 观测信号（供 difftest 使用）
+  // difftest 需要逻辑寄存器编号和数据
   io.commit_valid     := uROB.commit.valid
   io.commit_pc        := uROB.commit.pc
   io.commit_reg_wen   := uROB.commit.regWen
-  io.commit_reg_waddr := uROB.commit.rd
+  io.commit_reg_waddr := uROB.commit.rd        // difftest 使用逻辑寄存器编号
   io.commit_reg_wdata := uROB.commit.regWBData
+
+  // =====================================================
+  // ============ 分支恢复逻辑 ============
+  // =====================================================
+  // 当 Memory 阶段检测到分支预测失败时：
+  // 1. 从 BranchCheckpointTable 恢复 RAT、FreeList、ReadyTable
+  // 2. ROB tail 回滚（已由 ROB.rollback 处理）
+  // 3. StoreBuffer 回滚（已由 StoreBuffer.rollback 处理）
+  // 4. 清除年轻于该分支的流水线项（通过 flush 信号已处理）
+  //
+  // 注意：当前版本恢复使用 checkpoint 索引 0（简化方案，仅支持单分支 in-flight）
+  // TODO: 从 mispredict 指令的 ROB 或管道寄存器中取出 checkpoint 索引
+  // 当前过渡方案：从 Memory redirect 中取出分支 checkpoint 索引
+  // 每条分支/JALR 指令在 Rename 时保存了 checkpoint 索引，沿流水线传递到 Memory
+  val recoverCkptIdx = uMemory.redirect.checkpointIdx // 使用实际的 checkpoint 索引
+
+  // RAT 恢复
+  uRAT.io.recover     := memRedirectValid
+  uRAT.io.recoverData := uBCT.io.recoverRAT
+
+  // FreeList 恢复
+  uFreeList.io.recover     := memRedirectValid
+  uFreeList.io.recoverHead := uBCT.io.recoverFLHead
+  uFreeList.io.recoverTail := uBCT.io.recoverFLTail
+
+  // ReadyTable 恢复
+  uReadyTable.io.recover     := memRedirectValid
+  uReadyTable.io.recoverData := uBCT.io.recoverReady
+
+  // BranchCheckpointTable 恢复
+  uBCT.io.recoverValid := memRedirectValid
+  uBCT.io.recoverIdx   := recoverCkptIdx
 
   // =====================================================
   // ============ 数据旁路转发连接（Forwarding）============
@@ -286,23 +427,44 @@ class myCPU extends Module {
   //   1. Memory 级（Execute 前 1 条指令的结果，Load 除外——数据还没读回来）
   //   2. Refresh 级（Execute 前 2 条指令的结果，Load 数据已可用）
   //   3. Commit 级（同周期正在提交的指令结果）
+  //   4. Refresh 结果缓存级（最近一次 Refresh 结果的持久副本，覆盖 MemRefDff 清空后的空窗）
   //   兜底：ReadReg 阶段读取的寄存器值（经 RRExDff 传入）
 
   // 第 1 级旁路：来自 ExMemDff（Memory 级）
+  // 使用物理目的寄存器 pdst 进行旁路匹配
   val wen_Memory = uExMemDff.out.valid && uExMemDff.out.bits.regWriteEnable &&
     !uExMemDff.out.bits.type_decode_together(4)  // Load 此时数据不可用
-  uExecute.fwd.mem_rd   := uExMemDff.out.bits.inst_rd
+  uExecute.fwd.mem_pdst := uExMemDff.out.bits.pdst
   uExecute.fwd.mem_data := uExMemDff.out.bits.data
   uExecute.fwd.mem_wen  := wen_Memory
 
+  // Execute 级 Load-Use 冒险检测信号（用于检测 ExMemDff 中 Load 导致的 RAW 冒险）
+  uExecute.memLoadIsValid := uExMemDff.out.valid
+  uExecute.memLoadIsLoad  := uExMemDff.out.bits.type_decode_together(4)
+
   // 第 2 级旁路：来自 MemRefDff（Refresh 级，Load 数据已可用）
   val refWen = uMemRefDff.out.valid && uMemRefDff.out.bits.regWriteEnable
-  uExecute.fwd.ref_rd   := uMemRefDff.out.bits.inst_rd
+  uExecute.fwd.ref_pdst := uMemRefDff.out.bits.pdst
   uExecute.fwd.ref_data := uMemRefDff.out.bits.data
   uExecute.fwd.ref_wen  := refWen
 
-  // 第 3 级旁路：Commit 级（同周期 ROB 正在提交的指令结果）
-  uExecute.fwd.commit_rd   := uROB.commit.rd
+  // ---- Refresh 结果缓存（第 4 级旁路，优先级低于 Commit）----
+  // 使用物理目的寄存器 pdst 进行匹配
+  val refBufValid = RegInit(false.B)
+  val refBufPdst  = RegInit(0.U(CPUConfig.prfAddrWidth.W))
+  val refBufData  = RegInit(0.U(32.W))
+  // 当 MemRefDff 有新的有效写回结果时，更新缓存
+  when(refWen) {
+    refBufValid := true.B
+    refBufPdst  := uMemRefDff.out.bits.pdst
+    refBufData  := uMemRefDff.out.bits.data
+  }
+  uExecute.fwd.refBuf_pdst := refBufPdst
+  uExecute.fwd.refBuf_data := refBufData
+  uExecute.fwd.refBuf_wen  := refBufValid
+
+  // 第 4 级旁路：Commit 级（同周期 ROB 正在提交的指令结果）
+  uExecute.fwd.commit_pdst := uROB.commit.pdst
   uExecute.fwd.commit_data := uROB.commit.regWBData
   uExecute.fwd.commit_wen  := uROB.commit.regWen
 }
