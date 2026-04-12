@@ -25,7 +25,7 @@ import mycpu.CPUConfig
 class ReadyTable extends Module {
   val io = IO(new Bundle {
     // ---- 读端口（8 个，Rename 阶段查询源操作数就绪状态）----
-    val raddr = Input(Vec(8, UInt(CPUConfig.prfAddrWidth.W)))   // 查询的物理寄存器编号
+    val raddr = Input(Vec(8, UInt(CPUConfig.prfAddrWidth.W)))    // 查询的物理寄存器编号
     val rdata = Output(Vec(8, Bool()))                           // 就绪状态（true = ready）
 
     // ---- Rename 阶段置 busy（新分配的 pdst 还没有执行结果）----

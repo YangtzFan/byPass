@@ -1,8 +1,9 @@
-package mycpu.dataLane
+package mycpu.device
 
 import chisel3._
 import chisel3.util._
 import mycpu.CPUConfig
+import mycpu.dataLane._
 
 // ============================================================================
 // ROB（重排序缓冲区）—— 支持 4-wide 分配 + Memory 阶段回滚

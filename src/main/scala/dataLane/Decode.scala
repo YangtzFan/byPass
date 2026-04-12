@@ -16,8 +16,7 @@ import mycpu.device.SE
 // ============================================================================
 class Decode extends Module {
   val in  = IO(Flipped(Decoupled(Vec(4, new FetchBufferEntry))))  // 来自 FetchBuffer 的 4 条指令
-  val out = IO(Decoupled(Vec(4, new DecodedInst)))       // 输出 4 条译码结果
-  val flush = IO(Input(Bool()))                            // 流水线冲刷信号
+  val out = IO(Decoupled(Vec(4, new DecodedInst))) // 输出 4 条译码结果
 
   val ses = Seq.fill(4)(Module(new SE)) // 4 个符号扩展/立即数生成模块
 
@@ -25,7 +24,7 @@ class Decode extends Module {
     val entry = in.bits(i)
     val inst = entry.inst
 
-    // ---- 指令字段拆解（RISC-V 标准格式）----
+    // ---- 指令字段拆解 ----
     val opcode = inst(6, 0)
     val rd     = inst(11, 7)
     val funct3 = inst(14, 12)
@@ -37,17 +36,16 @@ class Decode extends Module {
 
     // ---- 指令类型识别 ----
     val uType = (opcode === "b0110111".U) || (opcode === "b0010111".U) // LUI / AUIPC
-    val jal   = opcode === "b1101111".U    // JAL
-    val jalr  = opcode === "b1100111".U    // JALR
-    val bType = opcode === "b1100011".U    // B 型分支指令
-    val lType = opcode === "b0000011".U    // Load 指令
-    val iType = opcode === "b0010011".U    // I 型算术/逻辑指令
-    val sType = opcode === "b0100011".U    // Store 指令
-    val rType = opcode === "b0110011".U    // R 型算术/逻辑指令
+    val jal   = opcode === "b1101111".U // JAL
+    val jalr  = opcode === "b1100111".U // JALR
+    val bType = opcode === "b1100011".U // B 型分支指令
+    val lType = opcode === "b0000011".U // Load 指令
+    val iType = opcode === "b0010011".U // I 型算术/逻辑指令
+    val sType = opcode === "b0100011".U // Store 指令
+    val rType = opcode === "b0110011".U // R 型算术/逻辑指令
     val other = (opcode === "b0001111".U) || (opcode === "b1110011".U) // FENCE / ECALL
 
-    // 9 位独热编码：{uType, jal, jalr, bType, lType, iType, sType, rType, other}
-    val type_decode_together = Cat(uType, jal, jalr, bType, lType, iType, sType, rType, other)
+    val type_decode_together = Cat(uType, jal, jalr, bType, lType, iType, sType, rType, other) // 9 位独热编码
 
     // ---- 立即数生成 ----
     ses(i).io.type_decode_together := type_decode_together
@@ -61,13 +59,15 @@ class Decode extends Module {
     out.bits(i).inst                 := inst
     out.bits(i).imm                  := ses(i).io.imm_o
     out.bits(i).type_decode_together := type_decode_together
+    out.bits(i).regWriteEnable       := uType || jal || jalr || lType || iType || rType
+    out.bits(i).memWriteEnable       := sType
     out.bits(i).predict_taken        := entry.predict_taken   // 从 Fetch BPU 传递
     out.bits(i).predict_target       := entry.predict_target
     out.bits(i).bht_meta             := entry.bht_meta
     out.bits(i).valid                := entry.valid // 有效指示位直接透传 FetchBuffer 的出队掩码
   }
 
-  // Decode 是纯组合逻辑，直接透传 valid/ready，flush 时不输出
+  // Decode 是纯组合逻辑，直接透传 valid/ready
   in.ready  := out.ready
-  out.valid := in.valid && !flush
+  out.valid := in.valid
 }

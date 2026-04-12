@@ -17,8 +17,8 @@ class FetchBuffer(val depth: Int = CPUConfig.fetchBufferEntries) extends Module 
   private val idxWidth = log2Ceil(depth)
 
   val enq = IO(Flipped(Decoupled(Vec(4, new FetchBufferEntry)))) // 入队端口：4 条指令（含预测信息）
-  val deq = IO(Decoupled(Vec(4, new FetchBufferEntry)))       // 出队端口： 4 条指令
-  val flush = IO(Input(Bool()))                        // 清空信号
+  val deq = IO(Decoupled(Vec(4, new FetchBufferEntry))) // 出队端口： 4 条指令
+  val flush = IO(Input(Bool())) // 清空信号
 
   // 环形缓冲区存储（每个 entry 包含指令、PC、预测信息）head/tail 指针比实际索引多 1 位，用最高位区分是否多绕了一圈
   val buffer = Reg(Vec(depth, new FetchBufferEntry))
@@ -29,7 +29,7 @@ class FetchBuffer(val depth: Int = CPUConfig.fetchBufferEntries) extends Module 
   val count = tail - head                        // 当前缓冲区中有效指令数量
   val enqCount = PopCount(enq.bits.map(_.valid)) // 统计本次 FetchPacket 中有效指令数
 
-  // ---- 入队有效槽位偏移计算，确定写入缓冲区的位置 ----
+  // 入队有效槽位偏移计算，确定写入缓冲区的位置
   val offsets = WireInit(VecInit(Seq.fill(4)(0.U(idxWidth.W))))   // 默认驱动为 0
   for (i <- 1 until 4) {
     offsets(i) := offsets(i - 1) +& Mux(enq.bits(i - 1).valid, 1.U, 0.U)
@@ -49,12 +49,8 @@ class FetchBuffer(val depth: Int = CPUConfig.fetchBufferEntries) extends Module 
     when(enq.fire && !flush) { // 入队使能（flush 时不执行）：将有效指令（含预测信息）写入缓冲区
       for (i <- 0 until 4) {
         when(enq.bits(i).valid) {
-          val writeIdx = (idx(tail) +% offsets(i))
-          buffer(writeIdx).inst           := enq.bits(i).inst
-          buffer(writeIdx).pc             := enq.bits(i).pc
-          buffer(writeIdx).predict_taken  := enq.bits(i).predict_taken
-          buffer(writeIdx).predict_target := enq.bits(i).predict_target
-          buffer(writeIdx).bht_meta       := enq.bits(i).bht_meta
+          val writeIdx = idx(tail) +% offsets(i)
+          buffer(writeIdx) := enq.bits(i)
         }
       }
       tail := tail + enqCount
@@ -65,6 +61,6 @@ class FetchBuffer(val depth: Int = CPUConfig.fetchBufferEntries) extends Module 
   }
 
   // ---- 出入队信号：空闲槽位足够时才接受入队；缓冲区非空时可出队 ----
-  enq.ready := (depth.U - count) >= enqCount
+  enq.ready := depth.U - count >= enqCount
   deq.valid := count > 0.U
 }

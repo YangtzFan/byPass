@@ -53,7 +53,6 @@ class myCPU extends Module {
   val memRedirectAddr         = Wire(UInt(32.W)) // Memory 阶段重定向地址
   val memRedirectRobIdx       = Wire(UInt(CPUConfig.robPtrWidth.W)) // 误预测指令的 ROB 指针
   val memRedirectStoreSeqSnap = Wire(UInt(CPUConfig.storeSeqWidth.W)) // 误预测指令的 storeSeqSnap（用于 SB 精确回滚）
-
   val fetchPredictJump   = Wire(Bool())       // Fetch 阶段 BPU 预测跳转使能
   val fetchPredictTarget = Wire(UInt(32.W))   // Fetch 阶段 BPU 预测跳转目标
 
@@ -71,8 +70,8 @@ class myCPU extends Module {
   // =====================================================
   val uFetch = Module(new Fetch)
   uFetch.in <> uPc.out
-  io.inst_addr_o := uFetch.rom.inst_addr_o
-  uFetch.rom.inst_i := io.inst_i
+  io.inst_addr_o := uFetch.irom.inst_addr_o
+  uFetch.irom.inst_i := io.inst_i
   // ---- BHT 顶层实例化并连接到 Fetch ----
   val uBHT = Option.when(CPUConfig.useBHT)(Module(new BHT(CPUConfig.bhtEntries)))
   if (CPUConfig.useBHT) {
@@ -98,7 +97,6 @@ class myCPU extends Module {
   // =====================================================
   val uDecode = Module(new Decode)
   uDecode.in <> uFetchBuffer.deq
-  uDecode.flush := memRedirectValid
 
   // =====================================================
   // ============ Decode → Rename 流水寄存器（DecRenDff）============
@@ -126,23 +124,10 @@ class myCPU extends Module {
   val uBCT = Module(new BranchCheckpointTable)
 
   // ---- Rename ↔ RAT 连接 ----
-  uRAT.io.raddr      := uRename.rat.raddr
-  uRename.rat.rdata   := uRAT.io.rdata
-  uRAT.io.staleRaddr := uRename.rat.staleRaddr
-  uRename.rat.staleRdata := uRAT.io.staleRdata
-  uRAT.io.wen        := uRename.rat.wen
-  uRAT.io.waddr      := uRename.rat.waddr
-  uRAT.io.wdata      := uRename.rat.wdata
+  uRename.rat <> uRAT.rwio
 
   // ---- Rename ↔ FreeList 连接 ----
-  uFreeList.io.allocReq := uRename.freeList.allocReq
-  uRename.freeList.canAlloc := uFreeList.io.canAlloc
-  uRename.freeList.allocPdst := uFreeList.io.allocPdst
-  uFreeList.io.doAlloc := uRename.freeList.doAlloc
-  // checkpoint 专用分配数量（第一个 checkpoint）：仅统计第一个分支及之前 lane 的分配
-  uFreeList.io.snapAllocReq := uRename.checkpoint.ckptAllocCount
-  // checkpoint 专用分配数量（第二个 checkpoint）：统计第二个分支及之前 lane 的分配
-  uFreeList.io.snapAllocReq2 := uRename.checkpoint.ckptAllocCount2
+  uRename.freeList <> uFreeList.renameIO
 
   // ---- Rename ↔ ReadyTable 连接（置 busy）----
   uReadyTable.io.busyVen  := uRename.readyTable.busyVen
@@ -151,13 +136,13 @@ class myCPU extends Module {
   for (i <- 0 until 8) { uReadyTable.io.raddr(i) := 0.U }
 
   // ---- Rename ↔ BranchCheckpointTable 连接（保存 checkpoint）----
-  // 第一个 checkpoint 保存
-  uBCT.io.saveValid        := uRename.checkpoint.saveValid
-  uRename.checkpoint.saveIdx := uBCT.io.saveIdx
   uRename.checkpoint.canSave1 := uBCT.io.canSave1
   uRename.checkpoint.canSave2 := uBCT.io.canSave2
+  // 第一个 checkpoint 保存
+  uBCT.io.saveValid := uRename.checkpoint.saveValid
+  uRename.checkpoint.saveIdx := uBCT.io.saveIdx
   // 第二个 checkpoint 保存
-  uBCT.io.saveValid2         := uRename.checkpoint.saveValid2
+  uBCT.io.saveValid2 := uRename.checkpoint.saveValid2
   uRename.checkpoint.saveIdx2 := uBCT.io.saveIdx2
 
   // ---- 第一个 Checkpoint RAT 快照构建 ----

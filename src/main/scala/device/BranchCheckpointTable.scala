@@ -24,8 +24,8 @@ class BranchCheckpointTable extends Module {
   val io = IO(new Bundle {
     // ---- 保存 checkpoint（Rename 阶段，遇到被预测分支时）----
     // 支持每周期最多保存 2 个 checkpoint（同组内两个分支各存一个）
-    val saveValid = Input(Bool())                                          // 第一个 checkpoint 保存使能
-    val saveIdx   = Output(UInt(CPUConfig.ckptPtrWidth.W))                  // 第一个 checkpoint 全指针
+    val saveValid = Input(Bool())                          // 第一个 checkpoint 保存使能
+    val saveIdx   = Output(UInt(CPUConfig.ckptPtrWidth.W)) // 第一个 checkpoint 全指针
 
     // 第一个 checkpoint 保存的数据（只包含到第一个分支为止的 lane 写入）
     val saveRAT       = Input(Vec(CPUConfig.archRegs, UInt(CPUConfig.prfAddrWidth.W)))

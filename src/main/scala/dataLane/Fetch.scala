@@ -14,7 +14,7 @@ import mycpu.CPUConfig
 //   - JAL：始终预测跳转，目标 = PC + J-type 立即数
 //   - B-type：使用 BHT 预测结果，目标 = PC + B-type 立即数
 //   - JALR：预测不跳转（目标依赖 rs1，Fetch 无法确定）
-//   - 在 4 条指令中找到第一条预测跳转的分支，截断后续槽位的 validMask
+//   - 在 4 条指令中找到第一条预测跳转的分支，截断后续槽位的 valid
 //
 // 地址对齐处理：PC[3:2] 决定起始槽位，只有 >= start_slot 的槽位有效
 // ============================================================================
@@ -23,10 +23,10 @@ class Fetch extends Module {
   private val bhtIdxWidth = log2Ceil(CPUConfig.bhtEntries)
 
   val in = IO(Flipped(Decoupled(UInt(32.W)))) // 输入：PC 值
-  val out = IO(Decoupled(Vec(4, new FetchBufferEntry)))  // 输出：4 个取指结果包（含预测信息）
+  val out = IO(Decoupled(Vec(4, new FetchBufferEntry))) // 输出：4 个取指结果包（含预测信息）
 
   // ---- 读 IROM 接口 ----
-  val rom = IO(new Bundle {
+  val irom = IO(new Bundle {
     val inst_addr_o = Output(UInt(14.W))      // 输出到 IROM 的地址（128-bit 字地址 = PC[17:4]）
     val inst_i      = Input(UInt(128.W))      // IROM 返回的 128 位数据（4 条指令拼接）
   })
@@ -43,23 +43,23 @@ class Fetch extends Module {
     val target = Output(UInt(32.W))     // 预测跳转目标
   })
 
-  val pc = in.bits            // 当前 PC 值
+  val pc = in.bits         // 当前 PC 值
   val basePC = pc(31, 4) ## 0.U(4.W) // 这是 16 字节对齐的基址 PC
-  val startSlot = pc(3, 2)    // 在 4 条指令中的起始槽位索引（0~3）
+  val startSlot = pc(3, 2) // 在 4 条指令中的起始槽位索引（0~3）
 
   // ---- 解包 4 条指令并求对应 PC 值 ----
-  rom.inst_addr_o := pc(17, 4) // 输出到 IROM 地址
+  irom.inst_addr_o := pc(17, 4) // 输出到 IROM 地址
   val pcs = Wire(Vec(4, UInt(32.W)))
   val insts = Wire(Vec(4, UInt(32.W)))
   for (i <- 0 until 4) {      
     pcs(i) := (basePC(31, 2) + i.U) ## 0.U(2.W) // 求每条指令的 PC 值（即使非对齐，也会取相应对齐地址向后 4 条指令）
-    insts(i) := rom.inst_i(32 * i + 31, 32 * i) // 将 128 位数据解包为 4 × 32 位指令
+    insts(i) := irom.inst_i(32 * i + 31, 32 * i) // 将 128 位数据解包为 4 × 32 位指令
   }
 
   // ---- 轻量预译码 + BPU 预测 ----
-  val slotTaken   = Wire(Vec(4, Bool()))       // 每个槽位是否预测跳转
-  val slotTarget  = Wire(Vec(4, UInt(32.W)))   // 每个槽位的预测目标
-  val slotBHTMeta = Wire(Vec(4, UInt(2.W)))    // 每个槽位的 BHT 元数据
+  val slotTaken   = Wire(Vec(4, Bool()))     // 每个槽位是否预测跳转
+  val slotTarget  = Wire(Vec(4, UInt(32.W))) // 每个槽位的预测目标
+  val slotBHTMeta = Wire(Vec(4, UInt(2.W)))  // 每个槽位的 BHT 元数据
   val validTaken  = Wire(Vec(4, Bool()))
   for (i <- 0 until 4) { // 开始遍历每一条指令
     val inst   = insts(i)
@@ -84,11 +84,10 @@ class Fetch extends Module {
     slotBHTMeta(i) := { if (useBHT){bht.get.predict(i)} else {0.U(2.W)} }  // BHT 计数器原始值
     validTaken(i)  := (i.U >= startSlot) && slotTaken(i) // 每个槽位是否为"有效且预测跳转"
   }
-
+  
+  // ---- 预测结果输出（给 PC 模块在 myCPU 中使用）----
   val hasTaken = validTaken.asUInt.orR // 是否存在至少一条预测跳转的指令
   val firstTakenSlot = PriorityEncoder(validTaken.asUInt) // 第一条预测跳转的槽位索引
-
-  // ---- 预测结果输出（给 PC 模块在 myCPU 中使用）----
   predict.jump   := hasTaken && out.fire // 下游可以接收数据时才执行分支跳转预测
   predict.target := slotTarget(firstTakenSlot)
   
@@ -96,13 +95,13 @@ class Fetch extends Module {
   for (i <- 0 until 4) {
     out.bits(i).pc   := pcs(i)
     out.bits(i).inst := insts(i)
-    // 预测信息按槽位输出。valid 逻辑：
-    //   1. 槽位索引 >= startSlot（PC 对齐要求）
-    //   2. 如果存在预测跳转，则仅保留第一条跳转及之前的槽位，防止不相关指令进入 FetchBuffer
-    out.bits(i).valid := (i.U >= startSlot) && (!hasTaken || i.U <= firstTakenSlot)
     out.bits(i).predict_taken  := slotTaken(i)
     out.bits(i).predict_target := slotTarget(i)
     out.bits(i).bht_meta       := slotBHTMeta(i)
+    // 预测信息按槽位输出。valid 逻辑：
+    //   1. 槽位索引 >= startSlot（PC 对齐要求）
+    //   2. 如果存在预测跳转，则仅保留第一条预测为跳转及之前的槽位，防止不相关指令进入 FetchBuffer
+    out.bits(i).valid := (i.U >= startSlot) && (!hasTaken || i.U <= firstTakenSlot)
   }
 
   in.ready  := out.ready // 反压：下游不接收时，PC 也暂停

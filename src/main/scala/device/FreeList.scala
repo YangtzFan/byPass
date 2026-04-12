@@ -18,17 +18,23 @@ import mycpu.CPUConfig
 //
 // FIFO 实现：使用环形缓冲区管理空闲物理寄存器编号
 // ============================================================================
-class FreeList extends Module {
-  val io = IO(new Bundle {
-    // ---- 分配端口（Rename 阶段请求空闲物理寄存器）----
-    val allocReq   = Input(UInt(3.W))                                      // 请求分配数量（0~4）
-    val canAlloc   = Output(Bool())                                        // 是否有足够空闲寄存器（>= 4）
-    val allocPdst  = Output(Vec(4, UInt(CPUConfig.prfAddrWidth.W)))        // 分配的物理寄存器编号
-    val doAlloc    = Input(Bool())                                         // 实际提交分配（Rename 确认后拉高）
+class RenameIO extends Bundle {
+  val allocReq   = Output(UInt(3.W))                             // 请求分配数量（0~4）为 0 时相当于不分配
+  val canAlloc   = Input(Bool())                                 // 是否有足够空闲寄存器（>= 4）
+  val allocPdst  = Input(Vec(4, UInt(CPUConfig.prfAddrWidth.W))) // 分配的物理寄存器编号
+  val doAlloc    = Output(Bool())                                // 实际提交分配（Rename 确认后拉高）
+  val snapAllocReq  = Output(UInt(3.W)) // 第一个 checkpoint 中需要计入的 FreeList 分配数量
+  val snapAllocReq2 = Output(UInt(3.W)) // 第二个 checkpoint 中需要计入的 FreeList 分配数量
+}
 
-    // ---- 释放端口（Commit 阶段释放旧物理寄存器）----
-    val freeValid  = Input(Bool())                                         // 释放使能
-    val freePdst   = Input(UInt(CPUConfig.prfAddrWidth.W))                 // 待释放的物理寄存器编号
+class FreeList extends Module {
+  // ---- Rename 阶段端口 ----
+  val renameIO = IO(Flipped(new RenameIO))
+
+  val io = IO(new Bundle {
+    // ---- Commit 端口 ----
+    val freeValid  = Input(Bool())                         // 释放使能
+    val freePdst   = Input(UInt(CPUConfig.prfAddrWidth.W)) // 待释放的物理寄存器编号
 
     // ---- 恢复端口（分支预测失败时恢复 FreeList 状态）----
     val recover      = Input(Bool())                                       // 恢复使能
@@ -39,8 +45,7 @@ class FreeList extends Module {
     // snapAllocReq：第一个 checkpoint 中实际需要计入的分配数量（仅第一个分支及之前的 lane）
     // snapAllocReq2：第二个 checkpoint 中实际需要计入的分配数量（仅第二个分支及之前的 lane）
     // 与 allocReq（全组分配数）不同，用于精确计算 checkpoint 的 head 快照
-    val snapAllocReq  = Input(UInt(3.W))
-    val snapAllocReq2 = Input(UInt(3.W))
+
     val snapHead  = Output(UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W))  // 第一个 checkpoint head 快照
     val snapHead2 = Output(UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W))  // 第二个 checkpoint head 快照
     val snapTail  = Output(UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W))  // 当前 tail 指针快照
@@ -68,11 +73,11 @@ class FreeList extends Module {
 
   // ---- 分配逻辑 ----
   // 只要空闲数 >= 4 就允许分配（不依赖 allocReq 避免组合环路）
-  io.canAlloc := count >= 4.U
+  renameIO.canAlloc := count >= 4.U
 
   // 输出连续 4 个空闲物理寄存器编号（从 head 开始，不管是否实际分配）
   for (i <- 0 until 4) {
-    io.allocPdst(i) := fifo(idx(head + i.U))
+    renameIO.allocPdst(i) := fifo(idx(head + i.U))
   }
 
   // 实际分配时推进 head
@@ -82,8 +87,8 @@ class FreeList extends Module {
     // 否则每次 mispredict 恢复都会泄漏已释放的物理寄存器
     head := io.recoverHead
   }.otherwise {
-    when(io.doAlloc) {
-      head := head + io.allocReq
+    when(renameIO.doAlloc) {
+      head := head + renameIO.allocReq
     }
   }
   // ---- 释放逻辑：独立于恢复逻辑 ----
@@ -98,7 +103,7 @@ class FreeList extends Module {
   // snapHead 使用 snapAllocReq（仅第一个分支及之前 lane 的分配数）
   // snapHead2 使用 snapAllocReq2（仅第二个分支及之前 lane 的分配数）
   // 恢复时，对应 checkpoint 之后 lane 分配的物理寄存器会回到空闲池
-  io.snapHead  := Mux(io.doAlloc, head + io.snapAllocReq, head)
-  io.snapHead2 := Mux(io.doAlloc, head + io.snapAllocReq2, head)
+  io.snapHead  := Mux(renameIO.doAlloc, head + renameIO.snapAllocReq, head)
+  io.snapHead2 := Mux(renameIO.doAlloc, head + renameIO.snapAllocReq2, head)
   io.snapTail  := tail
 }

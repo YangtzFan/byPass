@@ -109,6 +109,7 @@ class Dispatch extends Module {
     out.entries(i).bht_meta             := entry.bht_meta
     out.entries(i).robIdx               := robAlloc.idxs(i) // ROB 返回的指针
     out.entries(i).regWriteEnable       := entry.regWriteEnable
+    out.entries(i).memWriteEnable       := entry.memWriteEnable
     out.entries(i).sbIdx                := sbAlloc.idxs(sbOffsets(i)) // StoreBuffer 返回的物理槽位索引
     out.entries(i).isSbAlloc            := sType && entry.valid // 仅 Store 指令分配了 StoreBuffer
     // storeSeqSnap：每条指令记录"该指令之前（不含自身）一共有多少 Store 已分配"的 nextStoreSeq 快照
