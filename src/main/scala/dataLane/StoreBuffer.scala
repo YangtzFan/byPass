@@ -41,7 +41,7 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   val alloc = IO(Flipped(new SBAllocIO))
 
   // ---- Store 写入接口（Memory 阶段使用：写入 Store 地址和数据）----
-  val write = IO(Flipped(new SBWriteIO))
+  val write = IO(Input(new SBWriteIO))
 
   // ---- Load 查询接口（Memory 阶段使用：Store-to-Load 转发）----
   val query = IO(Flipped(new SBQueryIO))
@@ -137,7 +137,6 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     buffer(write.idx).addr      := write.addr
     buffer(write.idx).data      := write.data
     buffer(write.idx).mask      := write.mask
-
   }
 
   // ===================== 查询逻辑（Memory 阶段 Load 指令）=====================

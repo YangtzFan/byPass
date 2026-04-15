@@ -60,7 +60,6 @@ class Decode extends Module {
     out.bits(i).imm                  := ses(i).io.imm_o
     out.bits(i).type_decode_together := type_decode_together
     out.bits(i).regWriteEnable       := uType || jal || jalr || lType || iType || rType
-    out.bits(i).memWriteEnable       := sType
     out.bits(i).predict_taken        := entry.predict_taken   // 从 Fetch BPU 传递
     out.bits(i).predict_target       := entry.predict_target
     out.bits(i).bht_meta             := entry.bht_meta

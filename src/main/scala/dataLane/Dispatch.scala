@@ -23,11 +23,6 @@ import mycpu.CPUConfig
 // ============================================================================
 class Dispatch extends Module {
   val in  = IO(Flipped(Decoupled(new Rename_Dispatch_Payload))) // 输入：来自 RenDisDff
-  val out = IO(new Bundle {                                     // 输出：送入 IssueQueue 的写入数据
-    val entries    = Output(Vec(4, new DispatchEntry))
-    val validCount = Output(UInt(3.W))
-    val valid      = Output(Bool())                             // 本周期是否有有效的 Dispatch 输出
-  })
   val flush = IO(Input(Bool()))                                 // 流水线冲刷信号
   // ---- ROB 4-wide 分配接口 ----
   val robAlloc = IO(new ROBMultiAllocIO)
@@ -35,6 +30,7 @@ class Dispatch extends Module {
   val sbAlloc = IO(new SBAllocIO)
   // ---- IssueQueue 分配接口（参照 StoreBuffer 的分配模式）----
   val iqAlloc = IO(new IQAllocIO)
+  val out = IO(Output(new IQWriteData))
 
   val validCount = in.bits.validCount // 取出 Rename 统计的有效指令数量
   val storeCount = in.bits.storeCount // 取出 Rename 统计的既是 store 又有效的指令数量
@@ -46,20 +42,16 @@ class Dispatch extends Module {
   val canDispatch = robCanAlloc && sbCanAlloc && iqCanAlloc // 所有资源充足才能派遣
   val doDispatch  = in.valid && canDispatch && !flush      // 流水线冲刷时不派遣
 
-  // ---- 向 ROB 发送分配请求，返回请求分配表项数目 ----
+  // ---- 向 ROB、StoreBuffer、IssueQueue 发送分配请求，返回请求分配表项数目 ----
   robAlloc.request := Mux(doDispatch, validCount, 0.U)
-
-  // ---- 向 StoreBuffer 发送分配请求，返回请求分配表项数目 ----
   sbAlloc.request := Mux(doDispatch, storeCount, 0.U)
-
-  // ---- 向 IssueQueue 发送分配请求（参照 StoreBuffer 的分配模式）----
   iqAlloc.request := Mux(doDispatch, validCount, 0.U)
 
   // ---- 计算每条 Store 指令在 StoreBuffer 分配返回指针中的偏移 ----
   // sbAlloc.idxs(0..3) 是连续分配的 StoreBuffer 指针，需要将它们按 Store 指令出现的先后顺序映射
   val sbOffsets = WireInit(VecInit(Seq.fill(4)(0.U(2.W))))
   for (i <- 1 until 4) {
-    sbOffsets(i) := sbOffsets(i - 1) +& Mux(in.bits.entries(i - 1).memWriteEnable, 1.U, 0.U)
+    sbOffsets(i) := sbOffsets(i - 1) +& Mux(in.bits.entries(i - 1).type_decode_together(2), 1.U, 0.U)
   }
 
   // ---- 逐路处理：生成 DispatchEntry + ROBAllocData ----
@@ -81,8 +73,8 @@ class Dispatch extends Module {
     // ---- ROB 分配数据 ----
     robAlloc.data(i).pc            := entry.pc
     robAlloc.data(i).inst          := entry.inst
-    robAlloc.data(i).regWen        := entry.regWriteEnable
     robAlloc.data(i).rd            := rd
+    robAlloc.data(i).regWen        := entry.regWriteEnable
     robAlloc.data(i).isLoad        := lType
     robAlloc.data(i).isStore       := sType
     robAlloc.data(i).isBranch      := bType
@@ -109,7 +101,6 @@ class Dispatch extends Module {
     out.entries(i).bht_meta             := entry.bht_meta
     out.entries(i).robIdx               := robAlloc.idxs(i) // ROB 返回的指针
     out.entries(i).regWriteEnable       := entry.regWriteEnable
-    out.entries(i).memWriteEnable       := entry.memWriteEnable
     out.entries(i).sbIdx                := sbAlloc.idxs(sbOffsets(i)) // StoreBuffer 返回的物理槽位索引
     out.entries(i).isSbAlloc            := sType && entry.valid // 仅 Store 指令分配了 StoreBuffer
     // storeSeqSnap：每条指令记录"该指令之前（不含自身）一共有多少 Store 已分配"的 nextStoreSeq 快照

@@ -42,10 +42,9 @@ object CPUConfig {
   // ---- PRF（物理寄存器堆）参数 ----
   val prfEntries: Int = 128                    // 物理寄存器数量（p0~p127）
   val prfAddrWidth: Int = log2Ceil(prfEntries) // 物理寄存器编号位宽（7 位）
-  val archRegs: Int = 32                       // 逻辑寄存器数量（x0~x31）
   val renameWidth: Int = 4                     // 重命名宽度（每拍最多处理 4 条指令）
   // ---- FreeList 参数 ----
-  val freeListEntries: Int = prfEntries - archRegs // FreeList 容量（96）
+  val freeListEntries: Int = prfEntries - 32   // FreeList 容量（96）
 
   // ---- 分支 Checkpoint 参数 ----
   val maxBranchCheckpoints: Int = 8                      // 最大同时在飞分支数（checkpoint 数量）

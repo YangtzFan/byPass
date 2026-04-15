@@ -136,18 +136,21 @@ class Execute extends Module {
   // ALU 控制信号：是否需要查看 inst[30]（区分 ADD/SUB、SRL/SRA 等）
   val iChoose30OrNot = iType && (funct3 === "b101".U)
   val rChoose30OrNot = rType && ((funct3 === "b101".U) || (funct3 === "b000".U))
-  val aluA = MuxCase(0.U(32.W), Seq( // ALU 操作数 A：B/JALR/Load/Store/I/R 型用 rs1，AUIPC/JAL 用 PC
+  val aluA = Mux1H(Seq( // ALU 操作数 A：B/JALR/Load/Store/I/R 型用 rs1，AUIPC/JAL 用 PC
     (bType || jalr || lType || sType || iType || rType) -> actual_rdata1,
-    (auipc || jal) -> in.bits.pc
+    (auipc || jal) -> in.bits.pc,
+    (lui || other) -> 0.U(32.W)
   ))
-  val aluB = MuxCase(0.U(32.W), Seq( // ALU 操作数 B：B/R 型用 rs2，其余用立即数
+  val aluB = Mux1H(Seq( // ALU 操作数 B：B/R 型用 rs2，其余用立即数
     (bType || rType) -> actual_rdata2,
-    (auipc || jal || jalr || lType || sType || iType) -> in.bits.imm
+    (auipc || jal || jalr || lType || sType || iType) -> in.bits.imm,
+    (lui || other) -> 0.U(32.W)
   ))
-  val aluCtrl = MuxCase(0.U(4.W), Seq( // ALU 控制信号：4 位 {funct7[5](部分), funct3}
+  val aluCtrl = Mux1H(Seq( // ALU 控制信号：4 位 {funct7[5](部分), funct3}
     bType -> Mux(funct3(2), Cat(0.U(2.W), funct3(2, 1)), 8.U(4.W)), // 分支比较
     iType -> Cat(iChoose30OrNot && in.bits.inst(30), funct3),
-    rType -> Cat(rChoose30OrNot && in.bits.inst(30), funct3)
+    rType -> Cat(rChoose30OrNot && in.bits.inst(30), funct3),
+    !(bType || iType || rType) -> 0.U(4.W)
   ))
   val uALU = Module(new ALU)
   uALU.io.a      := aluA
@@ -191,10 +194,11 @@ class Execute extends Module {
   out.bits.inst_funct3 := Mux(lType || sType, funct3, 0.U) // Load/Store 需要 funct3
   out.bits.inst_rd := Mux(uType || jal || jalr || lType || iType || rType, rd, 0.U) // 逻辑目标寄存器（difftest 用）
   out.bits.pdst := Mux(uType || jal || jalr || lType || iType || rType, pdst, 0.U) // 物理目的寄存器（旁路转发匹配用）
-  out.bits.data := MuxCase(0.U(32.W), Seq(                 // 传入下一级的数据
-    lui -> in.bits.imm,                                    // LUI：直接输出高 20 位立即数
+  out.bits.data := Mux1H(Seq( // 传入下一级的数据
+    lui -> in.bits.imm, // LUI：直接输出高 20 位立即数
     (auipc || lType || sType || iType || rType) -> uALU.io.result, // ALU 结果
-    (jal || jalr) -> (in.bits.pc + 4.U(32.W))              // JAL/JALR：链接地址 = PC+4
+    (jal || jalr) -> (in.bits.pc + 4.U(32.W)), // JAL/JALR：链接地址 = PC+4
+    (bType || other) -> 0.U(32.W)
   ))
   out.bits.reg_rdata2           := Mux(sType, actual_rdata2, 0.U) // Store 的写入数据（保留用于后续阶段）
   out.bits.type_decode_together := in.bits.type_decode_together

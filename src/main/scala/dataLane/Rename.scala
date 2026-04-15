@@ -6,6 +6,7 @@ import mycpu.CPUConfig
 import mycpu.device.RATReadWriteIO
 import mycpu.device.RenameIO
 import chisel3.{UIntIntf => i}
+import mycpu.device.saveRequestRename
 
 // ============================================================================
 // Rename（重命名阶段）—— 4-wide 寄存器重命名
@@ -17,8 +18,8 @@ import chisel3.{UIntIntf => i}
 //   4. 保存旧映射 stalePdst = RAT[rd]（考虑同拍 bypass）到 ROB
 //   5. 更新 RAT 映射，使更年轻 lane 可见
 //   6. 新分配的 pdst 在 ReadyTable 中置 busy
-//   7. 被预测分支指令保存 RAT/FreeList/ReadyTable checkpoint
-//
+//   7. 快照型分支指令需保存 RAT/FreeList/ReadyTable checkpoint
+//   ※ 快照型分支：B型 或 JALR（JALR 总是标记为 mispredict 跳转，需要 checkpoint，JAL 一定跳转，无需 checkpoint）
 // 处理顺序：lane 0 最老 → lane 3 最年轻
 // ============================================================================
 class Rename extends Module {
@@ -28,10 +29,8 @@ class Rename extends Module {
 
   // ---- RAT 接口 ----
   val rat = IO(new RATReadWriteIO)
-
   // ---- FreeList 接口 ----
   val freeList = IO(new RenameIO)
-
   // ---- ReadyTable 接口 ----
   val readyTable = IO(new Bundle {
     val busyVen  = Output(Vec(4, Bool()))                         // 置 busy 使能
@@ -39,17 +38,10 @@ class Rename extends Module {
   })
 
   // ---- BranchCheckpoint 接口 ----
-  val checkpoint = IO(new Bundle {
-    val canSave1 = Input(Bool()) // BCT 至少有 1 个空位
-    val canSave2 = Input(Bool()) // BCT 至少有 2 个空位
-    // ---- 第一个 checkpoint（到第一个被预测分支为止）----
-    val saveValid = Output(Bool())                        // 第一个 checkpoint 保存使能
-    val saveIdx   = Input(UInt(CPUConfig.ckptPtrWidth.W)) // 第一个 checkpoint 全指针
-    val ckptLaneMask  = Output(Vec(4, Bool()))  // 各 lane 是否包含在第一个 checkpoint RAT 中
-    // ---- 第二个 checkpoint（到第二个被预测分支为止）----
-    val saveValid2 = Output(Bool())                        // 第二个 checkpoint 保存使能
-    val saveIdx2   = Input(UInt(CPUConfig.ckptPtrWidth.W)) // 第二个 checkpoint 全指针
-    val ckptLaneMask2  = Output(Vec(4, Bool())) // 各 lane 是否包含在第二个 checkpoint RAT 中
+  val ckPointReq = IO(new saveRequestRename)
+  val ckptRAT = IO(new Bundle {
+    val postRename1 = Output(Vec(32, UInt(CPUConfig.prfAddrWidth.W))) // RAT 快照 1
+    val postRename2 = Output(Vec(32, UInt(CPUConfig.prfAddrWidth.W))) // RAT 快照 2
   })
 
   // ---- 逐路处理：提取指令字段 ----
@@ -57,40 +49,27 @@ class Rename extends Module {
   val rs2s = in.bits.map(_.inst(24, 20)) // 每条指令的 rs2
   val rds  = in.bits.map(_.inst(11, 7))  // 每条指令的 rd
   val regWriteEnables = in.bits.map(_.regWriteEnable) // 是否写回寄存器
-  val memWriteEnables = in.bits.map(_.memWriteEnable) // 是否 Store
+  val memWriteEnables = in.bits.map(_.type_decode_together(2)) // sType
 
-  // 检测本拍是否有被预测分支（用于 checkpoint）
-  val predictedBranchVec = Wire(Vec(4, Bool()))
-  val hadBranchBefore = WireInit(VecInit(Seq.fill(4)(false.B))) // hadBranchBefore(i) 表示在 lane i 之前（不含 i）是否已经出现过被预测分支
+  val predictedBranchVec = Wire(Vec(4, Bool())) // 标记每个槽位是否是快照型分支
   for (i <- 0 until 4) {
     val td    = in.bits(i).type_decode_together
     val jalr  = td(6)
     val bType = td(5)
-    // 被预测分支：B型 或 JALR（JALR 总是标记为 mispredict 跳转，需要 checkpoint，JAL 一定跳转，无需 checkpoint）
-    predictedBranchVec(i) := in.bits(i).valid && (bType || jalr)
+    predictedBranchVec(i) := in.bits(i).valid && (bType || jalr) // 快照型分支即 bType 和 JALR
   }
-  for (i <- 1 until 4) {
-    hadBranchBefore(i) := predictedBranchVec.take(i).reduce(_ || _)
-  }
-  // 标记第一个被预测分支在哪个位置（仅该指令在 ROB 中设置 hasCheckpoint，用于 Commit 时释放 BCT 表项）
-  val firstPredictedBranch = WireInit(VecInit((0 until 4).map {i => predictedBranchVec(i) && !hadBranchBefore(i)} ))
-  val hasPredictedBranch = firstPredictedBranch.asUInt.orR // 是否有一个预测分支
-
-  // 标记第二个被预测分支（同组内有两个分支时，第二个分支也需要 checkpoint）
-  // 例：lane 0 和 lane 3 都是分支 → firstPredictedBranch=[1,0,0,0], secondPredictedBranch=[0,0,0,1]
-  val secondPredictedBranch = Wire(Vec(4, Bool()))
-  secondPredictedBranch(0) := false.B  // lane 0 不可能是第二个
-  for (i <- 1 until 4) {
-    // 第二个被预测分支：自身是分支，且之前恰好有一个分支（第一个已标记）
-    val branchCountBefore = PopCount(predictedBranchVec.take(i))
-    secondPredictedBranch(i) := predictedBranchVec(i) && branchCountBefore === 1.U
-  }
-  val hasSecondPredictedBranch = secondPredictedBranch.asUInt.orR // 是否有第2个预测分支
+  val firstPredictedBranchUInt = PriorityEncoderOH(predictedBranchVec.asUInt) // 第一个快照型分支
+  val secondPredictedBranchUInt = PriorityEncoderOH(predictedBranchVec.asUInt & ~firstPredictedBranchUInt) // 第二个快照型分支：掩去第一个后再找
+  val hasFirstPredictedBranch = firstPredictedBranchUInt.orR // 是否有一个预测分支
+  val hasSecondPredictedBranch = secondPredictedBranchUInt.orR // 是否有第2个预测分支
+  // 后面仍然希望用 Vec[Bool]
+  val firstPredictedBranch  = VecInit(firstPredictedBranchUInt.asBools)
+  val secondPredictedBranch = VecInit(secondPredictedBranchUInt.asBools)
 
   // ---- 判断是否能进行 Rename ----
   val ckptReady = MuxCase(true.B, Seq( // 没有分支则不需要 BCT 空位，直接为 ready
-    hasSecondPredictedBranch -> checkpoint.canSave2, // 如果本拍有 2 个被预测分支，需要 BCT 有 2 个空位（canSave2）
-    hasPredictedBranch -> checkpoint.canSave1 // 如果只有 1 个被预测分支，只需要 1 个空位（canSave1）
+    hasSecondPredictedBranch -> ckPointReq.canSave2, // 如果本拍有 2 个被预测分支，需要 BCT 有 2 个空位（canSave2）
+    hasFirstPredictedBranch -> ckPointReq.canSave1 // 如果只有 1 个被预测分支，只需要 1 个空位（canSave1）
   ))
   val canRename = freeList.canAlloc && ckptReady && out.ready
   val doRename  = in.valid && canRename && !flush
@@ -100,12 +79,12 @@ class Rename extends Module {
   for (i <- 0 until 4) {
     needAlloc(i) := in.bits(i).valid && regWriteEnables(i) && rds(i) =/= 0.U
   }
-  val allocOffsets = Wire(Vec(4, UInt(2.W))) // 在 FreeList 分配结果中的偏移
-  allocOffsets(0) := 0.U
+  val allocOffsets = WireInit(VecInit(Seq.fill(4)(0.U(2.W)))) // 在 FreeList 分配结果中的偏移
   for (i <- 1 until 4) {
     allocOffsets(i) := allocOffsets(i - 1) + Mux(needAlloc(i - 1), 1.U, 0.U)
   }
-  val totalAllocCount = allocOffsets(3) + Mux(needAlloc(3), 1.U, 0.U)
+  // 使用 +& (宽化加法) 避免当 4 路全部需要分配时 3+1=4 溢出截断为 0
+  val totalAllocCount = allocOffsets(3) +& Mux(needAlloc(3), 1.U, 0.U)
 
   freeList.doAlloc  := doRename // 向 freeList 提交是否执行了分配操作使能
   freeList.allocReq := Mux(doRename, totalAllocCount, 0.U) // 请求分配的个数
@@ -133,19 +112,13 @@ class Rename extends Module {
   val psrc2s     = Wire(Vec(4, UInt(CPUConfig.prfAddrWidth.W)))
   val stalePdsts = Wire(Vec(4, UInt(CPUConfig.prfAddrWidth.W)))
   for (i <- 0 until 4) {
-    psrc1s(i) := rat.rdata(i * 2) // 默认从 RAT 读取
+    psrc1s(i) := rat.rdata(i * 2)
     psrc2s(i) := rat.rdata(i * 2 + 1)
     stalePdsts(i) := rat.staleRdata(i)
     for (j <- 0 until i) { // 如果更老的 lane j 写了同一逻辑寄存器，使用其 pdst
-      when(needAlloc(j) && rds(j) === rs1s(i) && rs1s(i) =/= 0.U) {
-        psrc1s(i) := pdsts(j)
-      }
-      when(needAlloc(j) && rds(j) === rs2s(i) && rs2s(i) =/= 0.U) {
-        psrc2s(i) := pdsts(j)
-      }
-      when(needAlloc(j) && rds(j) === rds(i) && rds(i) =/= 0.U) {
-        stalePdsts(i) := pdsts(j)
-      }
+      when(needAlloc(j) && rds(j) === rs1s(i) && rs1s(i) =/= 0.U) { psrc1s(i) := pdsts(j) }
+      when(needAlloc(j) && rds(j) === rs2s(i) && rs2s(i) =/= 0.U) { psrc2s(i) := pdsts(j) }
+      when(needAlloc(j) && rds(j) === rds(i) && rds(i) =/= 0.U) { stalePdsts(i) := pdsts(j) }
     }
     when(rs1s(i) === 0.U) { psrc1s(i) := 0.U } // x0 永远映射到 p0
     when(rs2s(i) === 0.U) { psrc2s(i) := 0.U }
@@ -163,38 +136,53 @@ class Rename extends Module {
   // 注意：checkpoint 保存的是本拍 Rename 写入之前还是之后的状态？
   // 应保存 Rename 写入之后的 RAT 状态（因为被预测分支本身可能也写 rd）
   // 但 FreeList 和 ReadyTable 的 checkpoint 由 myCPU 顶层在 Rename 完成后保存
-  checkpoint.saveValid  := doRename && hasPredictedBranch
-  checkpoint.saveValid2 := doRename && hasSecondPredictedBranch
+  ckPointReq.saveValid1  := doRename && hasFirstPredictedBranch
+  ckPointReq.saveValid2 := doRename && hasSecondPredictedBranch
 
+  private def ohToInclusiveLaneMask(oh: UInt, width: Int): UInt = {
+    // 例子（width = 4）:
+    // oh = 0001 -> 0001
+    // oh = 0010 -> 0011
+    // oh = 0100 -> 0111
+    // oh = 1000 -> 1111
+    // oh = 0000 -> 1111
+    (Cat(oh, 0.U(1.W)) - 1.U)((width - 1), 0)
+  }
   // ---- Checkpoint Lane Mask 计算（第一个 checkpoint）----
   // 第一个 checkpoint RAT 应只包含 lane 0 到第一个被预测分支（含）的写入
-  
-
-  // ckptLaneMask(i) = lane i 在第一个被预测分支及之前 → 应包含在第一个 checkpoint 中
-  for (i <- 0 until 4) {
-    checkpoint.ckptLaneMask(i) := !hadBranchBefore(i)
-  }
+  // ckptLaneMask1(i) = lane i 在第一个被预测分支及之前 → 应包含在第一个 checkpoint 中
+  val ckptLaneMask1 = ohToInclusiveLaneMask(firstPredictedBranchUInt, 4)
+  val ckptLaneMask1Vec = VecInit(ckptLaneMask1.asBools)
   // ckptAllocCount：仅统计第一个 checkpoint 包含的 lane 中的分配数量
-  freeList.snapAllocReq := PopCount(
-    (0 until 4).map(i => needAlloc(i) && !hadBranchBefore(i))
-  )
+  freeList.snapAllocReq1 := PopCount(needAlloc.asUInt & ckptLaneMask1)
 
   // ---- Checkpoint Lane Mask 计算（第二个 checkpoint）----
   // 第二个 checkpoint RAT 包含 lane 0 到第二个被预测分支（含）的写入
-  // hadTwoBranchesBefore(i) = lane i 之前（不含 i）是否已有 >= 2 个被预测分支
-  val hadTwoBranchesBefore = Wire(Vec(4, Bool()))
-  hadTwoBranchesBefore(0) := false.B
-  for (i <- 1 until 4) {
-    hadTwoBranchesBefore(i) := PopCount(predictedBranchVec.take(i)) >= 2.U
-  }
   // ckptLaneMask2(i) = lane i 在第二个被预测分支及之前 → 应包含在第二个 checkpoint 中
-  for (i <- 0 until 4) {
-    checkpoint.ckptLaneMask2(i) := !hadTwoBranchesBefore(i)
-  }
+  val ckptLaneMask2 = ohToInclusiveLaneMask(secondPredictedBranchUInt, 4)
+  val ckptLaneMask2Vec = VecInit(ckptLaneMask2.asBools)
   // ckptAllocCount2：统计第二个 checkpoint 包含的 lane 中的分配数量
-  freeList.snapAllocReq2 := PopCount(
-    (0 until 4).map(i => needAlloc(i) && !hadTwoBranchesBefore(i))
-  )
+  freeList.snapAllocReq2 := PopCount(needAlloc.asUInt & ckptLaneMask2)
+
+  // ---- 第一个 Checkpoint RAT 快照构建 ----
+  // 只叠加 ckptLaneMask1 为 true 的 lane 的写入（到第一个被预测分支为止）
+  val postRenameRAT1 = WireInit(rat.snapData)
+  for (i <- 0 until 4) {
+    when(ckptLaneMask1Vec(i) && rat.wen(i) && rat.waddr(i) =/= 0.U) {
+      postRenameRAT1(rat.waddr(i)) := rat.wdata(i)
+    }
+  }
+  ckptRAT.postRename1 := postRenameRAT1
+
+  // ---- 第二个 Checkpoint RAT 快照构建 ----
+  // 叠加 ckptLaneMask2 为 true 的 lane 的写入（到第二个被预测分支为止）
+  val postRenameRAT2 = WireInit(rat.snapData)
+  for (i <- 0 until 4) {
+    when(ckptLaneMask2Vec(i) && rat.wen(i) && rat.waddr(i) =/= 0.U) {
+      postRenameRAT2(rat.waddr(i)) := rat.wdata(i)
+    }
+  }
+  ckptRAT.postRename2 := postRenameRAT2
 
   // ---- 向下游输出 RenameEntry ----
   for (i <- 0 until 4) {
@@ -206,7 +194,6 @@ class Rename extends Module {
     out.bits.entries(i).predict_target       := in.bits(i).predict_target
     out.bits.entries(i).bht_meta             := in.bits(i).bht_meta
     out.bits.entries(i).regWriteEnable       := regWriteEnables(i)
-    out.bits.entries(i).memWriteEnable       := memWriteEnables(i)
     out.bits.entries(i).valid                := in.bits(i).valid
     out.bits.entries(i).psrc1                := psrc1s(i)
     out.bits.entries(i).psrc2                := psrc2s(i)
@@ -214,10 +201,10 @@ class Rename extends Module {
     out.bits.entries(i).stalePdst            := stalePdsts(i)
     out.bits.entries(i).ldst                 := rds(i)
     // 分支 checkpoint 索引：第一个被预测分支使用 saveIdx，第二个使用 saveIdx2
-    out.bits.entries(i).checkpointIdx        := Mux(firstPredictedBranch(i), checkpoint.saveIdx,
-                                                  Mux(secondPredictedBranch(i), checkpoint.saveIdx2, 0.U))
+    out.bits.entries(i).checkpointIdx        := Mux(firstPredictedBranch(i), ckPointReq.saveIdx1,
+                                                  Mux(secondPredictedBranch(i), ckPointReq.saveIdx2, 0.U))
     // hasCheckpoint：第一个和第二个被预测分支都为 true（各自对应不同的 BCT 表项）
-    out.bits.entries(i).hasCheckpoint          := firstPredictedBranch(i) || secondPredictedBranch(i)
+    out.bits.entries(i).hasCheckpoint        := firstPredictedBranch(i) || secondPredictedBranch(i)
   }
   out.bits.validCount := PopCount(in.bits.map(_.valid))
   out.bits.storeCount := PopCount((in.bits.map(_.valid) zip memWriteEnables).map {

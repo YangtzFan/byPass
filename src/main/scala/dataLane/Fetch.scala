@@ -27,8 +27,8 @@ class Fetch extends Module {
 
   // ---- 读 IROM 接口 ----
   val irom = IO(new Bundle {
-    val inst_addr_o = Output(UInt(14.W))      // 输出到 IROM 的地址（128-bit 字地址 = PC[17:4]）
-    val inst_i      = Input(UInt(128.W))      // IROM 返回的 128 位数据（4 条指令拼接）
+    val inst_addr_o = Output(UInt(14.W)) // 输出到 IROM 的地址（128-bit 字地址 = PC[17:4]）
+    val inst_i      = Input(UInt(128.W)) // IROM 返回的 128 位数据（4 条指令拼接）
   })
 
   // ---- BHT 接口（由 myCPU 顶层连接到 BHT 模块）----

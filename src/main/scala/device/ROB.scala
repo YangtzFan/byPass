@@ -35,7 +35,7 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
   val empty = count === 0.U
   val full  = count === entries.U
 
-  alloc.canAlloc := count +& 4.U <= entries.U // canAlloc 不依赖 request，避免与 Dispatch 形成组合环路。空闲空间 >= 4才能分配
+  alloc.canAlloc := count +& 4.U <= entries.U // canAlloc 不依赖 request，避免与 Dispatch 形成组合环路
   for (i <- 0 until 4) { // 返回连续的 ROB 指针（从当前 tail 开始）
     alloc.idxs(i) := tail + i.U
   }
@@ -107,11 +107,11 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
   // ===================== Refresh 阶段完成标记 =====================
   when(refresh.valid) {
     val refEntry = rob(idx(refresh.idx))
-    refEntry.done          := true.B
-    refEntry.regWBData     := refresh.regWBData
+    refEntry.done         := true.B
+    refEntry.regWBData    := refresh.regWBData
     refEntry.actualTaken  := refresh.actualTaken
     refEntry.actualTarget := refresh.actualTarget
-    refEntry.mispredict    := refresh.mispredict
+    refEntry.mispredict   := refresh.mispredict
   }
   // ===================== Commit 指针更新 =====================
   when(canCommit) {

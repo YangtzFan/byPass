@@ -112,8 +112,6 @@ class myCPU extends Module {
   uRename.in <> uDecRenDff.out
   uRename.flush := memRedirectValid
 
-  // ---- PRF（物理寄存器堆，128 x 32-bit）----
-  val uPRF = Module(new PRF)
   // ---- RAT（投机态映射表）----
   val uRAT = Module(new RAT)
   // ---- FreeList（空闲物理寄存器 FIFO）----
@@ -136,46 +134,17 @@ class myCPU extends Module {
   for (i <- 0 until 8) { uReadyTable.io.raddr(i) := 0.U }
 
   // ---- Rename ↔ BranchCheckpointTable 连接（保存 checkpoint）----
-  uRename.checkpoint.canSave1 := uBCT.io.canSave1
-  uRename.checkpoint.canSave2 := uBCT.io.canSave2
-  // 第一个 checkpoint 保存
-  uBCT.io.saveValid := uRename.checkpoint.saveValid
-  uRename.checkpoint.saveIdx := uBCT.io.saveIdx
-  // 第二个 checkpoint 保存
-  uBCT.io.saveValid2 := uRename.checkpoint.saveValid2
-  uRename.checkpoint.saveIdx2 := uBCT.io.saveIdx2
+  uBCT.renameRequest <> uRename.ckPointReq
 
-  // ---- 第一个 Checkpoint RAT 快照构建 ----
-  // 只叠加 ckptLaneMask 为 true 的 lane 的写入（到第一个被预测分支为止）
-  val postRenameRAT = Wire(Vec(CPUConfig.archRegs, UInt(CPUConfig.prfAddrWidth.W)))
-  for (r <- 0 until CPUConfig.archRegs) {
-    postRenameRAT(r) := uRAT.io.snapData(r)
-  }
-  for (i <- 0 until 4) {
-    when(uRename.checkpoint.ckptLaneMask(i) && uRename.rat.wen(i) && uRename.rat.waddr(i) =/= 0.U) {
-      postRenameRAT(uRename.rat.waddr(i)) := uRename.rat.wdata(i)
-    }
-  }
-  uBCT.io.saveRAT   := postRenameRAT
-  uBCT.io.saveFLHead := uFreeList.io.snapHead
-  uBCT.io.saveFLTail := uFreeList.io.snapTail
-  uBCT.io.saveReady  := uReadyTable.io.snapData
+  uBCT.save1.rat     := uRename.ckptRAT.postRename1
+  uBCT.save1.flHead  := uFreeList.io.snapHead1
+  uBCT.save1.flTail  := uFreeList.io.snapTail
+  uBCT.save1.readyTb := uReadyTable.io.snapData
 
-  // ---- 第二个 Checkpoint RAT 快照构建 ----
-  // 叠加 ckptLaneMask2 为 true 的 lane 的写入（到第二个被预测分支为止）
-  val postRenameRAT2 = Wire(Vec(CPUConfig.archRegs, UInt(CPUConfig.prfAddrWidth.W)))
-  for (r <- 0 until CPUConfig.archRegs) {
-    postRenameRAT2(r) := uRAT.io.snapData(r)
-  }
-  for (i <- 0 until 4) {
-    when(uRename.checkpoint.ckptLaneMask2(i) && uRename.rat.wen(i) && uRename.rat.waddr(i) =/= 0.U) {
-      postRenameRAT2(uRename.rat.waddr(i)) := uRename.rat.wdata(i)
-    }
-  }
-  uBCT.io.saveRAT2   := postRenameRAT2
-  uBCT.io.saveFLHead2 := uFreeList.io.snapHead2
-  uBCT.io.saveFLTail2 := uFreeList.io.snapTail
-  uBCT.io.saveReady2  := uReadyTable.io.snapData
+  uBCT.save2.rat     := uRename.ckptRAT.postRename2
+  uBCT.save2.flHead  := uFreeList.io.snapHead2
+  uBCT.save2.flTail  := uFreeList.io.snapTail
+  uBCT.save2.readyTb := uReadyTable.io.snapData
 
   // =====================================================
   // ============ Rename → Dispatch 流水寄存器（RenDisDff）============
@@ -191,25 +160,20 @@ class myCPU extends Module {
   val uDisp = Module(new Dispatch)
   uDisp.in <> uRenDisDff.out
   uDisp.flush := memRedirectValid
-  // ---- ROB 实例化与 Dispatch 连接 ----
+  // ---- ROB 和 StoreBuffer 实例化 ----
   val uROB = Module(new ROB)
-  // ---- StoreBuffer 实例化 ----
   val uStoreBuffer = Module(new StoreBuffer)
-  // ---- Dispatch ↔ ROB 分配连接 ----
+  // ---- Dispatch ↔ ROB 和 StoreBuffer 分配连接 ----
   uROB.alloc <> uDisp.robAlloc
-  // ---- Dispatch ↔ StoreBuffer 分配连接（使用 <> 自动连接）----
   uStoreBuffer.alloc <> uDisp.sbAlloc
 
   // =====================================================
   // ============ IssueQueue（Vec + FreeList + instSeq 架构）============
   // =====================================================
   val uIssueQueue = Module(new IssueQueue)
-  // ---- Dispatch ↔ IssueQueue 分配连接（参照 StoreBuffer 的分配模式）----
+  // ---- Dispatch ↔ IssueQueue 连接（参照 StoreBuffer 的分配模式）----
   uIssueQueue.alloc <> uDisp.iqAlloc
-  // ---- Dispatch → IssueQueue 写入连接 ----
-  uIssueQueue.write.valid   := uDisp.out.valid
-  uIssueQueue.write.entries := uDisp.out.entries
-  uIssueQueue.write.count   := uDisp.out.validCount
+  uIssueQueue.write := uDisp.out
   uIssueQueue.flush := memRedirectValid
 
   // =====================================================
@@ -237,6 +201,8 @@ class myCPU extends Module {
   // =====================================================
   val uReadReg = Module(new ReadReg)
   uReadReg.in <> uIssRRDff.out
+  // ---- PRF（物理寄存器堆，128 x 32-bit）----
+  val uPRF = Module(new PRF)
   // ---- PRF 读端口连接（按物理寄存器编号读取操作数）----
   uPRF.io.raddr1 := uReadReg.prfRead.raddr1
   uPRF.io.raddr2 := uReadReg.prfRead.raddr2
@@ -279,10 +245,10 @@ class myCPU extends Module {
   io.ram_mask_o := uMemory.io.ram_mask_o
   uMemory.io.ram_rdata_i := io.ram_rdata_i
 
-  // ---- StoreBuffer 写入连接（Memory 阶段将 Store 地址和数据写入 StoreBuffer，使用 <> 自动连接）----
-  uStoreBuffer.write <> uMemory.sbWrite
+  // ---- Store StoreBuffer 写入连接（Memory 阶段将地址和数据写入 StoreBuffer）----
+  uStoreBuffer.write := uMemory.sbWrite
 
-  // ---- StoreBuffer 查询连接（Memory 阶段 Load 指令查询 Store-to-Load 转发，使用 <> 自动连接）----
+  // ---- Load StoreBuffer 查询连接（Memory 阶段指令查询 Store-to-Load 转发，使用 <> 自动连接）----
   uStoreBuffer.query <> uMemory.sbQuery
 
   // ---- Memory 阶段 DRAM 端口冲突信号：drain 正在写时 Load 需要停顿 ----
@@ -324,7 +290,7 @@ class myCPU extends Module {
   // ---- RRAT（提交态映射表）----
   // Commit 时更新 RRAT[ldst] = pdst，作为架构状态的映射记录
   // RRAT 不需要单独的模块，用简单寄存器实现即可
-  val rrat = RegInit(VecInit((0 until CPUConfig.archRegs).map(i => i.U(CPUConfig.prfAddrWidth.W))))
+  val rrat = RegInit(VecInit((0 until 32).map(i => i.U(CPUConfig.prfAddrWidth.W))))
 
   // Commit 时更新 RRAT 和释放 stalePdst
   val commitRegWen = uROB.commit.regWen && uROB.commit.ldst =/= 0.U

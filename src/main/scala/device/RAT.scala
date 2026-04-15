@@ -31,24 +31,22 @@ class RATReadWriteIO extends Bundle {
   val wen        = Output(Vec(4, Bool()))                         // 4 个写端口
   val waddr      = Output(Vec(4, UInt(5.W)))                      // 4 个写地址
   val wdata      = Output(Vec(4, UInt(CPUConfig.prfAddrWidth.W))) // 4 个写数据
+  val snapData   = Input(Vec(32, UInt(CPUConfig.prfAddrWidth.W))) // 完整快照输出端口（BranchCheckpoint 保存用）
 }
 
 class RAT extends Module {
   val rwio = IO(Flipped(new RATReadWriteIO))
   val io = IO(new Bundle {
     // ---- 批量恢复端口（分支预测失败时从 checkpoint 恢复）----
-    val recover       = Input(Bool())                                   // 恢复使能
-    val recoverData   = Input(Vec(CPUConfig.archRegs, UInt(CPUConfig.prfAddrWidth.W))) // 恢复数据（完整 RAT 快照）
-
-    // ---- 完整快照输出端口（BranchCheckpoint 保存用）----
-    val snapData = Output(Vec(CPUConfig.archRegs, UInt(CPUConfig.prfAddrWidth.W)))
+    val recover     = Input(Bool())                                  // 恢复使能
+    val recoverData = Input(Vec(32, UInt(CPUConfig.prfAddrWidth.W))) // 恢复数据（完整 RAT 快照）
   })
 
-  val table = RegInit(VecInit((0 until CPUConfig.archRegs).map(i => i.U(CPUConfig.prfAddrWidth.W)))) // 映射表：32 个表项，初始映射 x_i -> p_i
+  val table = RegInit(VecInit((0 until 32).map(i => i.U(CPUConfig.prfAddrWidth.W)))) // 映射表：初始映射 x_i -> p_i
 
   // ---- 批量恢复逻辑（优先级最高）----
   when(io.recover) {
-    for (i <- 0 until CPUConfig.archRegs) {
+    for (i <- 0 until 32) {
       table(i) := io.recoverData(i)
     }
   }.otherwise {
@@ -62,8 +60,8 @@ class RAT extends Module {
     }
   }
 
-  // ---- 组合读端口：直接读取当前映射 ----
-  // 注意：这里读到的是 "上一拍末尾" 的值，不包含本拍的写入 Rename bypass 由 Rename 模块在外部处理
+  // ---- 组合读端口：读取 RAT[rs1] 和 RAT[rs2] 作为当前映射 ----
+  // 注意：这里读到的是 "上一拍末尾" 的值，不包含本拍的写入 Rename 数据旁路由 Rename 模块在外部处理
   for (i <- 0 until 8) {
     rwio.rdata(i) := Mux(rwio.raddr(i) === 0.U, 0.U, table(rwio.raddr(i)))
   }
@@ -74,5 +72,5 @@ class RAT extends Module {
   }
 
   // ---- 完整快照输出（用于 BranchCheckpoint 保存）----
-  io.snapData := table
+  rwio.snapData := table
 }

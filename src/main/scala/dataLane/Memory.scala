@@ -44,7 +44,7 @@ class Memory extends Module {
   })
 
   // ---- StoreBuffer 写入端口（将 Store 地址和数据写入 StoreBuffer）----
-  val sbWrite = IO(new SBWriteIO)
+  val sbWrite = IO(Output(new SBWriteIO))
 
   // ---- StoreBuffer 查询接口（Load 指令需要检查 Store-to-Load 转发）----
   val sbQuery = IO(new SBQueryIO)
@@ -86,7 +86,6 @@ class Memory extends Module {
 
   // 综合停顿信号：SB 停顿或 DRAM 端口冲突（仅 Load 时有效）
   val memStall = sbStall || dramConflict
-
 
   // DRAM 读端口：只有 Load 指令且不从 StoreBuffer 转发时才需要读 DRAM
   io.ram_addr_o := Mux(lType && !sbQuery.hit, in.bits.data, 0.U)

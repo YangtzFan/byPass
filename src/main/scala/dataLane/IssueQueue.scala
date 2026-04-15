@@ -23,24 +23,29 @@ import mycpu.CPUConfig
 
 // ---- IssueQueue 内部表项：在 DispatchEntry 基础上增加 instSeq 字段 ----
 class IssueQueueEntry extends Bundle {
-  val data    = new DispatchEntry            // 原始 Dispatch 阶段的指令信息
-  val instSeq = UInt(CPUConfig.instSeqWidth.W)  // 指令逻辑年龄（全局单调递增）
+  val data    = new DispatchEntry // 原始 Dispatch 阶段的指令信息
+  val instSeq = UInt(CPUConfig.instSeqWidth.W) // 指令逻辑年龄（全局单调递增）
 }
 
 // ---- IssueQueue 分配接口（Dispatch 阶段使用）----
-// 参照 StoreBuffer 的 SBAllocIO 设计
 class IQAllocIO extends Bundle {
-  val request  = Output(UInt(3.W))                                        // 请求分配的表项数（0~4）
-  val canAlloc = Input(Bool())                                            // IssueQueue 是否有足够空间
-  val idxs     = Input(Vec(4, UInt(log2Ceil(CPUConfig.issueQueueEntries).W)))  // 分配的物理槽位索引
+  val canAlloc = Input(Bool())     // IssueQueue 是否有足够空间
+  val request  = Output(UInt(3.W)) // 请求分配的表项数（0~4）
+  val idxs     = Input(Vec(4, UInt(log2Ceil(CPUConfig.issueQueueEntries).W))) // 分配的物理槽位索引
+}
+
+class IQWriteData extends Bundle {
+  val entries    = Vec(4, new DispatchEntry)
+  val validCount = UInt(3.W)
+  val valid      = Bool() // 本周期是否有有效的 Dispatch 输出
 }
 
 // ---- IssueQueue 发射选择接口（Issue 阶段使用）----
 // Issue 阶段读取最老的有效条目，并通知 IssueQueue 释放该槽位
 class IQIssueIO extends Bundle {
-  val valid = Output(Bool())                                              // 是否有可发射的条目
-  val entry = Output(new DispatchEntry)                                   // 最老的有效条目数据
-  val fire  = Input(Bool())                                               // Issue 阶段确认发射（释放该槽位）
+  val valid = Output(Bool())            // 是否有可发射的条目
+  val entry = Output(new DispatchEntry) // 最老的有效条目数据
+  val fire  = Input(Bool())             // Issue 阶段确认发射（释放该槽位）
 }
 
 class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
@@ -52,11 +57,7 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
 
   // ---- 写入接口（Dispatch 阶段使用：直接写入表项数据）----
   // 与 StoreBuffer 不同，IssueQueue 在分配时就写入全部数据（Dispatch 已有完整信息）
-  val write = IO(new Bundle {
-    val valid   = Input(Bool())                              // 写入使能
-    val entries = Input(Vec(4, new DispatchEntry))           // 4 路写入数据
-    val count   = Input(UInt(3.W))                           // 实际写入数量
-  })
+  val write = IO(Input(new IQWriteData))
 
   // ---- 发射选择接口（Issue 阶段使用）----
   val issue = IO(new IQIssueIO)
@@ -68,9 +69,9 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
   // 存储阵列：Vec[depth] 的平坦 IssueQueueEntry 数组
   // 空闲物理槽位列表：freeVec 位向量
   // ========================================================================
-  val buffer  = RegInit(VecInit(Seq.fill(depth)(0.U.asTypeOf(new IssueQueueEntry))))
-  val validVec = RegInit(VecInit(Seq.fill(depth)(false.B)))  // 每个槽位是否有效
-  val freeVec = RegInit(VecInit(Seq.fill(depth)(true.B)))    // 初始状态：所有槽位空闲
+  val buffer    = RegInit(VecInit(Seq.fill(depth)(0.U.asTypeOf(new IssueQueueEntry))))
+  val validVec  = RegInit(VecInit(Seq.fill(depth)(false.B))) // 每个槽位是否有效
+  val freeVec   = RegInit(VecInit(Seq.fill(depth)(true.B)))  // 初始状态：所有槽位空闲
   val freeCount = PopCount(freeVec)                          // 空闲槽位计数
 
   // ---- FreeList 分配逻辑（级联 PriorityEncoder）----
@@ -83,55 +84,48 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
   freeValid(0) := mask0.orR
   freeIdxs(0)  := PriorityEncoder(mask0)
 
-  // 第 1 个：遮蔽前一个已选中的位
-  val mask1 = mask0 & ~(1.U(depth.W) << freeIdxs(0))
+  // 第 1 个：遮蔽前一个已选中的位，找下一个空闲槽
+  val mask1 = mask0 & ~(PriorityEncoderOH(mask0))
   freeValid(1) := mask1.orR
   freeIdxs(1)  := PriorityEncoder(mask1)
 
-  // 第 2 个：遮蔽前两个已选中的位
-  val mask2 = mask1 & ~(1.U(depth.W) << freeIdxs(1))
+  // 第 2 个：遮蔽前两个已选中的位，找下下一个空闲槽
+  val mask2 = mask1 & ~(PriorityEncoderOH(mask1))
   freeValid(2) := mask2.orR
   freeIdxs(2)  := PriorityEncoder(mask2)
 
-  // 第 3 个：遮蔽前三个已选中的位
-  val mask3 = mask2 & ~(1.U(depth.W) << freeIdxs(2))
+  // 第 3 个：遮蔽前三个已选中的位，找下下个个空闲槽
+  val mask3 = mask2 & ~(PriorityEncoderOH(mask2))
   freeValid(3) := mask3.orR
   freeIdxs(3)  := PriorityEncoder(mask3)
 
   // ========================================================================
-  // nextInstSeq：全局单调递增的指令序号计数器
+  // nextInstSeq：全局单调递增的指令序号计数器，用于确定指令逻辑年龄
   // ========================================================================
   val nextInstSeq = RegInit(0.U(seqWidth.W))
 
   // ===================== 分配逻辑（Dispatch 阶段）=====================
-  // canAlloc 不依赖 request，避免与 Dispatch 形成组合环路
-  alloc.canAlloc := freeCount >= 4.U
+  alloc.canAlloc := freeCount >= 4.U // canAlloc 不依赖 request，避免与 Dispatch 形成组合环路
+  alloc.idxs := freeIdxs // 返回 FreeList 选中的物理索引
 
-  // 返回 FreeList 选中的物理索引
-  for (i <- 0 until 4) {
-    alloc.idxs(i) := freeIdxs(i)
-  }
-
-  // ===================== 写入逻辑（Dispatch 阶段）=====================
+  // ===================== 写入逻辑（Dispatch）=====================
   // Dispatch 确认分派后，将指令数据写入对应的物理槽位
-  val doWrite = write.valid && !flush
-  when(doWrite) {
+  when(write.valid && !flush) { // 冲刷时不写入
     for (i <- 0 until 4) {
-      when(i.U < write.count) {
+      when(i.U < write.validCount) {
         val physIdx = freeIdxs(i)
         // 写入指令数据
         buffer(physIdx).data    := write.entries(i)
-        buffer(physIdx).instSeq := nextInstSeq + i.U  // 分配逻辑年龄
+        buffer(physIdx).instSeq := nextInstSeq + i.U // 分配逻辑年龄
         // 将该槽位标记为有效和已占用
         validVec(physIdx) := true.B
         freeVec(physIdx)  := false.B
       }
     }
-    // 更新全局 instSeq 计数器
-    nextInstSeq := nextInstSeq + write.count
+    nextInstSeq := nextInstSeq + write.validCount // 更新全局 instSeq 计数器
   }
 
-  // ===================== 发射选择逻辑（Issue 阶段）=====================
+  // ===================== 发射选择逻辑（Issue）=====================
   // 在所有 valid 的条目中，选择 instSeq 最小（最老）的条目
   // 使用 found 标志模式（参照 StoreBuffer 的 Drain 选择逻辑）
   val (issueIdx, issueSeq, issueFound) = (0 until depth).foldLeft(
