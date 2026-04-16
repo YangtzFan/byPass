@@ -17,27 +17,24 @@ import chisel3.util._
 //   supportFlush : 是否需要 flush 端口（flush 时 valid 清零，丢弃数据）
 // ============================================================================
 class BaseDff[T <: Data](gen: T, supportFlush: Boolean = false) extends Module {
-  val in  = IO(Flipped(Decoupled(gen)))   // 输入端（Flipped 使 valid/bits 为 Input，ready 为 Output）
-  val out = IO(Decoupled(gen))             // 输出端（valid/bits 为 Output，ready 为 Input）
+  val in  = IO(Flipped(Decoupled(gen))) // 输入端（Flipped 使 valid/bits 为 Input，ready 为 Output）
+  val out = IO(Decoupled(gen))          // 输出端（valid/bits 为 Output，ready 为 Input）
   val flush = Option.when(supportFlush)(IO(Input(Bool())))  // 可选的 flush 信号
 
-  val validReg = RegInit(false.B)                            // 数据是否有效
+  val validReg = RegInit(false.B)                             // 数据是否有效
   val bitsReg  = RegInit(0.U.asTypeOf(chiselTypeOf(in.bits))) // 缓存的数据
 
   out.valid := validReg
   out.bits  := bitsReg
 
-  // 背压逻辑：当前为空 或 下游已取走 → 可以接收新数据
-  in.ready := !validReg || out.ready
+  in.ready := !validReg || out.ready // 背压逻辑：当前为空 或 下游已取走 → 可以接收新数据
 
-  when(flush.getOrElse(false.B)) {
-    // flush 时清除 valid，丢弃当前缓存的数据
+  when(flush.getOrElse(false.B)) { // flush 时清除 valid，丢弃当前缓存的数据
     validReg := false.B
-  }.elsewhen(in.ready) {
-    // 可以接收时，用上游 valid 更新本级 valid
+  }.elsewhen(in.ready) { // 可以接收时，用上游 valid 更新本级 valid
     validReg := in.valid
-    when(in.valid) {
-      bitsReg := in.bits   // 锁存新数据
+    when(in.valid) { // 有效时才锁存，节省翻转功耗
+      bitsReg := in.bits // 锁存新数据
     }
   }
 }

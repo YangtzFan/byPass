@@ -28,13 +28,14 @@ class SE extends Module {
     val imm_o  = Output(UInt(32.W))
   })
 
-  val U_type = io.type_decode_together(8)
-  val JAL = io.type_decode_together(7)
-  val JALR = io.type_decode_together(6)
-  val B_type = io.type_decode_together(5)
-  val L_type = io.type_decode_together(4)
-  val I_type = io.type_decode_together(3)
-  val S_type = io.type_decode_together(2)
+  val uType = io.type_decode_together(8)
+  val jal = io.type_decode_together(7)
+  val jalr = io.type_decode_together(6)
+  val bType = io.type_decode_together(5)
+  val lType = io.type_decode_together(4)
+  val iType = io.type_decode_together(3)
+  val sType = io.type_decode_together(2)
+  val other = io.type_decode_together(1) || io.type_decode_together(0)
 
   private val splitImm12 = Cat(io.funct7, io.rd) // S/B 型指令的 12 位原始立即数字段来自 inst[31:25] ++ inst[11:7]
   private def iImm: UInt = signExtend(io.imm12) // JALR / I-type / L-type: 直接对 imm12 做符号扩展
@@ -56,12 +57,13 @@ class SE extends Module {
   ))
 
   // 输出立即数
-  io.imm_o := MuxCase(0.U(32.W), Seq(
-    U_type             -> uImm,
-    JAL                -> jImm,
-    JALR               -> iImm,
-    B_type             -> bImm,
-    (L_type || I_type) -> iImm,
-    S_type             -> sImm
+  io.imm_o := Mux1H(Seq(
+    uType            -> uImm,
+    jal              -> jImm,
+    jalr             -> iImm,
+    bType            -> bImm,
+    (lType || iType) -> iImm,
+    sType            -> sImm,
+    other            -> 0.U(32.W)
   ))
 }

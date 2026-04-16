@@ -8,3 +8,5 @@ build/
 .xmake/
 tmp
 AGENTS.md
+scripts
+.gitignore
