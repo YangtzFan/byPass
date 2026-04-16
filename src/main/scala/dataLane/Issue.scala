@@ -16,6 +16,7 @@ import mycpu.CPUConfig
 //   - Load-Use 冒险：当下游正在执行的指令是 Load，且当前指令的源寄存器
 //     依赖该 Load 的目标寄存器时，暂停发射一个周期
 //
+// 无寄存器重命名版本：使用逻辑寄存器编号 rd(5-bit) 进行 Load-Use 冒险检测
 // 输出 Issue_ReadReg_Payload 给 IssRRDff → ReadReg 阶段
 // ============================================================================
 class Issue extends Module {
@@ -27,10 +28,10 @@ class Issue extends Module {
 
   // ---- Load-Use 冒险检测接口 ----
   // 从 IssRRDff（Issue → ReadReg 流水寄存器）获取正在进入 ReadReg 的指令信息
-  // 使用物理目的寄存器 pdst 进行冒险匹配
+  // 无寄存器重命名版本：使用逻辑目标寄存器 rd(5-bit) 进行匹配
   val hazard = IO(new Bundle {
-    val pdst        = Input(UInt(CPUConfig.prfAddrWidth.W)) // ReadReg 阶段指令的物理目的寄存器编号
-    val isValidLoad = Input(Bool())    // 该指令是否为 Load
+    val rd          = Input(UInt(5.W))  // ReadReg 阶段指令的逻辑目标寄存器编号
+    val isValidLoad = Input(Bool())     // 该指令是否为有效 Load
   })
 
   // ---- 从 IssueQueue 获取最老的有效指令 ----
@@ -39,8 +40,8 @@ class Issue extends Module {
 
   // ---- 指令字段提取 ----
   val inst = entry.inst
-  val rs1  = inst(19, 15)
-  val rs2  = inst(24, 20)
+  val rs1  = inst(19, 15) // 逻辑源寄存器 1
+  val rs2  = inst(24, 20) // 逻辑源寄存器 2
 
   // ---- 指令类型提取（从 9 位独热编码）----
   val td    = entry.type_decode_together
@@ -52,12 +53,13 @@ class Issue extends Module {
   val rType = td(1)
 
   // ---- Load-Use 冒险检测 ----
-  // 使用物理寄存器编号进行匹配，避免逻辑寄存器重名问题
+  // 无寄存器重命名版本：使用逻辑寄存器编号进行匹配
+  // rd=x0 不会产生冒险（x0 硬编码为 0）
   val use_rs1 = jalr || bType || iType || sType || rType || lType
   val use_rs2 = bType || sType || rType
-  val loadUseStall = hazard.isValidLoad && (hazard.pdst =/= 0.U) &&
-    ((use_rs1 && (entry.psrc1 === hazard.pdst)) ||
-     (use_rs2 && (entry.psrc2 === hazard.pdst)))
+  val loadUseStall = hazard.isValidLoad && (hazard.rd =/= 0.U) &&
+    ((use_rs1 && (rs1 === hazard.rd)) ||
+     (use_rs2 && (rs2 === hazard.rd)))
 
   // ---- 是否可以发射当前指令 ----
   val canIssue = entryValid && !loadUseStall && !flush
@@ -75,13 +77,6 @@ class Issue extends Module {
   out.bits.sbIdx                := entry.sbIdx
   out.bits.isSbAlloc            := entry.isSbAlloc
   out.bits.storeSeqSnap         := entry.storeSeqSnap
-  // 物理寄存器映射信息透传
-  out.bits.psrc1                := entry.psrc1
-  out.bits.psrc2                := entry.psrc2
-  out.bits.pdst                 := entry.pdst
-  out.bits.stalePdst            := entry.stalePdst
-  out.bits.ldst                 := entry.ldst
-  out.bits.checkpointIdx        := entry.checkpointIdx // 分支 checkpoint 索引透传
 
   // ---- 握手信号 ----
   out.valid := canIssue

@@ -9,10 +9,12 @@ import mycpu.CPUConfig
 // ============================================================================
 // 注意：这里 **不** 直接写寄存器堆，也 **不** 更新架构状态！
 // Refresh 的职责是通知 ROB "这条指令已经执行完毕"，并将结果写入 ROB 表项。
-// 真正写入寄存器堆和内存的操作在 Commit 阶段完成（保证顺序提交语义）。
+// 真正写入寄存器堆的操作在 myCPU 顶层中通过 Refresh 阶段的信号驱动 REG 写入。
 //
 // 无 flush 端口：Memory 重定向时，Refresh 中的指令必然比误预测指令更老（正确路径），
 // 或者就是误预测指令本身（需要正常完成以便 Commit），因此不需要冲刷。
+//
+// 无寄存器重命名版本：输出逻辑寄存器 rd 而非物理寄存器 pdst
 // ============================================================================
 class Refresh extends Module {
   val in = IO(Flipped(Decoupled(new Memory_Refresh_Payload)))  // 输入：来自 MemRefDff 流水线寄存器
@@ -27,8 +29,8 @@ class Refresh extends Module {
   robRefresh.actualTaken    := in.bits.actual_taken
   robRefresh.actualTarget   := in.bits.actual_target
   robRefresh.mispredict     := in.bits.mispredict
-  robRefresh.pdst           := in.bits.pdst           // 物理目的寄存器（PRF 写入 + ReadyTable 标记 ready）
-  robRefresh.regWriteEnable := in.bits.regWriteEnable // 是否需要写回
+  robRefresh.rd             := in.bits.inst_rd            // 逻辑目标寄存器（REG 写入用）
+  robRefresh.regWriteEnable := in.bits.regWriteEnable     // 是否需要写回
 
   in.ready := true.B  // Refresh 始终准备好接收
 }

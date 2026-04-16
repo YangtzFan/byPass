@@ -39,18 +39,6 @@ object CPUConfig {
   val sbPtrWidth: Int = sbIdxWidth + 1      // StoreBuffer 指针位宽（含回绕位，6 位）——保留兼容
   val storeSeqWidth: Int = 32               // storeSeq 逻辑年龄位宽（使用 32 位避免回绕导致的比较错误）
 
-  // ---- PRF（物理寄存器堆）参数 ----
-  val prfEntries: Int = 128                    // 物理寄存器数量（p0~p127）
-  val prfAddrWidth: Int = log2Ceil(prfEntries) // 物理寄存器编号位宽（7 位）
-  val renameWidth: Int = 4                     // 重命名宽度（每拍最多处理 4 条指令）
-  // ---- FreeList 参数 ----
-  val freeListEntries: Int = prfEntries - 32   // FreeList 容量（96）
-
-  // ---- 分支 Checkpoint 参数 ----
-  val maxBranchCheckpoints: Int = 8                      // 最大同时在飞分支数（checkpoint 数量）
-  val ckptIdxWidth: Int = log2Ceil(maxBranchCheckpoints) // checkpoint 索引位宽（3 位）
-  val ckptPtrWidth: Int = ckptIdxWidth + 1               // checkpoint 全指针位宽（含回绕位，4 位）
-
   // ---- 便捷方法 ----
   def useBHT: Boolean  = branchPredictor == DynamicBHT
   def useBTFN: Boolean = branchPredictor == StaticBTFN
