@@ -37,7 +37,7 @@ object CPUConfig {
   val sbEntries: Int = 32                   // StoreBuffer 深度
   val sbIdxWidth: Int = log2Ceil(sbEntries) // StoreBuffer 索引位宽（5 位）
   val sbPtrWidth: Int = sbIdxWidth + 1      // StoreBuffer 指针位宽（含回绕位，6 位）——保留兼容
-  val storeSeqWidth: Int = 32               // storeSeq 逻辑年龄位宽（使用 32 位避免回绕导致的比较错误）
+  val storeSeqWidth: Int = 8                // storeSeq 逻辑年龄位宽（8 位，使用循环比较处理回绕，半区间 128 > sbEntries 故安全）
 
   // ---- PRF（物理寄存器堆）参数 ----
   val prfEntries: Int = 128                    // 物理寄存器数量（p0~p127）

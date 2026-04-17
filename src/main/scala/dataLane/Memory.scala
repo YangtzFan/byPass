@@ -9,7 +9,7 @@ import mycpu.CPUConfig
 // ============================================================================
 // - Load 指令：
 //     1. 先检查 StoreBuffer 中是否有更老的 Store 命中同一地址
-//        a) 如果有且地址已知 → 从 StoreBuffer 转发数据
+//        a) 如果有且地址已知 → 暂时不从 StoreBuffer 转发数据，而是等 drain 后从主存读取
 //        b) 如果有更老的 Store 但地址未知 → 流水线停顿（等待 Store 地址计算完成）
 //        c) 没有匹配 → 从 DRAM 读取数据
 //     2. 最终输出 Load 读回的数据
@@ -29,18 +29,18 @@ class Memory extends Module {
 
   // ---- DRAM 读端口接口（Load 使用）----
   val io = IO(new Bundle {
-    val ram_addr_o  = Output(UInt(32.W))          // DRAM 读地址
-    val ram_mask_o  = Output(UInt(3.W))           // 访存宽度掩码
-    val ram_rdata_i = Input(UInt(32.W))           // DRAM 读回数据
+    val ram_addr_o  = Output(UInt(32.W)) // DRAM 读地址
+    val ram_mask_o  = Output(UInt(3.W))  // 访存宽度掩码
+    val ram_rdata_i = Input(UInt(32.W))  // DRAM 读回数据
   })
 
   // ---- Memory 阶段重定向输出 ----
   val redirect = IO(new Bundle {
-    val valid        = Output(Bool())                              // 需要重定向
-    val addr         = Output(UInt(32.W))                          // 正确的跳转目标地址
-    val robIdx       = Output(UInt(CPUConfig.robPtrWidth.W))       // 误预测指令的 ROB 指针（用于 ROB 回滚）
-    val storeSeqSnap = Output(UInt(CPUConfig.storeSeqWidth.W))     // 误预测指令的 storeSeqSnap（用于 StoreBuffer 精确回滚）
-    val checkpointIdx = Output(UInt(CPUConfig.ckptPtrWidth.W)) // 误预测指令的 checkpoint 全指针（含回绕位，用于 BCT 恢复）
+    val valid         = Output(Bool())                          // 需要重定向
+    val addr          = Output(UInt(32.W))                      // 正确的跳转目标地址
+    val robIdx        = Output(UInt(CPUConfig.robPtrWidth.W))   // 误预测指令的 ROB 指针（用于 ROB 回滚）
+    val storeSeqSnap  = Output(UInt(CPUConfig.storeSeqWidth.W)) // 误预测指令的 storeSeqSnap（用于 StoreBuffer 精确回滚）
+    val checkpointIdx = Output(UInt(CPUConfig.ckptPtrWidth.W))  // 误预测指令的 checkpoint 全指针（含回绕位，用于 BCT 恢复）
   })
 
   // ---- StoreBuffer 写入端口（将 Store 地址和数据写入 StoreBuffer）----
@@ -56,22 +56,24 @@ class Memory extends Module {
   val uType = in.bits.type_decode_together(8)
   val jal   = in.bits.type_decode_together(7)
   val jalr  = in.bits.type_decode_together(6)
-  val lType = in.bits.type_decode_together(4)  // Load
+  val bType = in.bits.type_decode_together(5)
+  val lType = in.bits.type_decode_together(4) // Load
   val iType = in.bits.type_decode_together(3)
-  val sType = in.bits.type_decode_together(2)  // Store
+  val sType = in.bits.type_decode_together(2) // Store
   val rType = in.bits.type_decode_together(1)
+  val other = in.bits.type_decode_together(0)
 
   // ---- StoreBuffer 写入（Store 指令）
   sbWrite.valid := in.valid && sType && in.bits.isSbAlloc
   sbWrite.idx   := in.bits.sbIdx
-  sbWrite.addr  := in.bits.data                // Store 地址 = rs1 + 立即数（ALU 计算结果）
-  sbWrite.data  := in.bits.reg_rdata2          // Store 数据 = rs2 的值
-  sbWrite.mask  := in.bits.inst_funct3         // Store 宽度掩码 = funct3
+  sbWrite.addr  := in.bits.data        // Store 地址 = rs1 + 立即数（ALU 计算结果）
+  sbWrite.data  := in.bits.reg_rdata2  // Store 数据 = rs2 的值
+  sbWrite.mask  := in.bits.inst_funct3 // Store 宽度掩码 = funct3
 
   // ---- StoreBuffer 查询（Load 指令）----
   sbQuery.valid        := in.valid && lType
-  sbQuery.addr         := in.bits.data       // Load 地址 = ALU 计算结果
-  sbQuery.storeSeqSnap := in.bits.storeSeqSnap  // 只查 storeSeq < snap 的更老 Store
+  sbQuery.addr         := in.bits.data         // Load 地址 = ALU 计算结果
+  sbQuery.storeSeqSnap := in.bits.storeSeqSnap // 只查 storeSeq < snap 的更老 Store
 
   // ---- Store-to-Load 冒险检测 ----
   // 停顿条件（hit 或 pending 任一成立）：
@@ -107,9 +109,10 @@ class Memory extends Module {
   out.bits.pc := in.bits.pc
   out.bits.inst_rd := Mux(uType || jal || jalr || lType || iType || rType, in.bits.inst_rd, 0.U)
   out.bits.pdst := Mux(uType || jal || jalr || lType || iType || rType, in.bits.pdst, 0.U) // 物理目的寄存器透传
-  out.bits.data := MuxCase(0.U, Seq(
+  out.bits.data := Mux1H(Seq(
     (uType || jal || jalr || iType || rType) -> in.bits.data,  // 非访存指令：透传 ALU 结果
-    lType -> loadData                                           // Load：StoreBuffer 转发或 DRAM 读回
+    lType -> loadData,                                         // Load：StoreBuffer 转发或 DRAM 读回
+    (bType || sType) -> 0.U(32.W)
   ))
   out.bits.type_decode_together := in.bits.type_decode_together
   out.bits.robIdx         := in.bits.robIdx

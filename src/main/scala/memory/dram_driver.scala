@@ -50,10 +50,11 @@ class dram_driver extends Module {
   val selectedByte = dramBytes(byteOff)
   val selectedHalf = Mux(byteOff(1), Cat(dramBytes(3), dramBytes(2)), Cat(dramBytes(1), dramBytes(0)))
   val selectedWord = rawData
-  io.perip_rdata := MuxCase(0.U, Seq(
+  io.perip_rdata := Mux1H(Seq(
     isByte -> extend(selectedByte, isUnsigned),
     isHalf -> extend(selectedHalf, isUnsigned),
-    isWord -> selectedWord
+    isWord -> selectedWord,
+    !(isByte || isHalf || isWord) -> 0.U(32.W)
   ))
 
   // ------------------------------

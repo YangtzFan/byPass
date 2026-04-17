@@ -43,9 +43,9 @@ class myCPU extends Module {
     val commit_reg_wdata = Output(UInt(32.W))
     // ---- DRAM 写端口（仅 Commit 阶段 Store 才写入，通过 StoreBuffer）----
     val commit_ram_wen   = Output(Bool())
-    val commit_ram_waddr  = Output(UInt(32.W))
+    val commit_ram_waddr = Output(UInt(32.W))
     val commit_ram_wdata = Output(UInt(32.W))
-    val commit_ram_wmask  = Output(UInt(3.W))
+    val commit_ram_wmask = Output(UInt(3.W))
   })
 
   // ---- 全局控制信号 ----

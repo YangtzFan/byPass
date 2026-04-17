@@ -10,7 +10,8 @@ import mycpu.CPUConfig
 // 核心设计变更（相对于旧版环形缓冲区）：
 //   1. 物理槽位用 Vec[sbEntries] 平坦数组存储，不再依赖 head/tail 指针
 //   2. FreeStoreBufferList（空闲列表）：位向量管理可分配的物理槽位索引
-//   3. storeSeq（逻辑年龄）：全局单调递增计数器 nextStoreSeq，每分配 N 个 Store 就 +N
+//   3. storeSeq（逻辑年龄）：全局递增计数器 nextStoreSeq，每分配 N 个 Store 就 +N
+//      - 允许自然回绕溢出，使用循环比较（signed-difference MSB）保证正确性
 //      - 每个表项记录自己的 storeSeq，用于判断新旧关系
 //      - 与物理位置完全解耦，物理槽可以乱序分配和释放
 //   4. Load 在 Dispatch 时获取 nextStoreSeq 快照（storeSeqSnap），
@@ -60,7 +61,7 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   // 空闲物理槽位列表：FreeStoreBufferList
   // ========================================================================
   val buffer = RegInit(VecInit(Seq.fill(depth)(0.U.asTypeOf(new StoreBufferEntry))))
-  val freeVec = RegInit(VecInit(Seq.fill(depth)(true.B))) // 初始状态：所有槽位空闲
+  val freeVec = VecInit(buffer.map(entry => !entry.valid))
   val freeCount = PopCount(freeVec) // 计算空闲槽位数量（用于 canAlloc 判断）
 
   // ---- FreeList 分配逻辑 ----
@@ -75,24 +76,38 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   freeIdxs(0)  := PriorityEncoder(mask0)
 
   // 第 1 个：遮蔽前一个已选中的位后继续找
-  val mask1 = mask0 & ~(1.U(depth.W) << freeIdxs(0))
+  val mask1 = mask0 & ~(PriorityEncoderOH(mask0))
   freeValid(1) := mask1.orR
   freeIdxs(1)  := PriorityEncoder(mask1)
 
   // 第 2 个：遮蔽前两个已选中的位
-  val mask2 = mask1 & ~(1.U(depth.W) << freeIdxs(1))
+  val mask2 = mask1 & ~(PriorityEncoderOH(mask1))
   freeValid(2) := mask2.orR
   freeIdxs(2)  := PriorityEncoder(mask2)
 
   // 第 3 个：遮蔽前三个已选中的位
-  val mask3 = mask2 & ~(1.U(depth.W) << freeIdxs(2))
+  val mask3 = mask2 & ~(PriorityEncoderOH(mask2))
   freeValid(3) := mask3.orR
   freeIdxs(3)  := PriorityEncoder(mask3)
 
   // ========================================================================
-  // nextStoreSeq：全局单调递增的 Store 序号计数器
+  // 循环序号比较辅助函数（处理 nextStoreSeq 回绕溢出问题）
   // ========================================================================
-  // 每次 Dispatch 分配 N 个 Store，nextStoreSeq += N
+  // 原理：将 (a - b) 的无符号结果的最高位视为符号位
+  //   - 若 MSB=1，说明 a 在循环意义上"落后于"b（a 更老）
+  //   - 若 MSB=0，说明 a "领先于"或"等于" b（a 更新或相等）
+  // 正确性前提：任意两个活跃序号的真实距离 < 2^(seqWidth-1)
+  //   sbEntries=32，流水线深度~10，故最大距离 < 42 << 128 = 2^(8-1)，安全
+  // ========================================================================
+  /** a 是否严格比 b 更老（循环比较） */
+  def seqOlderThan(a: UInt, b: UInt): Bool = (a - b)(seqWidth - 1)
+  /** a 是否比 b 更新或相等（循环比较） */
+  def seqNewerOrEq(a: UInt, b: UInt): Bool = !(a - b)(seqWidth - 1)
+
+  // ========================================================================
+  // nextStoreSeq：全局递增的 Store 序号计数器（允许自然回绕，使用循环比较保证正确性）
+  // ========================================================================
+  // 每次 Dispatch 分配 N 个 Store，nextStoreSeq += N（无符号回绕）
   // 所有指令（包括 Load）在 Dispatch 时快照 nextStoreSeq 作为 storeSeqSnap
   val nextStoreSeq = RegInit(0.U(seqWidth.W))
 
@@ -115,15 +130,12 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
         val physIdx = freeIdxs(i)
         // 初始化表项
         buffer(physIdx).valid     := true.B
-        buffer(physIdx).addrValid := false.B    // 地址尚未计算（等 Memory 阶段写入）
-        buffer(physIdx).committed := false.B    // 尚未提交
+        buffer(physIdx).addrValid := false.B // 地址尚未计算（等 Memory 阶段写入）
+        buffer(physIdx).committed := false.B // 尚未提交
         buffer(physIdx).addr      := 0.U
         buffer(physIdx).data      := 0.U
         buffer(physIdx).mask      := 0.U
         buffer(physIdx).storeSeq  := nextStoreSeq + i.U  // 分配逻辑年龄
-        // 将该槽位标记为已占用
-        freeVec(physIdx) := false.B
-
       }
     }
     // 更新全局 storeSeq 计数器
@@ -142,19 +154,19 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   // ===================== 查询逻辑（Memory 阶段 Load 指令）=====================
   // 遍历所有表项，查找满足以下条件的 Store：
   //   1. valid=true（已分配）
-  //   2. storeSeq < storeSeqSnap（比当前 Load "更老"的 Store）
+  //   2. storeSeq 比 storeSeqSnap 更老（即该 Store 在 Load 之前分配）
   //   3. 地址匹配（addrValid=true && addr 相同）
-  // 若存在 valid && storeSeq < snap && !addrValid → pending=true（地址未知，需等待）
+  // 若存在 valid && 更老 && !addrValid → pending=true（地址未知，需等待）
   //
-  // storeSeq 使用 32 位宽，足够覆盖整个仿真过程中不会回绕，因此可以安全使用 < 比较
-  val hitVec     = Wire(Vec(depth, Bool()))     // 每个表项是否地址命中
-  val pendingVec = Wire(Vec(depth, Bool()))     // 每个表项是否地址未知（需要等待）
-  val seqVec     = Wire(Vec(depth, UInt(seqWidth.W)))  // 每个表项的 storeSeq
+  // 使用循环比较 seqOlderThan 处理 storeSeq 回绕溢出
+  val hitVec     = Wire(Vec(depth, Bool())) // 每个表项是否地址命中
+  val pendingVec = Wire(Vec(depth, Bool())) // 每个表项是否地址未知（需要等待）
+  val seqVec     = Wire(Vec(depth, UInt(seqWidth.W))) // 每个表项的 storeSeq
 
   for (i <- 0 until depth) {
     val entry = buffer(i)
-    // 判断该表项是否是比当前 Load "更老"的有效 Store
-    val isOlder = entry.valid && (entry.storeSeq < query.storeSeqSnap)
+    // 判断该表项是否是比当前 Load "更老"的有效 Store（循环比较）
+    val isOlder = entry.valid && seqOlderThan(entry.storeSeq, query.storeSeqSnap)
     // 地址命中：更老 Store 且地址已知且**字对齐地址**匹配（addr[31:2]）
     // 注意：不能用完整字节地址比较，否则会漏检部分重叠（如 sh addr=18 vs lw addr=16 同属一个字）
     // 使用字对齐地址确保同一 32 位字内的任何 Store/Load 组合都能被检测到
@@ -170,11 +182,11 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
 
   // ---- 选择"最年轻命中"的 Store 数据进行转发 ----
   // 在所有 hitVec(i)=true 的表项中，选 storeSeq 最大（最年轻）的那个
-  // 使用 Scala 层面的 foldLeft 归约，生成 Mux 链（纯组合逻辑，无 when 环路）
+  // 使用循环比较 seqNewerOrEq 处理回绕
   val (youngestSeq, youngestData) = (0 until depth).foldLeft(
     (0.U(seqWidth.W), 0.U(32.W))
   ) { case ((bestSeq, bestData), i) =>
-    val better = hitVec(i) && (seqVec(i) >= bestSeq)
+    val better = hitVec(i) && seqNewerOrEq(seqVec(i), bestSeq)
     (Mux(better, seqVec(i), bestSeq), Mux(better, buffer(i).data, bestData))
   }
   query.data := Mux(query.hit, youngestData, 0.U)
@@ -210,16 +222,14 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   }
   val hasDrain = drainCandidates.asUInt.orR
 
-  // 找 storeSeq 最小（最老）的 drain 候选
-  // 使用 Scala 层面的 foldLeft 归约，生成 Mux 链（纯组合逻辑，无 when 环路）
-  // 注意：使用 found 标志避免初始 bestSeq 值与实际 storeSeq 冲突
-  // （旧实现用 maxSeq=255 作初始值，导致 storeSeq=255 的表项因 255<255=false 永远无法被选中）
+  // 找 storeSeq 最小（最老）的 drain 候选（使用循环比较 seqOlderThan）
+  // 使用 found 标志避免初始 bestSeq 值与实际 storeSeq 冲突
   val (drainIdx, drainSeq, _) = (0 until depth).foldLeft(
     (0.U(idxWidth.W), 0.U(seqWidth.W), false.B)
   ) { case ((bestIdx, bestSeq, found), i) =>
     // 当尚未找到任何候选时，第一个候选直接胜出
-    // 当已有候选时，storeSeq 更小的候选胜出（选最老的）
-    val better = drainCandidates(i) && (!found || (buffer(i).storeSeq < bestSeq))
+    // 当已有候选时，storeSeq 更老的候选胜出（选最老的，循环比较）
+    val better = drainCandidates(i) && (!found || seqOlderThan(buffer(i).storeSeq, bestSeq))
     (Mux(better, i.U(idxWidth.W), bestIdx),
      Mux(better, buffer(i).storeSeq, bestSeq),
      found || drainCandidates(i))
@@ -234,11 +244,10 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   // Drain 完成后释放槽位
   when(hasDrain) {
     buffer(drainIdx).valid := false.B
-    freeVec(drainIdx) := true.B
   }
 
   // ===================== 回滚逻辑（Memory 重定向）=====================
-  // 精确回滚：清除所有 storeSeq >= rollback.storeSeqSnap 且未 committed 的表项
+  // 精确回滚：清除所有 storeSeq 比 rollback.storeSeqSnap 更新或相等 且未 committed 的表项
   // 已 committed 的表项不受回滚影响（它们已经被 ROB 确认为正确路径的指令）
   // 同时将 nextStoreSeq 回退到 rollback.storeSeqSnap
   when(rollback.valid) {
@@ -246,11 +255,10 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     nextStoreSeq := rollback.storeSeqSnap
     // 逐个检查所有表项
     for (i <- 0 until depth) {
-      // 只清除：有效 && 未提交 && storeSeq >= 回滚点的表项
+      // 只清除：有效 && 未提交 && storeSeq >= 回滚点的表项（循环比较）
       when(buffer(i).valid && !buffer(i).committed &&
-           (buffer(i).storeSeq >= rollback.storeSeqSnap)) {
+           seqNewerOrEq(buffer(i).storeSeq, rollback.storeSeqSnap)) {
         buffer(i).valid := false.B
-        freeVec(i) := true.B  // 归还空闲列表
       }
     }
   }
