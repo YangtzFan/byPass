@@ -180,9 +180,11 @@ class StoreBufferEntry extends Bundle {
   val valid     = Bool()                          // 表项是否有效（已分配）
   val addrValid = Bool()                          // 地址是否已写入（Memory 阶段写入地址和数据）
   val committed = Bool()                          // 是否已被 ROB 提交（可以 drain 到内存）
-  val addr      = UInt(32.W)                      // Store 地址
-  val data      = UInt(32.W)                      // Store 数据
-  val mask      = UInt(3.W)                       // Store 宽度掩码（funct3）
+  val addr      = UInt(32.W)                      // Store 原始完整地址（difftest 用）
+  val data      = UInt(32.W)                      // Store 原始数据（rs2 值，difftest 用）
+  val mask      = UInt(3.W)                       // Store 原始宽度掩码（funct3，difftest 用）
+  val byteMask  = UInt(4.W)                       // 字节写使能掩码（sb/sh/sw 对应 1/2/4 位使能）
+  val byteData  = UInt(32.W)                      // 字节对齐后的写数据（已按字内偏移摆好位置）
   val storeSeq  = UInt(CPUConfig.storeSeqWidth.W) // 逻辑年龄：全局单调递增序号，越小越老
 }
 
@@ -204,22 +206,26 @@ class SBAllocIO extends Bundle {
 
 // ---- 写入接口（Memory 阶段写入 Store 地址和数据）----
 class SBWriteIO extends Bundle {
-  val valid = Bool()                       // 写入使能
-  val idx   = UInt(CPUConfig.sbIdxWidth.W) // 要写的物理槽位索引
-  val addr  = UInt(32.W)                   // Store 地址
-  val data  = UInt(32.W)                   // Store 数据
-  val mask  = UInt(3.W)                    // Store 宽度掩码
+  val valid    = Bool()                       // 写入使能
+  val idx      = UInt(CPUConfig.sbIdxWidth.W) // 要写的物理槽位索引
+  val addr     = UInt(32.W)                   // Store 原始完整地址（difftest 用）
+  val data     = UInt(32.W)                   // Store 原始数据（rs2 值，difftest 用）
+  val mask     = UInt(3.W)                    // Store 原始宽度掩码（funct3，difftest 用）
+  val byteMask = UInt(4.W)                    // 字节写使能掩码
+  val byteData = UInt(32.W)                   // 字节对齐后的写数据
 }
 
-// ---- 查询接口（Memory 阶段 Load 指令查询 Store-to-Load 转发）----
-// 新架构：使用 storeSeqSnap 精确界定"更老的 Store"边界
+// ---- 查询接口（Memory 阶段 Load 指令查询 Store-to-Load 字节级转发）----
+// 新架构：按字节粒度判断转发覆盖情况，支持部分转发 + 外部读合并
 class SBQueryIO extends Bundle {
   val valid        = Output(Bool())                          // 是否进行查询（Load 有效时）
-  val addr         = Output(UInt(32.W))                      // Load 的地址
+  val wordAddr     = Output(UInt(30.W))                      // Load 的字对齐地址（addr[31:2]）
+  val loadMask     = Output(UInt(4.W))                       // Load 需要读取的字节掩码
   val storeSeqSnap = Output(UInt(CPUConfig.storeSeqWidth.W)) // Load 的 storeSeq 快照：只查 storeSeq < snap 的表项
-  val hit          = Input(Bool())                           // 是否有更老的 Store 地址命中
-  val data         = Input(UInt(32.W))                       // 命中时转发的 Store 数据
-  val pending      = Input(Bool())                           // 是否有更老的 Store 地址未知（需要停顿）
+  val olderUnknown = Input(Bool())                           // 存在更老的 Store 地址未知（需要停顿等待）
+  val fullCover    = Input(Bool())                           // Load 所需字节全部被 StoreBuffer 覆盖（可直接转发）
+  val fwdMask      = Input(UInt(4.W))                        // 可转发的字节掩码（每位表示该字节是否由 SB 提供）
+  val fwdData      = Input(UInt(32.W))                       // 转发数据（仅 fwdMask 对应字节有效）
 }
 
 // ---- 提交标记接口（ROB 提交 Store 时，标记 SB 表项为 committed）----
@@ -229,13 +235,21 @@ class SBCommitIO extends Bundle {
   val storeSeq = Output(UInt(CPUConfig.storeSeqWidth.W))    // 被提交的 Store 的 storeSeq（用于定位表项）
 }
 
-// ---- Drain 接口（将已 committed 的表项写入内存，与 commit 解耦）----
+// ---- Drain 接口（将已 committed 的表项写入外部存储器，与 commit 解耦）----
 // StoreBuffer 内部按最老 committed 表项的顺序 drain
+// 写完成由外部 drainAck 信号确认，确认后才释放槽位
 class SBDrainIO extends Bundle {
-  val valid = Output(Bool())                                // 本周期是否有 Store 需要写入内存
-  val addr  = Output(UInt(32.W))                            // 写入地址
-  val data  = Output(UInt(32.W))                            // 写入数据
-  val mask  = Output(UInt(3.W))                             // 写入宽度掩码
+  val valid    = Output(Bool())          // 本周期是否有 Store 需要写入外部
+  // 原始值（用于 difftest 信号输出，保持与参考模型一致）
+  val addr     = Output(UInt(32.W))      // 原始 Store 完整字节地址
+  val data     = Output(UInt(32.W))      // 原始 Store 数据（rs2 值）
+  val mask     = Output(UInt(3.W))       // 原始 Store 宽度掩码（funct3）
+  // 字节级值（用于实际外部写操作）
+  val wordAddr = Output(UInt(30.W))      // 字对齐地址（addr[31:2]）
+  val wstrb    = Output(UInt(4.W))       // 字节写使能掩码
+  val wdata    = Output(UInt(32.W))      // 字节对齐后的写数据
+  // 写完成确认（外部写响应返回后由 myCPU 置位，释放 SB 槽位）
+  val drainAck = Input(Bool())
 }
 
 // ---- 回滚接口（Memory 重定向时按 storeSeq 精确回滚 StoreBuffer）----
@@ -325,4 +339,21 @@ class ROBCommitIO extends Bundle {
   val pdst         = Output(UInt(CPUConfig.prfAddrWidth.W))   // 物理目的寄存器（Commit 更新 RRAT 用）
   val stalePdst    = Output(UInt(CPUConfig.prfAddrWidth.W))   // 旧物理目的寄存器（Commit 释放到 FreeList 用）
   val ldst         = Output(UInt(5.W))                         // 逻辑目的寄存器（Commit 更新 RRAT 用）
+}
+
+// ==========================================================================
+// MemReqBundle —— LSU 对外存储器请求（Load 读 / Store drain 写统一接口）
+// ==========================================================================
+class MemReqBundle extends Bundle {
+  val isWrite = Bool()     // true=写请求（Store drain），false=读请求（Load）
+  val addr    = UInt(32.W) // 字节地址（32 位完整地址）
+  val wdata   = UInt(32.W) // 写数据（已按字节对齐，仅写请求有效）
+  val wstrb   = UInt(4.W)  // 字节写使能掩码（仅写请求有效）
+}
+
+// ==========================================================================
+// MemRespBundle —— LSU 对外存储器响应
+// ==========================================================================
+class MemRespBundle extends Bundle {
+  val rdata = UInt(32.W)        // 读回数据（原始 32 位字，不做符号扩展）
 }

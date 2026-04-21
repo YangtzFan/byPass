@@ -25,6 +25,10 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
   val refresh = IO(Flipped(new ROBRefreshIO))     // Refresh 阶段完成标记接口
   val commit  = IO(new ROBCommitIO)               // 提交接口
 
+  // ---- Store drain 阻塞接口 ----
+  val commitBlocked = IO(Input(Bool()))     // 外部通知：Store drain 未完成，阻塞 commit
+  val headReady     = IO(Output(Bool()))    // 输出：ROB head 是否可提交（done && !empty）
+
   // 存储阵列和指针
   val rob = RegInit(VecInit(Seq.fill(entries)(0.U.asTypeOf(new ROBEntry))))
   val head = RegInit(0.U((idxW + 1).W))   // 头指针（最老的指令）
@@ -44,7 +48,8 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
 
   // ===================== 提交输出（组合逻辑，始终驱动）=====================
   val headEntry = rob(idx(head))
-  val canCommit = !empty && headEntry.done
+  val canCommit = !empty && headEntry.done && !commitBlocked // Store drain 未完成时阻塞提交
+  headReady := !empty && headEntry.done  // headReady 不受 commitBlocked 影响（用于触发 drain）
   commit.valid        := canCommit
   commit.pc           := headEntry.pc
   commit.inst         := headEntry.inst

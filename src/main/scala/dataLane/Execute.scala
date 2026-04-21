@@ -16,14 +16,14 @@ import mycpu.device.ALU
 //   5. Store 指令：将地址和数据写入 StoreBuffer（通过顶层连接）
 //
 // 数据旁路优先级（距离 Execute 最近的优先）：
-//   Memory 级 > Refresh 级 > Commit 级 > ReadReg 阶段读取的寄存器值（兜底）
+//   Memory 级 > Refresh 级 > Post-Refresh 级 > Commit 级 > ReadReg 阶段读取的寄存器值（兜底）
 // ============================================================================
 class Execute extends Module {
   val in = IO(Flipped(Decoupled(new ReadReg_Execute_Payload)))  // 输入：来自 RRExDff（ReadReg 阶段）
   val out = IO(Decoupled(new Execute_Memory_Payload))           // 输出：送往 ExMemDff → Memory
 
   // ---- 数据旁路转发输入端口 ----
-  // 共 4 个转发来源，由 myCPU 顶层连接
+  // 共 5 个转发来源，由 myCPU 顶层连接
   // 使用物理寄存器编号 pdst 进行匹配（替代逻辑寄存器编号）
   val fwd = IO(new Bundle {
     // 第 1 级：来自 ExMemDff（Execute 前 1 条指令，即 Memory 阶段正在处理的指令）
@@ -34,7 +34,14 @@ class Execute extends Module {
     val ref_pdst = Input(UInt(CPUConfig.prfAddrWidth.W))
     val ref_data = Input(UInt(32.W))
     val ref_wen  = Input(Bool())
-    // 第 3 级：ROB Commit（同周期正在提交的指令）
+    // 第 3 级：Post-Refresh（上一周期 Refresh 写回的结果，覆盖 Load-Use 停顿导致的转发间隙）
+    // 当 Execute 因 Load-Use 冒险停顿 1 周期时，MemRefDff 中的数据会被下一条指令覆盖，
+    // 但 PRF 尚未被 ReadReg 阶段读取到（ReadReg 在停顿前已完成），导致转发缺口。
+    // 此级保存上一周期 Refresh 写 PRF 的信息，填补该缺口。
+    val postRef_pdst = Input(UInt(CPUConfig.prfAddrWidth.W))
+    val postRef_data = Input(UInt(32.W))
+    val postRef_wen  = Input(Bool())
+    // 第 4 级：ROB Commit（同周期正在提交的指令）
     val commit_pdst = Input(UInt(CPUConfig.prfAddrWidth.W))
     val commit_data = Input(UInt(32.W))
     val commit_wen  = Input(Bool())
@@ -79,23 +86,27 @@ class Execute extends Module {
   // rs1 的旁路匹配检测（使用物理寄存器编号，按优先级从高到低）
   val fwd_rs1_from_mem = fwd.mem_wen && (fwd.mem_pdst =/= 0.U) && (fwd.mem_pdst === psrc1)
   val fwd_rs1_from_ref = fwd.ref_wen && (fwd.ref_pdst =/= 0.U) && (fwd.ref_pdst === psrc1)
+  val fwd_rs1_from_postRef = fwd.postRef_wen && (fwd.postRef_pdst =/= 0.U) && (fwd.postRef_pdst === psrc1)
   val fwd_rs1_from_commit = fwd.commit_wen && (fwd.commit_pdst =/= 0.U) && (fwd.commit_pdst === psrc1)
   val actual_rdata1 = PriorityMux(Seq(
-    fwd_rs1_from_mem    -> fwd.mem_data,       // 优先级最高：Memory 级（非 Load）
-    fwd_rs1_from_ref    -> fwd.ref_data,       // 第 2 优先：Refresh 级（MemRefDff，含 Load 数据）
-    fwd_rs1_from_commit -> fwd.commit_data,    // 第 3 优先：Commit 级（当前周期正在提交的指令）
-    true.B              -> in.bits.src1Data    // 兜底：ReadReg 阶段从 PRF 读取的值
+    fwd_rs1_from_mem     -> fwd.mem_data,       // 优先级最高：Memory 级（非 Load）
+    fwd_rs1_from_ref     -> fwd.ref_data,       // 第 2 优先：Refresh 级（MemRefDff，含 Load 数据）
+    fwd_rs1_from_postRef -> fwd.postRef_data,   // 第 3 优先：Post-Refresh 级（上一周期 Refresh 写回）
+    fwd_rs1_from_commit  -> fwd.commit_data,    // 第 4 优先：Commit 级（当前周期正在提交的指令）
+    true.B               -> in.bits.src1Data    // 兜底：ReadReg 阶段从 PRF 读取的值
   ))
 
   // rs2 的旁路匹配检测（使用物理寄存器编号，同样优先级规则）
   val fwd_rs2_from_mem = fwd.mem_wen && (fwd.mem_pdst =/= 0.U) && (fwd.mem_pdst === psrc2)
   val fwd_rs2_from_ref = fwd.ref_wen && (fwd.ref_pdst =/= 0.U) && (fwd.ref_pdst === psrc2)
+  val fwd_rs2_from_postRef = fwd.postRef_wen && (fwd.postRef_pdst =/= 0.U) && (fwd.postRef_pdst === psrc2)
   val fwd_rs2_from_commit = fwd.commit_wen && (fwd.commit_pdst =/= 0.U) && (fwd.commit_pdst === psrc2)
   val actual_rdata2 = PriorityMux(Seq(
-    fwd_rs2_from_mem    -> fwd.mem_data,
-    fwd_rs2_from_ref    -> fwd.ref_data,
-    fwd_rs2_from_commit -> fwd.commit_data,
-    true.B              -> in.bits.src2Data    // 兜底：ReadReg 阶段从 PRF 读取的值
+    fwd_rs2_from_mem     -> fwd.mem_data,
+    fwd_rs2_from_ref     -> fwd.ref_data,
+    fwd_rs2_from_postRef -> fwd.postRef_data,
+    fwd_rs2_from_commit  -> fwd.commit_data,
+    true.B               -> in.bits.src2Data    // 兜底：ReadReg 阶段从 PRF 读取的值
   ))
 
   // ============================================================

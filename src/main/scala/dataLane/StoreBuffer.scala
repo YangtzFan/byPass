@@ -135,6 +135,8 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
         buffer(physIdx).addr      := 0.U
         buffer(physIdx).data      := 0.U
         buffer(physIdx).mask      := 0.U
+        buffer(physIdx).byteMask  := 0.U    // 字节掩码初始化
+        buffer(physIdx).byteData  := 0.U    // 字节数据初始化
         buffer(physIdx).storeSeq  := nextStoreSeq + i.U  // 分配逻辑年龄
       }
     }
@@ -149,47 +151,63 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     buffer(write.idx).addr      := write.addr
     buffer(write.idx).data      := write.data
     buffer(write.idx).mask      := write.mask
+    buffer(write.idx).byteMask  := write.byteMask   // 写入字节掩码
+    buffer(write.idx).byteData  := write.byteData   // 写入字节对齐后数据
   }
 
-  // ===================== 查询逻辑（Memory 阶段 Load 指令）=====================
-  // 遍历所有表项，查找满足以下条件的 Store：
-  //   1. valid=true（已分配）
-  //   2. storeSeq 比 storeSeqSnap 更老（即该 Store 在 Load 之前分配）
-  //   3. 地址匹配（addrValid=true && addr 相同）
-  // 若存在 valid && 更老 && !addrValid → pending=true（地址未知，需等待）
+  // ===================== 查询逻辑（Memory 阶段 Load 指令 — 字节级转发）=====================
+  // 对每个字节独立判断：在所有比 Load 更老的有效 Store 中，
+  // 找到字对齐地址匹配且该字节有 byteMask 使能的最年轻 Store，提取该字节数据
   //
-  // 使用循环比较 seqOlderThan 处理 storeSeq 回绕溢出
-  val hitVec     = Wire(Vec(depth, Bool())) // 每个表项是否地址命中
-  val pendingVec = Wire(Vec(depth, Bool())) // 每个表项是否地址未知（需要等待）
-  val seqVec     = Wire(Vec(depth, UInt(seqWidth.W))) // 每个表项的 storeSeq
+  // 输出：
+  //   olderUnknown: 存在更老的 Store 地址未知（需停顿等待）
+  //   fullCover:    Load 所有需要的字节都被 SB 覆盖（可纯转发，无需读外部）
+  //   fwdMask:      每位表示该字节是否由 SB 转发
+  //   fwdData:      转发数据字（仅 fwdMask 对应字节有效）
+
+  // ---- 逐表项判断"更老"和"字地址匹配"----
+  val olderVec     = Wire(Vec(depth, Bool())) // 更老且有效
+  val wordAddrHit  = Wire(Vec(depth, Bool())) // 更老且字地址匹配（addrValid）
+  val pendingVec   = Wire(Vec(depth, Bool())) // 更老但地址未知
 
   for (i <- 0 until depth) {
-    val entry = buffer(i)
-    // 判断该表项是否是比当前 Load "更老"的有效 Store（循环比较）
+    val entry   = buffer(i)
     val isOlder = entry.valid && seqOlderThan(entry.storeSeq, query.storeSeqSnap)
-    // 地址命中：更老 Store 且地址已知且**字对齐地址**匹配（addr[31:2]）
-    // 注意：不能用完整字节地址比较，否则会漏检部分重叠（如 sh addr=18 vs lw addr=16 同属一个字）
-    // 使用字对齐地址确保同一 32 位字内的任何 Store/Load 组合都能被检测到
-    hitVec(i) := isOlder && entry.addrValid && (entry.addr(31, 2) === query.addr(31, 2))
-    // 地址未知：更老 Store 但地址尚未计算完成
-    pendingVec(i) := isOlder && !entry.addrValid
-    // 记录 storeSeq 用于后续选择最年轻命中
-    seqVec(i) := entry.storeSeq
+    olderVec(i)    := isOlder
+    wordAddrHit(i) := isOlder && entry.addrValid && (entry.addr(31, 2) === query.wordAddr)
+    pendingVec(i)  := isOlder && !entry.addrValid
   }
 
-  query.hit     := query.valid && hitVec.asUInt.orR
-  query.pending := query.valid && pendingVec.asUInt.orR
+  // olderUnknown：存在更老 Store 地址未知 → Memory 阶段需要停顿
+  query.olderUnknown := query.valid && pendingVec.asUInt.orR
 
-  // ---- 选择"最年轻命中"的 Store 数据进行转发 ----
-  // 在所有 hitVec(i)=true 的表项中，选 storeSeq 最大（最年轻）的那个
-  // 使用循环比较 seqNewerOrEq 处理回绕
-  val (youngestSeq, youngestData) = (0 until depth).foldLeft(
-    (0.U(seqWidth.W), 0.U(32.W))
-  ) { case ((bestSeq, bestData), i) =>
-    val better = hitVec(i) && seqNewerOrEq(seqVec(i), bestSeq)
-    (Mux(better, seqVec(i), bestSeq), Mux(better, buffer(i).data, bestData))
+  // ---- 按字节独立选择最年轻匹配 Store ----
+  // 对每个字节 b (0~3)：在所有 wordAddrHit 且 byteMask(b)=1 的表项中选 storeSeq 最大的
+  val perByteFwdValid = Wire(Vec(4, Bool()))  // 该字节是否有转发源
+  val perByteFwdData  = Wire(Vec(4, UInt(8.W))) // 该字节的转发数据
+
+  for (b <- 0 until 4) {
+    // 对所有表项做 foldLeft，选出该字节的最年轻匹配 Store
+    val (bestValid, bestSeq, bestByte) = (0 until depth).foldLeft(
+      (false.B, 0.U(seqWidth.W), 0.U(8.W))
+    ) { case ((bv, bs, bd), i) =>
+      // 候选条件：字地址匹配 && 该表项对字节 b 有写使能
+      val candidate = wordAddrHit(i) && buffer(i).byteMask(b)
+      // 胜出条件：第一个候选直接胜出，或比当前最佳更年轻（seqNewerOrEq，循环比较）
+      val better = candidate && (!bv || seqNewerOrEq(buffer(i).storeSeq, bs))
+      (bv || candidate,
+       Mux(better, buffer(i).storeSeq, bs),
+       Mux(better, buffer(i).byteData(b * 8 + 7, b * 8), bd))
+    }
+    perByteFwdValid(b) := bestValid
+    perByteFwdData(b)  := bestByte
   }
-  query.data := Mux(query.hit, youngestData, 0.U)
+
+  // 组装输出
+  query.fwdMask  := perByteFwdValid.asUInt
+  query.fwdData  := Cat(perByteFwdData(3), perByteFwdData(2), perByteFwdData(1), perByteFwdData(0))
+  // fullCover：Load 需要的字节全部被 SB 覆盖
+  query.fullCover := query.valid && ((query.fwdMask & query.loadMask) === query.loadMask)
 
   // ===================== 提交标记逻辑（ROB Commit）=====================
   // ROB 提交 Store 时，按 storeSeq 找到对应表项，标记 committed=true
@@ -202,12 +220,12 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     }
   }
 
-  // ===================== Drain 逻辑（将已提交表项写入内存）=====================
-  // 每周期选择一个 committed && addrValid && valid 的最老表项（storeSeq 最小）写入内存
-  // 写完后释放槽位（valid=false, freeVec 恢复）
+  // ===================== Drain 逻辑（将已提交表项写入外部存储器）=====================
+  // 每周期选择一个 committed && addrValid && valid 的最老表项（storeSeq 最小）
+  // 输出原始值（difftest）和字节级值（实际写操作）
+  // 释放槽位由 drainAck 信号控制：外部写响应返回后才释放
   //
   // 关键：需要组合旁路同周期的 commit 信号，使得 ROB 提交 Store 的同一周期就能 drain
-  // 否则 difftest 会观察到 commit 和 DRAM 写入不在同一周期（导致不匹配）
   val effectiveCommitted = Wire(Vec(depth, Bool()))
   for (i <- 0 until depth) {
     // 组合旁路：如果本周期 commit 正好命中这个表项，也算 committed
@@ -223,26 +241,27 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   val hasDrain = drainCandidates.asUInt.orR
 
   // 找 storeSeq 最小（最老）的 drain 候选（使用循环比较 seqOlderThan）
-  // 使用 found 标志避免初始 bestSeq 值与实际 storeSeq 冲突
   val (drainIdx, drainSeq, _) = (0 until depth).foldLeft(
     (0.U(idxWidth.W), 0.U(seqWidth.W), false.B)
   ) { case ((bestIdx, bestSeq, found), i) =>
-    // 当尚未找到任何候选时，第一个候选直接胜出
-    // 当已有候选时，storeSeq 更老的候选胜出（选最老的，循环比较）
     val better = drainCandidates(i) && (!found || seqOlderThan(buffer(i).storeSeq, bestSeq))
     (Mux(better, i.U(idxWidth.W), bestIdx),
      Mux(better, buffer(i).storeSeq, bestSeq),
      found || drainCandidates(i))
   }
 
-  // Drain 输出
-  drain.valid := hasDrain
-  drain.addr  := buffer(drainIdx).addr
-  drain.data  := buffer(drainIdx).data
-  drain.mask  := buffer(drainIdx).mask
+  // Drain 输出：原始值（用于 difftest 信号匹配参考模型）
+  drain.valid    := hasDrain
+  drain.addr     := buffer(drainIdx).addr
+  drain.data     := buffer(drainIdx).data
+  drain.mask     := buffer(drainIdx).mask
+  // Drain 输出：字节级值（用于实际外部写操作）
+  drain.wordAddr := buffer(drainIdx).addr(31, 2)
+  drain.wstrb    := buffer(drainIdx).byteMask
+  drain.wdata    := buffer(drainIdx).byteData
 
-  // Drain 完成后释放槽位
-  when(hasDrain) {
+  // Drain 完成后释放槽位（由外部 drainAck 信号控制，确保写操作已被外部确认）
+  when(drain.drainAck) {
     buffer(drainIdx).valid := false.B
   }
 

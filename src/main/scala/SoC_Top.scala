@@ -1,53 +1,107 @@
 package mycpu
 
 import chisel3._
+import chisel3.util._
 import mycpu.memory._
+import mycpu.dataLane._
 
 // ============================================================================
 // SoC_Top —— 片上系统顶层模块
 // ============================================================================
-// 将 CPU 核心、指令存储器（IROM）、数据存储器驱动（DRAM driver）连接在一起
-// 并对外暴露 difftest 调试接口
+// 将 CPU 核心、IROM、DRAM 驱动连接在一起
+// 新增 MemReq/MemResp 1 周期适配器：
+//   CPU 发出 DecoupledIO MemReq → 适配器接受 → 1 周期后返回 MemResp
+//   写请求：适配器在接受后的下一周期驱动 DRAM we，writeExecuted 防止重复写
+//   读请求：DRAM 读是组合逻辑，适配器在响应周期直接返回 rdata
 // ============================================================================
 class SoC_Top extends Module {
   val io = IO(new Bundle {
-    // ---- difftest 调试观测端口（供仿真框架对比验证）----
-    val debug_commit_have_inst = Output(Bool())    // 本周期是否有指令提交
-    val debug_commit_pc = Output(UInt(32.W))       // 提交指令的 PC
-    val debug_commit_reg_wen = Output(Bool())          // 是否写寄存器
-    val debug_commit_reg_waddr = Output(UInt(5.W))     // 写入的寄存器编号
-    val debug_commit_reg_wdata = Output(UInt(32.W))    // 写入的数据值
+    val debug_commit_have_inst = Output(Bool())
+    val debug_commit_pc = Output(UInt(32.W))
+    val debug_commit_reg_wen = Output(Bool())
+    val debug_commit_reg_waddr = Output(UInt(5.W))
+    val debug_commit_reg_wdata = Output(UInt(32.W))
 
-    val debug_commit_ram_wen = Output(Bool())    // 写入的数据值
-    val debug_commit_ram_waddr = Output(UInt(32.W))    // 写入的数据值
-    val debug_commit_ram_wdata = Output(UInt(32.W))    // 写入的数据值
-    val debug_commit_ram_wmask = Output(UInt(32.W))    // 写入的数据值
+    val debug_commit_ram_wen = Output(Bool())
+    val debug_commit_ram_waddr = Output(UInt(32.W))
+    val debug_commit_ram_wdata = Output(UInt(32.W))
+    val debug_commit_ram_wmask = Output(UInt(32.W))
   })
 
   // CPU 核心实例
   val coreCpu = Module(new myCPU)
 
-  // ---- IROM（指令 ROM，只读）----
-  // 128 位宽单读端口，每次返回 4 条指令
-  val memIrom = Module(new IROM)
-  memIrom.io.a := coreCpu.io.inst_addr_o // CPU 输出 14 位地址
-  coreCpu.io.inst_i := memIrom.io.spo    // IROM 返回 128 位指令数据
+  // ---- IROM ----
+  val irom = Module(new IROM)
+  irom.io.a := coreCpu.inst_addr_o
+  coreCpu.inst_i := irom.io.spo
 
-  // ---- DRAM 驱动器（数据存储器读写控制）----
-  // DRAM 的读写端口被 Load 和 Store 共享，通过 MUX 切换
-  // Store 优先（Commit 阶段写入时，地址/掩码切换为 Store 的）
+  // ---- DRAM 驱动器 ----
   val uDramDriver = Module(new dram_driver)
 
-  // 地址和掩码：Store 优先于 Load
-  uDramDriver.io.perip_addr := Mux(coreCpu.io.commit_ram_wen,
-    coreCpu.io.commit_ram_waddr(17, 0), // Store 地址
-    coreCpu.io.ram_addr_o(17, 0))       // Load 地址
-  uDramDriver.io.perip_wdata := coreCpu.io.commit_ram_wdata // Store 写数据
-  uDramDriver.io.perip_mask := Mux(coreCpu.io.commit_ram_wen,
-    coreCpu.io.commit_ram_wmask, // Store 宽度掩码
-    coreCpu.io.ram_mask_o)       // Load 宽度掩码
-  uDramDriver.io.dram_wen := coreCpu.io.commit_ram_wen // 写使能
-  coreCpu.io.ram_rdata_i := uDramDriver.io.perip_rdata // DRAM 读回数据
+  // ========================================================================
+  // MemReq/MemResp 1 周期适配器
+  // ========================================================================
+  // 状态机：sAccept（接受请求）→ sRespond（返回响应）
+  val sAccept :: sRespond :: Nil = Enum(2)
+  val adapterState = RegInit(sAccept)
+
+  // 保存请求信息
+  val reqIsWrite = RegInit(false.B)
+  val reqAddr    = RegInit(0.U(32.W))
+  val reqWdata   = RegInit(0.U(32.W))
+  val reqWstrb   = RegInit(0.U(4.W))
+  val writeExecuted = RegInit(false.B) // 防止重复写 DRAM
+
+  // 默认：不接受请求，不返回响应
+  coreCpu.memReq.ready  := false.B
+  coreCpu.memResp.valid := false.B
+  coreCpu.memResp.bits  := 0.U.asTypeOf(new MemRespBundle)
+
+  // DRAM 驱动默认值
+  uDramDriver.io.addr  := 0.U
+  uDramDriver.io.wdata := 0.U
+  uDramDriver.io.wstrb := 0.U
+  uDramDriver.io.we    := false.B
+
+  switch(adapterState) {
+    is(sAccept) {
+      // 可以接受新请求
+      coreCpu.memReq.ready := true.B
+      when(coreCpu.memReq.fire) {
+        reqIsWrite := coreCpu.memReq.bits.isWrite
+        reqAddr    := coreCpu.memReq.bits.addr
+        reqWdata   := coreCpu.memReq.bits.wdata
+        reqWstrb   := coreCpu.memReq.bits.wstrb
+        writeExecuted := false.B
+        adapterState := sRespond
+      }
+    }
+
+    is(sRespond) {
+      // 写请求：驱动 DRAM 写端口（仅一次）
+      when(reqIsWrite && !writeExecuted) {
+        uDramDriver.io.addr  := reqAddr(17, 0)
+        uDramDriver.io.wdata := reqWdata
+        uDramDriver.io.wstrb := reqWstrb
+        uDramDriver.io.we    := true.B
+        writeExecuted := true.B
+      }
+
+      // 读请求：组合逻辑驱动 DRAM 读地址
+      when(!reqIsWrite) {
+        uDramDriver.io.addr := reqAddr(17, 0)
+      }
+
+      // 返回响应（sticky：保持 valid 直到 fire）
+      coreCpu.memResp.valid     := true.B
+      coreCpu.memResp.bits.rdata := uDramDriver.io.rdata
+
+      when(coreCpu.memResp.fire) {
+        adapterState := sAccept
+      }
+    }
+  }
 
   // ---- Commit 阶段调试观测 ----
   io.debug_commit_have_inst := coreCpu.io.commit_valid
