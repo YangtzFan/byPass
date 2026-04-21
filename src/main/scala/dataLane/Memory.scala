@@ -32,8 +32,14 @@ class Memory extends Module {
   val out = IO(Decoupled(new Memory_Refresh_Payload))
 
   // ---- LSU Load 请求/响应接口（连接到 LSU Arbiter）----
-  val lsuLoadReq  = IO(DecoupledIO(new MemReqBundle))
-  val lsuLoadResp = IO(Flipped(DecoupledIO(new MemRespBundle)))
+  val lsuLoadReq  = IO(Decoupled(new MemReqBundle))
+  val lsuLoadResp = IO(Flipped(Decoupled(new MemRespBundle)))
+
+  // ---- StoreBuffer 写入端口（Store 指令写入地址、数据、字节级掩码）----
+  val sbWrite = IO(Output(new SBWriteIO))
+
+  // ---- StoreBuffer 查询接口（Load 指令字节级转发查询）----
+  val sbQuery = IO(new SBQueryIO)
 
   // ---- Memory 阶段重定向输出 ----
   val redirect = IO(new Bundle {
@@ -44,15 +50,7 @@ class Memory extends Module {
     val checkpointIdx = Output(UInt(CPUConfig.ckptPtrWidth.W))
   })
 
-  // ---- StoreBuffer 写入端口（Store 指令写入地址、数据、字节级掩码）----
-  val sbWrite = IO(Output(new SBWriteIO))
-
-  // ---- StoreBuffer 查询接口（Load 指令字节级转发查询）----
-  val sbQuery = IO(new SBQueryIO)
-
-  // ========================================================================
   // 指令类型解码
-  // ========================================================================
   val uType = in.bits.type_decode_together(8)
   val jal   = in.bits.type_decode_together(7)
   val jalr  = in.bits.type_decode_together(6)
@@ -63,42 +61,37 @@ class Memory extends Module {
   val rType = in.bits.type_decode_together(1)
   val other = in.bits.type_decode_together(0)
 
-  // ========================================================================
   // 字节对齐计算（Store 和 Load 共用）
-  // ========================================================================
   val addr    = in.bits.data          // ALU 计算出的访存地址
   val offset  = addr(1, 0)            // 字内字节偏移
   val funct3  = in.bits.inst_funct3   // 访存宽度标识
 
   // ---- Store 字节掩码和字节对齐数据 ----
-  val storeRawData = in.bits.reg_rdata2  // rs2 的原始值
-  val storeByteMask = Wire(UInt(4.W))
-  val storeByteData = Wire(UInt(32.W))
   // SB: funct3=000 → 1 字节
   // SH: funct3=001 → 2 字节（半字对齐）
   // SW: funct3=010 → 4 字节
-  storeByteMask := MuxLookup(funct3(1, 0), 0.U)(Seq(
-    0.U -> (1.U(4.W) << offset),                          // SB：单字节
+  val storeRawData = in.bits.reg_rdata2  // rs2 的原始值
+  val storeByteMask = MuxLookup(funct3(1, 0), 0.U)(Seq(
+    0.U -> (1.U(4.W) << offset),                           // SB：单字节
     1.U -> Mux(offset(1), "b1100".U(4.W), "b0011".U(4.W)), // SH：按半字对齐
-    2.U -> "b1111".U(4.W)                                   // SW：全字
+    2.U -> "b1111".U(4.W)                                  // SW：全字
   ))
-  storeByteData := MuxLookup(funct3(1, 0), 0.U)(Seq(
-    0.U -> (storeRawData(7, 0) << (offset << 3.U)),          // SB：字节移位到目标位置
+  val storeByteData = MuxLookup(funct3(1, 0), 0.U)(Seq(
+    0.U -> (storeRawData(7, 0) << (offset << 3.U)),        // SB：字节移位到目标位置
     1.U -> Mux(offset(1),
-      Cat(storeRawData(15, 0), 0.U(16.W)),                   // SH 高半字
-      Cat(0.U(16.W), storeRawData(15, 0))),                   // SH 低半字
-    2.U -> storeRawData                                        // SW：全字直接写
+      Cat(storeRawData(15, 0), 0.U(16.W)),                 // SH 高半字
+      Cat(0.U(16.W), storeRawData(15, 0))),                // SH 低半字
+    2.U -> storeRawData                                    // SW：全字直接写
   ))
 
   // ---- Load 字节掩码 ----
-  val loadByteMask = Wire(UInt(4.W))
   // LB/LBU: funct3[1:0]=00 → 1 字节
   // LH/LHU: funct3[1:0]=01 → 2 字节
   // LW:     funct3[1:0]=10 → 4 字节
-  loadByteMask := MuxLookup(funct3(1, 0), 0.U)(Seq(
-    0.U -> (1.U(4.W) << offset),                            // LB/LBU
+  val loadByteMask = MuxLookup(funct3(1, 0), 0.U)(Seq(
+    0.U -> (1.U(4.W) << offset),                           // LB/LBU
     1.U -> Mux(offset(1), "b1100".U(4.W), "b0011".U(4.W)), // LH/LHU
-    2.U -> "b1111".U(4.W)                                   // LW
+    2.U -> "b1111".U(4.W)                                  // LW
   ))
 
   // ========================================================================
@@ -106,11 +99,11 @@ class Memory extends Module {
   // ========================================================================
   sbWrite.valid    := in.valid && sType && in.bits.isSbAlloc
   sbWrite.idx      := in.bits.sbIdx
-  sbWrite.addr     := addr                    // 原始完整字节地址（difftest 用）
-  sbWrite.data     := storeRawData            // 原始 rs2 数据（difftest 用）
-  sbWrite.mask     := funct3                  // 原始 funct3（difftest 用）
-  sbWrite.byteMask := storeByteMask           // 字节写使能掩码
-  sbWrite.byteData := storeByteData           // 字节对齐后的写数据
+  sbWrite.addr     := addr          // 原始完整字节地址（difftest 用）
+  sbWrite.data     := storeRawData  // 原始 rs2 数据（difftest 用）
+  sbWrite.mask     := funct3        // 原始 funct3（difftest 用）
+  sbWrite.byteMask := storeByteMask // 字节写使能掩码
+  sbWrite.byteData := storeByteData // 字节对齐后的写数据
 
   // ========================================================================
   // StoreBuffer 查询（Load 指令 — 字节级转发）
@@ -136,23 +129,23 @@ class Memory extends Module {
   lsuLoadResp.ready := false.B
 
   // ---- 停顿/输出控制信号 ----
-  val memStall   = WireDefault(false.B)   // 综合停顿信号
-  val loadResult = WireDefault(0.U(32.W)) // Load 最终结果（符号扩展后）
+  val memStall   = WireInit(false.B)   // 综合停顿信号
+  val loadResult = WireInit(0.U(32.W)) // Load 最终结果（符号扩展后）
 
   // ---- 符号扩展辅助函数 ----
   // 从合并后的 32 位字中按 funct3 和 offset 提取并扩展
-  def signExtendLoad(mergedWord: UInt, f3: UInt, off: UInt): UInt = {
+  private def signExtendLoad(mergedWord: UInt, f3: UInt, off: UInt): UInt = {
     val result = Wire(UInt(32.W))
     val byte = (mergedWord >> (off << 3.U))(7, 0)
     val half = Mux(off(1),
       mergedWord(31, 16),
       mergedWord(15, 0))
     result := MuxLookup(f3, mergedWord)(Seq(
-      "b000".U -> Cat(Fill(24, byte(7)), byte),         // LB：符号扩展
-      "b001".U -> Cat(Fill(16, half(15)), half),         // LH：符号扩展
-      "b010".U -> mergedWord,                            // LW：全字
-      "b100".U -> Cat(0.U(24.W), byte),                  // LBU：零扩展
-      "b101".U -> Cat(0.U(16.W), half)                   // LHU：零扩展
+      "b000".U -> Cat(Fill(24, byte(7)), byte),  // LB：符号扩展
+      "b001".U -> Cat(Fill(16, half(15)), half), // LH：符号扩展
+      "b010".U -> mergedWord,                    // LW：全字
+      "b100".U -> Cat(0.U(24.W), byte),          // LBU：零扩展
+      "b101".U -> Cat(0.U(16.W), half)           // LHU：零扩展
     ))
     result
   }

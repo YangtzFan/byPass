@@ -62,7 +62,7 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   // ========================================================================
   val buffer = RegInit(VecInit(Seq.fill(depth)(0.U.asTypeOf(new StoreBufferEntry))))
   val freeVec = VecInit(buffer.map(entry => !entry.valid))
-  val freeCount = PopCount(freeVec) // 计算空闲槽位数量（用于 canAlloc 判断）
+  val freeCount = PopCount(freeVec) // 计算空闲槽位数量（向 Dispatch 暴露真实余量，而不是固定阈值结果）
 
   // ---- FreeList 分配逻辑 ----
   // 从 freeVec 中按优先级选择最多 4 个空闲槽位
@@ -112,7 +112,13 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   val nextStoreSeq = RegInit(0.U(seqWidth.W))
 
   // ===================== 分配逻辑（Dispatch 阶段）=====================
-  alloc.canAlloc := freeCount >= 4.U // canAlloc 不依赖 request，避免与 Dispatch 形成组合环路
+  // 这里只上报“现在还剩多少空槽”，不直接输出 canAlloc：
+  //   - request 仍然沿用“真正发生派发时才拉高”的提交式语义；
+  //   - 如果这里再根据 request 反推 canAlloc，就会和 Dispatch.doDispatch 形成语义纠缠；
+  //   - 因此让 Dispatch 使用 Rename 已统计好的 storeCount 与 availCount 做精确比较最稳妥。
+  //
+  // 这样 StoreBuffer 只负责提供资源现状，是否足够本拍派发由 Dispatch 统一裁决。
+  alloc.availCount := freeCount
 
   // 返回 FreeList 选中的物理索引和对应的 storeSeq
   for (i <- 0 until 4) {

@@ -195,10 +195,17 @@ class StoreBufferEntry extends Bundle {
 // Memory/myCPU）为基准。StoreBuffer 内部使用 Flipped() 翻转方向。
 
 // ---- 分配接口（Dispatch 阶段请求分配 Store 表项）----
-// 新架构：返回 FreeList 分配的物理槽位索引和对应的 storeSeq 逻辑年龄
+// 这里特意把“资源余量预览”和“真正执行分配”拆开：
+//   1. request 仍然只表示本拍真正要提交给 StoreBuffer 的分配数量；
+//   2. availCount 只反映当前还能提供多少空闲槽位，不携带任何“最坏情况 4 个 Store”假设；
+//   3. Dispatch 先根据 Rename 已经统计好的 storeCount 做精确比较，确认能派发后再把 request 拉高。
+// 这样可以避免如下错误背压：
+//   - 当前只剩 3 个空槽；
+//   - 本拍实际只有 1 条 Store；
+//   - 若仍使用“freeCount >= 4”这种保守条件，就会把本来可以派发的批次整拍挡住。
 class SBAllocIO extends Bundle {
   val request      = Output(UInt(3.W))                              // 请求分配的 Store 表项数（0~4）
-  val canAlloc     = Input(Bool())                                  // StoreBuffer 是否有足够空间
+  val availCount   = Input(UInt(log2Ceil(CPUConfig.sbEntries + 1).W)) // 当前可用空闲槽位数，仅反映资源余量
   val idxs         = Input(Vec(4, UInt(CPUConfig.sbIdxWidth.W)))    // 分配的物理槽位索引（FreeList 返回）
   val storeSeqs    = Input(Vec(4, UInt(CPUConfig.storeSeqWidth.W))) // 分配的 storeSeq 逻辑年龄
   val nextStoreSeq = Input(UInt(CPUConfig.storeSeqWidth.W))         // 当前 nextStoreSeq 快照（Load 用于 storeSeqSnap）

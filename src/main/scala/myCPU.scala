@@ -253,9 +253,7 @@ class myCPU extends Module {
   memRedirectRobIdx       := uMemory.redirect.robIdx
   memRedirectStoreSeqSnap := uMemory.redirect.storeSeqSnap
 
-  // =====================================================
-  // ============ LSU Arbiter（Load/Store 外部访存仲裁）============
-  // =====================================================
+  // ---- LSU Arbiter（Load/Store 外部访存仲裁）----
   val uLSUArbiter = Module(new LSUArbiter)
 
   // Memory 阶段 Load 请求/响应 ↔ LSU Arbiter

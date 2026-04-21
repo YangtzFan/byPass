@@ -37,13 +37,25 @@ class Dispatch extends Module {
 
   // ---- 派遣条件判断 ----
   val robCanAlloc = robAlloc.canAlloc // ROB 是否可以容纳所有有效指令
-  val sbCanAlloc  = sbAlloc.canAlloc // StoreBuffer 是否有足够空间（仅当有 Store 指令时才需要检查）
+  // 这里不能再直接依赖 StoreBuffer 侧给出的“固定阈值 canAlloc”：
+  //   - Rename 已经提前把本拍真实的 Store 数量统计成了 storeCount；
+  //   - Dispatch 只需要判断“当前空槽是否 >= 这次真实需求”；
+  //   - 当本拍没有有效输入时，把需求视为 0，这样不会因为无效拍里的脏 bits 把 ready 错误拉低。
+  //
+  // 这样就能覆盖 TASK.md 提到的关键场景：
+  //   - StoreBuffer 还剩 3 个空槽；
+  //   - 本拍 4-wide 中实际只有 1 条 Store；
+  //   - 现在会正确放行，而不是被 “>= 4” 的保守判定误伤。
+  val sbNeedCount = Mux(in.valid, storeCount, 0.U)
+  val sbCanAlloc  = sbAlloc.availCount >= sbNeedCount // StoreBuffer 是否足够容纳本拍真实的 Store 请求
   val iqCanAlloc  = iqAlloc.canAlloc // IssueQueue 是否有足够空间
   val canDispatch = robCanAlloc && sbCanAlloc && iqCanAlloc // 所有资源充足才能派遣
   val doDispatch  = in.valid && canDispatch && !flush      // 流水线冲刷时不派遣
 
   // ---- 向 ROB、StoreBuffer、IssueQueue 发送分配请求，返回请求分配表项数目 ----
   robAlloc.request := Mux(doDispatch, validCount, 0.U)
+  // request 仍然只在“真正派发成功”时拉高，确保 StoreBuffer 不会在 ROB / IQ 资源不足时提前消耗槽位。
+  // 精确的容量预判已经在上面的 sbNeedCount / availCount 比较中完成，因此这里保留原有的提交式语义即可。
   sbAlloc.request := Mux(doDispatch, storeCount, 0.U)
   iqAlloc.request := Mux(doDispatch, validCount, 0.U)
 

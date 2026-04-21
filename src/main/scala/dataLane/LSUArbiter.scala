@@ -22,16 +22,16 @@ import chisel3.util._
 class LSUArbiter extends Module {
   val io = IO(new Bundle {
     // ---- Memory 阶段的 Load 请求/响应 ----
-    val loadReq  = Flipped(DecoupledIO(new MemReqBundle))   // Load 读请求（isWrite=false）
-    val loadResp = DecoupledIO(new MemRespBundle)            // Load 读响应
+    val loadReq  = Flipped(Decoupled(new MemReqBundle))  // Load 读请求（isWrite=false）
+    val loadResp = Decoupled(new MemRespBundle)          // Load 读响应
 
     // ---- myCPU 的 Store drain 请求/响应 ----
-    val drainReq  = Flipped(DecoupledIO(new MemReqBundle))  // Store drain 写请求（isWrite=true）
-    val drainResp = DecoupledIO(new MemRespBundle)           // Store drain 写响应
+    val drainReq  = Flipped(Decoupled(new MemReqBundle)) // Store drain 写请求（isWrite=true）
+    val drainResp = Decoupled(new MemRespBundle)         // Store drain 写响应
 
     // ---- 外部 SoC_Top 的统一接口 ----
-    val memReq  = DecoupledIO(new MemReqBundle)              // 统一外部请求
-    val memResp = Flipped(DecoupledIO(new MemRespBundle))    // 统一外部响应
+    val memReq  = Decoupled(new MemReqBundle)            // 统一外部请求
+    val memResp = Flipped(Decoupled(new MemRespBundle))  // 统一外部响应
   })
 
   // 状态机定义
@@ -39,15 +39,15 @@ class LSUArbiter extends Module {
   val state = RegInit(sIdle)
 
   // 默认输出
-  io.loadReq.ready  := false.B
-  io.drainReq.ready := false.B
-  io.loadResp.valid := false.B
-  io.loadResp.bits  := 0.U.asTypeOf(new MemRespBundle)
+  io.loadReq.ready   := false.B
+  io.drainReq.ready  := false.B
+  io.loadResp.valid  := false.B
+  io.loadResp.bits   := 0.U.asTypeOf(new MemRespBundle)
   io.drainResp.valid := false.B
   io.drainResp.bits  := 0.U.asTypeOf(new MemRespBundle)
-  io.memReq.valid   := false.B
-  io.memReq.bits    := 0.U.asTypeOf(new MemReqBundle)
-  io.memResp.ready  := false.B
+  io.memReq.valid    := false.B
+  io.memReq.bits     := 0.U.asTypeOf(new MemReqBundle)
+  io.memResp.ready   := false.B
 
   switch(state) {
     is(sIdle) {
