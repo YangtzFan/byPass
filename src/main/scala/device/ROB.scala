@@ -39,7 +39,7 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
   val empty = count === 0.U
   val full  = count === entries.U
 
-  alloc.canAlloc := count +& 4.U <= entries.U // canAlloc 不依赖 request，避免与 Dispatch 形成组合环路
+  alloc.availCount := entries.U - count // 输出空闲个数由 Dispatch 判断
   for (i <- 0 until 4) { // 返回连续的 ROB 指针（从当前 tail 开始）
     alloc.idxs(i) := tail + i.U
   }

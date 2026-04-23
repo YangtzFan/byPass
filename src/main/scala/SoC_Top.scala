@@ -6,111 +6,105 @@ import mycpu.memory._
 import mycpu.dataLane._
 
 // ============================================================================
-// SoC_Top —— 片上系统顶层模块
+// SoC_Top —— 片上系统顶层
 // ============================================================================
-// 将 CPU 核心、IROM、DRAM 驱动连接在一起
-// 新增 MemReq/MemResp 1 周期适配器：
-//   CPU 发出 DecoupledIO MemReq → 适配器接受 → 1 周期后返回 MemResp
-//   写请求：适配器在接受后的下一周期驱动 DRAM we，writeExecuted 防止重复写
-//   读请求：DRAM 读是组合逻辑，适配器在响应周期直接返回 rdata
+// 新架构中，AXIStoreQueue 被放在核外：
+//   1. myCPU 仅暴露前端 enqueue / query / load req&resp 接口；
+//   2. AXIStoreQueue 统一仲裁 committed store 写回和 load miss 外读；
+//   3. DRAM 仍沿用当前的一拍请求 / 响应适配器；
+//   4. difftest 现在允许在 store 成功写入 AXIStoreQueue 的同拍进行比对，
+//      因此顶层不再需要额外缓存 commit / store-write 事件来重排观察时机。
 // ============================================================================
 class SoC_Top extends Module {
-  val io = IO(new Bundle {
-    val debug_commit_have_inst = Output(Bool())
-    val debug_commit_pc = Output(UInt(32.W))
-    val debug_commit_reg_wen = Output(Bool())
-    val debug_commit_reg_waddr = Output(UInt(5.W))
-    val debug_commit_reg_wdata = Output(UInt(32.W))
+  // difftest 多条提交观测：
+  //   1) io.debug_commit_count 标示本周期 commit 的指令条数（0..commitWidth）；
+  //   2) 每个 lane 有独立的 pc / reg_wen / reg_waddr / reg_wdata / is_store；
+  //   3) 每个 lane 有独立的 ram_wen / ram_waddr / ram_wdata / ram_wmask；
+  // 当前 commitWidth=1，但接口已按 Vec 暴露，后续扩宽 retire 时只需改配置。
+  val commitWidth = CPUConfig.commitWidth
 
-    val debug_commit_ram_wen = Output(Bool())
-    val debug_commit_ram_waddr = Output(UInt(32.W))
-    val debug_commit_ram_wdata = Output(UInt(32.W))
-    val debug_commit_ram_wmask = Output(UInt(32.W))
+  val io = IO(new Bundle {
+    val debug_commit_count = Output(UInt(log2Ceil(commitWidth + 1).W))
+    val debug_commit = Output(Vec(commitWidth, new Bundle {
+      val pc        = UInt(32.W)
+      val reg_wen   = Bool()
+      val reg_waddr = UInt(5.W)
+      val reg_wdata = UInt(32.W)
+
+      val ram_wen   = Bool()
+      val ram_waddr = UInt(32.W)
+      val ram_wdata = UInt(32.W)
+      val ram_wmask = UInt(32.W)
+    }))
   })
 
-  // CPU 核心实例
   val coreCpu = Module(new myCPU)
+  val axiStoreQueue = Module(new AXIStoreQueue)
 
   // ---- IROM ----
   val irom = Module(new IROM)
   irom.io.a := coreCpu.inst_addr_o
   coreCpu.inst_i := irom.io.spo
 
+  // ---- 内核前端接口 ↔ 核外 AXIStoreQueue ----
+  coreCpu.sqEnq <> axiStoreQueue.enq
+  coreCpu.sqQuery <> axiStoreQueue.query
+  coreCpu.sqLoadReq <> axiStoreQueue.loadReq
+  coreCpu.sqLoadResp <> axiStoreQueue.loadResp
+
   // ---- DRAM 驱动器 ----
   val uDramDriver = Module(new dram_driver)
 
   // ========================================================================
-  // MemReq/MemResp 1 周期适配器
+  // AXIStoreQueue 后端的一拍请求 / 响应适配
+  // dram_driver 本身是“组合读 + 时钟写”，而 AXIStoreQueue 已经在内部保证
+  // 任意时刻最多只有一笔后端请求在飞，所以这里不需要再维护额外状态机。
+  // 只需完成两件事：
+  //   1. 请求握手当拍，把地址/写数据直接送到 dram_driver；
+  //   2. 下一拍给 AXIStoreQueue 返回一个 response 脉冲，维持它当前的 waitResp 时序假设。
   // ========================================================================
-  // 状态机：sAccept（接受请求）→ sRespond（返回响应）
-  val sAccept :: sRespond :: Nil = Enum(2)
-  val adapterState = RegInit(sAccept)
+  val memReqFire = axiStoreQueue.memReq.valid
+  val memRespValid = RegNext(memReqFire, false.B)
+  val memRespRdata = RegEnable(uDramDriver.io.rdata, 0.U(32.W), memReqFire)
 
-  // 保存请求信息
-  val reqIsWrite = RegInit(false.B)
-  val reqAddr    = RegInit(0.U(32.W))
-  val reqWdata   = RegInit(0.U(32.W))
-  val reqWstrb   = RegInit(0.U(4.W))
-  val writeExecuted = RegInit(false.B) // 防止重复写 DRAM
+  axiStoreQueue.memReq.ready := true.B
+  axiStoreQueue.memResp.valid := memRespValid
+  axiStoreQueue.memResp.rdata := memRespRdata
 
-  // 默认：不接受请求，不返回响应
-  coreCpu.memReq.ready  := false.B
-  coreCpu.memResp.valid := false.B
-  coreCpu.memResp.bits  := 0.U.asTypeOf(new MemRespBundle)
+  uDramDriver.io.addr := axiStoreQueue.memReq.addr(17, 0)
+  uDramDriver.io.wdata := axiStoreQueue.memReq.wdata
+  uDramDriver.io.wstrb := axiStoreQueue.memReq.wstrb
+  uDramDriver.io.we := memReqFire && axiStoreQueue.memReq.isWrite
 
-  // DRAM 驱动默认值
-  uDramDriver.io.addr  := 0.U
-  uDramDriver.io.wdata := 0.U
-  uDramDriver.io.wstrb := 0.U
-  uDramDriver.io.we    := false.B
+  // ------------------------------------------------------------------
+  // 转发多条提交观测信号
+  // ------------------------------------------------------------------
+  // commit_count 由核内 ROB 提交端直接给出。
+  // 当前实现中 axiStoreQueue.debug.commitRamWen 一拍内至多有 1 个 store 成功入队，
+  // 与 commitWidth=1 场景完全对应；一旦扩宽到多提交，需在 AXIStoreQueue
+  // debug 接口中同步提供 Vec 形式，否则多 lane 的 ram 观测会失准。
+  io.debug_commit_count := coreCpu.io.commit_count
 
-  switch(adapterState) {
-    is(sAccept) {
-      // 可以接受新请求
-      coreCpu.memReq.ready := true.B
-      when(coreCpu.memReq.fire) {
-        reqIsWrite := coreCpu.memReq.bits.isWrite
-        reqAddr    := coreCpu.memReq.bits.addr
-        reqWdata   := coreCpu.memReq.bits.wdata
-        reqWstrb   := coreCpu.memReq.bits.wstrb
-        writeExecuted := false.B
-        adapterState := sRespond
-      }
-    }
+  // lane 0：寄存器写回信息来自 coreCpu.io.commit(0)，store 信息来自 axiStoreQueue.debug。
+  io.debug_commit(0).pc        := Mux(coreCpu.io.commit_count =/= 0.U, coreCpu.io.commit(0).pc, 0.U)
+  io.debug_commit(0).reg_wen   := coreCpu.io.commit(0).reg_wen
+  io.debug_commit(0).reg_waddr := Mux(coreCpu.io.commit(0).reg_wen, coreCpu.io.commit(0).reg_waddr, 0.U)
+  io.debug_commit(0).reg_wdata := Mux(coreCpu.io.commit(0).reg_wen, coreCpu.io.commit(0).reg_wdata, 0.U)
 
-    is(sRespond) {
-      // 写请求：驱动 DRAM 写端口（仅一次）
-      when(reqIsWrite && !writeExecuted) {
-        uDramDriver.io.addr  := reqAddr(17, 0)
-        uDramDriver.io.wdata := reqWdata
-        uDramDriver.io.wstrb := reqWstrb
-        uDramDriver.io.we    := true.B
-        writeExecuted := true.B
-      }
+  io.debug_commit(0).ram_wen   := axiStoreQueue.debug.commitRamWen
+  io.debug_commit(0).ram_waddr := Mux(axiStoreQueue.debug.commitRamWen, axiStoreQueue.debug.commitRamWaddr, 0.U)
+  io.debug_commit(0).ram_wdata := Mux(axiStoreQueue.debug.commitRamWen, axiStoreQueue.debug.commitRamWdata, 0.U)
+  io.debug_commit(0).ram_wmask := Mux(axiStoreQueue.debug.commitRamWen, axiStoreQueue.debug.commitRamWmask, 0.U)
 
-      // 读请求：组合逻辑驱动 DRAM 读地址
-      when(!reqIsWrite) {
-        uDramDriver.io.addr := reqAddr(17, 0)
-      }
-
-      // 返回响应（sticky：保持 valid 直到 fire）
-      coreCpu.memResp.valid     := true.B
-      coreCpu.memResp.bits.rdata := uDramDriver.io.rdata
-
-      when(coreCpu.memResp.fire) {
-        adapterState := sAccept
-      }
-    }
+  // 高位 lane 在 commitWidth>1 时使用。当前保持安全默认值。
+  for (i <- 1 until commitWidth) {
+    io.debug_commit(i).pc        := 0.U
+    io.debug_commit(i).reg_wen   := false.B
+    io.debug_commit(i).reg_waddr := 0.U
+    io.debug_commit(i).reg_wdata := 0.U
+    io.debug_commit(i).ram_wen   := false.B
+    io.debug_commit(i).ram_waddr := 0.U
+    io.debug_commit(i).ram_wdata := 0.U
+    io.debug_commit(i).ram_wmask := 0.U
   }
-
-  // ---- Commit 阶段调试观测 ----
-  io.debug_commit_have_inst := coreCpu.io.commit_valid
-  io.debug_commit_pc        := coreCpu.io.commit_pc
-  io.debug_commit_reg_wen   := coreCpu.io.commit_reg_wen
-  io.debug_commit_reg_waddr := coreCpu.io.commit_reg_waddr
-  io.debug_commit_reg_wdata := coreCpu.io.commit_reg_wdata
-  io.debug_commit_ram_wen   := coreCpu.io.commit_ram_wen
-  io.debug_commit_ram_waddr := coreCpu.io.commit_ram_waddr
-  io.debug_commit_ram_wdata := coreCpu.io.commit_ram_wdata
-  io.debug_commit_ram_wmask := coreCpu.io.commit_ram_wmask
 }

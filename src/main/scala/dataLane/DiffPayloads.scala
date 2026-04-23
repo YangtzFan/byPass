@@ -179,7 +179,6 @@ class Memory_Refresh_Payload extends Bundle {
 class StoreBufferEntry extends Bundle {
   val valid     = Bool()                          // 表项是否有效（已分配）
   val addrValid = Bool()                          // 地址是否已写入（Memory 阶段写入地址和数据）
-  val committed = Bool()                          // 是否已被 ROB 提交（可以 drain 到内存）
   val addr      = UInt(32.W)                      // Store 原始完整地址（difftest 用）
   val data      = UInt(32.W)                      // Store 原始数据（rs2 值，difftest 用）
   val mask      = UInt(3.W)                       // Store 原始宽度掩码（funct3，difftest 用）
@@ -204,8 +203,8 @@ class StoreBufferEntry extends Bundle {
 //   - 本拍实际只有 1 条 Store；
 //   - 若仍使用“freeCount >= 4”这种保守条件，就会把本来可以派发的批次整拍挡住。
 class SBAllocIO extends Bundle {
-  val request      = Output(UInt(3.W))                              // 请求分配的 Store 表项数（0~4）
-  val availCount   = Input(UInt(log2Ceil(CPUConfig.sbEntries + 1).W)) // 当前可用空闲槽位数，仅反映资源余量
+  val request      = Output(UInt(3.W))                              // 请求分配的 Store 表项数（0~4），仅在真正可以派发时拉高
+  val availCount   = Input(UInt(log2Ceil(CPUConfig.sbEntries + 1).W)) // 当前空闲槽位数，仅反映资源余量（不依赖 request）
   val idxs         = Input(Vec(4, UInt(CPUConfig.sbIdxWidth.W)))    // 分配的物理槽位索引（FreeList 返回）
   val storeSeqs    = Input(Vec(4, UInt(CPUConfig.storeSeqWidth.W))) // 分配的 storeSeq 逻辑年龄
   val nextStoreSeq = Input(UInt(CPUConfig.storeSeqWidth.W))         // 当前 nextStoreSeq 快照（Load 用于 storeSeqSnap）
@@ -235,28 +234,23 @@ class SBQueryIO extends Bundle {
   val fwdData      = Input(UInt(32.W))                       // 转发数据（仅 fwdMask 对应字节有效）
 }
 
-// ---- 提交标记接口（ROB 提交 Store 时，标记 SB 表项为 committed）----
-// 新架构：commit 仅标记 committed 标志，不直接写内存
+// ---- 提交候选接口（ROB head 是 Store 时，向 SB 取出待 enqueue 的表项）----
+// 新架构中，Store 的真正提交点是“成功进入 AXIStoreQueue”。
+// 因此这里不再做“committed 标记”，而是：
+//   1. Commit 侧按 storeSeq 向 SB 查询当前 head store 对应的完整信息；
+//   2. 若 AXIStoreQueue 同拍 ready，则以 enqSuccess 作为唯一释放条件；
+//   3. 未成功握手前，该 Store 仍留在 SB 中，继续参与 rollback / forwarding。
 class SBCommitIO extends Bundle {
-  val valid    = Output(Bool())                             // 本周期 ROB 是否提交一条 Store 指令
-  val storeSeq = Output(UInt(CPUConfig.storeSeqWidth.W))    // 被提交的 Store 的 storeSeq（用于定位表项）
-}
-
-// ---- Drain 接口（将已 committed 的表项写入外部存储器，与 commit 解耦）----
-// StoreBuffer 内部按最老 committed 表项的顺序 drain
-// 写完成由外部 drainAck 信号确认，确认后才释放槽位
-class SBDrainIO extends Bundle {
-  val valid    = Output(Bool())          // 本周期是否有 Store 需要写入外部
-  // 原始值（用于 difftest 信号输出，保持与参考模型一致）
-  val addr     = Output(UInt(32.W))      // 原始 Store 完整字节地址
-  val data     = Output(UInt(32.W))      // 原始 Store 数据（rs2 值）
-  val mask     = Output(UInt(3.W))       // 原始 Store 宽度掩码（funct3）
-  // 字节级值（用于实际外部写操作）
-  val wordAddr = Output(UInt(30.W))      // 字对齐地址（addr[31:2]）
-  val wstrb    = Output(UInt(4.W))       // 字节写使能掩码
-  val wdata    = Output(UInt(32.W))      // 字节对齐后的写数据
-  // 写完成确认（外部写响应返回后由 myCPU 置位，释放 SB 槽位）
-  val drainAck = Input(Bool())
+  val valid      = Output(Bool())                             // 本周期是否要按 storeSeq 查询 SB 中的候选 store
+  val storeSeq   = Output(UInt(CPUConfig.storeSeqWidth.W))    // ROB head store 的 storeSeq（用于定位表项）
+  val entryValid = Input(Bool())                              // SB 中是否找到了可 enqueue 的候选（含 addr/data 已就绪）
+  val addr       = Input(UInt(32.W))                          // 原始 Store 完整字节地址（difftest 用）
+  val data       = Input(UInt(32.W))                          // 原始 Store 数据（rs2 值，difftest 用）
+  val mask       = Input(UInt(3.W))                           // 原始 Store 宽度掩码（funct3，difftest 用）
+  val wordAddr   = Input(UInt(30.W))                          // 字对齐地址（addr[31:2]）
+  val wstrb      = Input(UInt(4.W))                           // 字节写使能掩码
+  val wdata      = Input(UInt(32.W))                          // 字节对齐后的写数据
+  val enqSuccess = Output(Bool())                             // AXIStoreQueue enqueue 成功脉冲：SB 仅在此时释放表项
 }
 
 // ---- 回滚接口（Memory 重定向时按 storeSeq 精确回滚 StoreBuffer）----
@@ -291,10 +285,10 @@ class ROBAllocData extends Bundle {
 
 // ---- ROB ↔ Dispatch 4-wide 分配接口 ----
 class ROBMultiAllocIO extends Bundle { // 方向以 Dispatch（发送方）为基准
-  val canAlloc = Input(Bool())                                // ROB 是否有足够空间
-  val request  = Output(UInt(3.W))                            // 请求分配的表项数量（0-4）
-  val data     = Output(Vec(4, new ROBAllocData))             // 每条指令的分配数据
-  val idxs     = Input(Vec(4, UInt(CPUConfig.robPtrWidth.W))) // ROB 返回的分配指针
+  val availCount = Input(UInt(CPUConfig.robPtrWidth.W))         // ROB 剩余空间
+  val request    = Output(UInt(3.W))                            // 请求分配的表项数量（0-4）
+  val data       = Output(Vec(4, new ROBAllocData))             // 每条指令的分配数据
+  val idxs       = Input(Vec(4, UInt(CPUConfig.robPtrWidth.W))) // ROB 返回的分配指针
 }
 
 // ============================================================================

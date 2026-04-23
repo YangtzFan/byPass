@@ -5,48 +5,38 @@ import chisel3.util._
 import mycpu.CPUConfig
 
 // ============================================================================
-// Memory（访存阶段）—— LSU 前端 + 分支纠错重定向 + StoreBuffer 字节级转发
+// Memory（访存阶段）—— StoreBuffer / AXIStoreQueue / DRAM 三级访存前端
 // ============================================================================
-// 两级状态机设计，支持多周期 Load：
-//   sIdle:
-//     - Store 指令：计算 byteMask/byteData，写入 StoreBuffer，直接透传
-//     - Load  指令：查询 SB 字节级转发，4 种情况：
-//         A) olderUnknown → 停顿等待
-//         B) fullCover   → 纯 SB 转发，立即输出（不读外部）
-//         C) 需要外部读  → 发出 lsuLoadReq，保存 fwdMask/fwdData → sWaitResp
-//         D) lsuLoadReq 未就绪 → 停顿等待仲裁器
-//     - 其他指令：直接透传，处理分支重定向
-//   sWaitResp:
-//     - 等待 lsuLoadResp 返回
-//     - 将保存的 SB 转发数据与外部读回数据按字节合并
-//     - 符号扩展后输出
+// 新版 load 处理顺序：
+//   1. 先查 StoreBuffer（speculative store）；
+//   2. 若无 olderUnknown，再按剩余 needMask 查 AXIStoreQueue（committed store）；
+//   3. 若仍未 full cover，向 AXIStoreQueue 发起外部读请求；
+//   4. 最终按优先级 StoreBuffer > AXIStoreQueue > DRAM 合并字节。
 //
-// 关键变更（相对旧版）：
-//   1. 移除直接 DRAM 端口，改用 DecoupledIO lsuLoadReq/lsuLoadResp
-//   2. 移除 drainActive 信号（由 LSU Arbiter 统一仲裁）
-//   3. 符号扩展从 dram_driver 移到本阶段
-//   4. StoreBuffer 查询改为字节级（wordAddr + loadMask）
+// 这样可以同时保证：
+//   - 更老未知地址 store 仍会阻断 load；
+//   - 已提交但未落地 DRAM 的 store 仍对后续 load 可见；
+//   - 同一个 load 的不同字节可以分别来自 SB / SQ / DRAM。
 // ============================================================================
 class Memory extends Module {
-  val in  = IO(Flipped(Decoupled(new Execute_Memory_Payload)))
+  val in = IO(Flipped(Decoupled(new Execute_Memory_Payload)))
   val out = IO(Decoupled(new Memory_Refresh_Payload))
 
-  // ---- LSU Load 请求/响应接口（连接到 LSU Arbiter）----
-  val lsuLoadReq  = IO(Decoupled(new MemReqBundle))
-  val lsuLoadResp = IO(Flipped(Decoupled(new MemRespBundle)))
-
-  // ---- StoreBuffer 写入端口（Store 指令写入地址、数据、字节级掩码）----
+  // ---- StoreBuffer 接口 ----
+  val sbQuery = IO(new SBQueryIO)
   val sbWrite = IO(Output(new SBWriteIO))
 
-  // ---- StoreBuffer 查询接口（Load 指令字节级转发查询）----
-  val sbQuery = IO(new SBQueryIO)
+  // ---- AXIStoreQueue 前端接口 ----
+  val sqQuery = IO(new AXISQQueryIO)
+  val sqLoadReq = IO(new AXISQLoadReqIO)
+  val sqLoadResp = IO(new AXISQLoadRespIO)
 
   // ---- Memory 阶段重定向输出 ----
   val redirect = IO(new Bundle {
-    val valid         = Output(Bool())
-    val addr          = Output(UInt(32.W))
-    val robIdx        = Output(UInt(CPUConfig.robPtrWidth.W))
-    val storeSeqSnap  = Output(UInt(CPUConfig.storeSeqWidth.W))
+    val valid = Output(Bool())
+    val addr = Output(UInt(32.W))
+    val robIdx = Output(UInt(CPUConfig.robPtrWidth.W))
+    val storeSeqSnap = Output(UInt(CPUConfig.storeSeqWidth.W))
     val checkpointIdx = Output(UInt(CPUConfig.ckptPtrWidth.W))
   })
 
@@ -55,97 +45,128 @@ class Memory extends Module {
   val jal   = in.bits.type_decode_together(7)
   val jalr  = in.bits.type_decode_together(6)
   val bType = in.bits.type_decode_together(5)
-  val lType = in.bits.type_decode_together(4) // Load
+  val lType = in.bits.type_decode_together(4)
   val iType = in.bits.type_decode_together(3)
-  val sType = in.bits.type_decode_together(2) // Store
+  val sType = in.bits.type_decode_together(2)
   val rType = in.bits.type_decode_together(1)
-  val other = in.bits.type_decode_together(0)
+  val addr  = in.bits.data
 
-  // 字节对齐计算（Store 和 Load 共用）
-  val addr    = in.bits.data          // ALU 计算出的访存地址
-  val offset  = addr(1, 0)            // 字内字节偏移
-  val funct3  = in.bits.inst_funct3   // 访存宽度标识
+  val offset = addr(1, 0)
+  val funct3 = in.bits.inst_funct3
+  val func3_OH = UIntToOH(funct3(1, 0))
 
-  // ---- Store 字节掩码和字节对齐数据 ----
-  // SB: funct3=000 → 1 字节
-  // SH: funct3=001 → 2 字节（半字对齐）
-  // SW: funct3=010 → 4 字节
-  val storeRawData = in.bits.reg_rdata2  // rs2 的原始值
-  val storeByteMask = MuxLookup(funct3(1, 0), 0.U)(Seq(
-    0.U -> (1.U(4.W) << offset),                           // SB：单字节
-    1.U -> Mux(offset(1), "b1100".U(4.W), "b0011".U(4.W)), // SH：按半字对齐
-    2.U -> "b1111".U(4.W)                                  // SW：全字
+  // ---- Store 字节对齐 ----
+  val storeRawData = in.bits.reg_rdata2
+  val storeByteMask = Mux1H(Seq(
+    func3_OH(0) -> (1.U(4.W) << offset),
+    func3_OH(1) -> Mux(offset(1), "b1100".U(4.W), "b0011".U(4.W)),
+    func3_OH(2) -> "b1111".U(4.W),
+    func3_OH(3) -> 0.U(4.W)
   ))
-  val storeByteData = MuxLookup(funct3(1, 0), 0.U)(Seq(
-    0.U -> (storeRawData(7, 0) << (offset << 3.U)),        // SB：字节移位到目标位置
-    1.U -> Mux(offset(1),
-      Cat(storeRawData(15, 0), 0.U(16.W)),                 // SH 高半字
-      Cat(0.U(16.W), storeRawData(15, 0))),                // SH 低半字
-    2.U -> storeRawData                                    // SW：全字直接写
+  val storeByteData = Mux1H(Seq(
+    func3_OH(0) -> (storeRawData(7, 0) << (offset << 3.U)),
+    func3_OH(1) -> Mux(offset(1), Cat(storeRawData(15, 0), 0.U(16.W)), Cat(0.U(16.W), storeRawData(15, 0))),
+    func3_OH(2) -> storeRawData,
+    func3_OH(3) -> 0.U(32.W)
   ))
 
-  // ---- Load 字节掩码 ----
-  // LB/LBU: funct3[1:0]=00 → 1 字节
-  // LH/LHU: funct3[1:0]=01 → 2 字节
-  // LW:     funct3[1:0]=10 → 4 字节
-  val loadByteMask = MuxLookup(funct3(1, 0), 0.U)(Seq(
-    0.U -> (1.U(4.W) << offset),                           // LB/LBU
-    1.U -> Mux(offset(1), "b1100".U(4.W), "b0011".U(4.W)), // LH/LHU
-    2.U -> "b1111".U(4.W)                                  // LW
+  // ---- Load 字节需求 ----
+  val loadByteMask = Mux1H(Seq(
+    func3_OH(0) -> (1.U(4.W) << offset),
+    func3_OH(1) -> Mux(offset(1), "b1100".U(4.W), "b0011".U(4.W)),
+    func3_OH(2) -> "b1111".U(4.W),
+    func3_OH(3) -> 0.U(4.W)
   ))
 
-  // ========================================================================
-  // StoreBuffer 写入（Store 指令 — 在 sIdle 阶段完成）
-  // ========================================================================
-  sbWrite.valid    := in.valid && sType && in.bits.isSbAlloc
-  sbWrite.idx      := in.bits.sbIdx
-  sbWrite.addr     := addr          // 原始完整字节地址（difftest 用）
-  sbWrite.data     := storeRawData  // 原始 rs2 数据（difftest 用）
-  sbWrite.mask     := funct3        // 原始 funct3（difftest 用）
-  sbWrite.byteMask := storeByteMask // 字节写使能掩码
-  sbWrite.byteData := storeByteData // 字节对齐后的写数据
+  // ===================== StoreBuffer 写入 =====================
+  sbWrite.valid := in.valid && sType && in.bits.isSbAlloc
+  sbWrite.idx := in.bits.sbIdx
+  sbWrite.addr := addr
+  sbWrite.data := storeRawData
+  sbWrite.mask := funct3
+  sbWrite.byteMask := storeByteMask
+  sbWrite.byteData := storeByteData
 
-  // ========================================================================
-  // StoreBuffer 查询（Load 指令 — 字节级转发）
-  // ========================================================================
-  sbQuery.valid        := in.valid && lType
-  sbQuery.wordAddr     := addr(31, 2)          // 字对齐地址
-  sbQuery.loadMask     := loadByteMask         // Load 需要的字节掩码
+  // ===================== StoreBuffer 查询 =====================
+  sbQuery.valid := in.valid && lType
+  sbQuery.wordAddr := addr(31, 2)
+  sbQuery.loadMask := loadByteMask
   sbQuery.storeSeqSnap := in.bits.storeSeqSnap
 
-  // ========================================================================
-  // 状态机
-  // ========================================================================
+  // SB 只负责 speculative store，因此先把它已经覆盖的字节扣掉，再去查 committed queue。
+  val sbFwdMask = sbQuery.fwdMask & loadByteMask
+  val needAfterSB = loadByteMask & ~sbFwdMask
+
+  // ===================== AXIStoreQueue 查询 / 外读接口默认值 =====================
+  sqQuery.valid := false.B
+  sqQuery.wordAddr := addr(31, 2)
+  sqQuery.loadMask := 0.U
+
+  sqLoadReq.valid := false.B
+  sqLoadReq.addr := Cat(addr(31, 2), 0.U(2.W))
+  sqLoadReq.needMask := 0.U
+  sqLoadResp.ready := false.B
+
+  // SQ forwarding 掩码只覆盖 SB 未覆盖的部分。
+  val sqVisibleMask = WireInit(0.U(4.W))
+  val sqVisibleData = WireInit(0.U(32.W))
+  val needAfterSQ = WireInit(needAfterSB)
+
+  when(in.valid && lType && !sbQuery.olderUnknown && (needAfterSB =/= 0.U)) {
+    sqQuery.valid := true.B
+    sqQuery.loadMask := needAfterSB
+    sqVisibleMask := sqQuery.fwdMask & needAfterSB
+    sqVisibleData := sqQuery.fwdData
+    needAfterSQ := needAfterSB & ~sqVisibleMask
+  }
+
+  // ===================== 状态机 =====================
   val sIdle :: sWaitResp :: Nil = Enum(2)
   val state = RegInit(sIdle)
 
-  // 保存从 sIdle 转入 sWaitResp 时的 SB 转发快照
-  val savedFwdMask = RegInit(0.U(4.W))
-  val savedFwdData = RegInit(0.U(32.W))
+  // 进入等待外部读状态时，保存当拍的 SB/SQ forwarding 结果。
+  val savedSbFwdMask = RegInit(0.U(4.W))
+  val savedSbFwdData = RegInit(0.U(32.W))
+  val savedSqFwdMask = RegInit(0.U(4.W))
+  val savedSqFwdData = RegInit(0.U(32.W))
 
-  // 默认输出
-  lsuLoadReq.valid  := false.B
-  lsuLoadReq.bits   := 0.U.asTypeOf(new MemReqBundle)
-  lsuLoadResp.ready := false.B
+  val memStall = WireInit(false.B)
+  val loadResult = WireInit(0.U(32.W))
 
-  // ---- 停顿/输出控制信号 ----
-  val memStall   = WireInit(false.B)   // 综合停顿信号
-  val loadResult = WireInit(0.U(32.W)) // Load 最终结果（符号扩展后）
+  // ---- 辅助函数：按优先级合并 SB / SQ / DRAM 三路字节来源 ----
+  private def mergeLoadSources(
+    sbMask: UInt,
+    sbData: UInt,
+    sqMask: UInt,
+    sqData: UInt,
+    dramData: UInt
+  ): UInt = {
+    val mergedBytes = Wire(Vec(4, UInt(8.W)))
+    for (b <- 0 until 4) {
+      mergedBytes(b) := Mux(
+        sbMask(b),
+        sbData(b * 8 + 7, b * 8),
+        Mux(
+          sqMask(b),
+          sqData(b * 8 + 7, b * 8),
+          dramData(b * 8 + 7, b * 8)
+        )
+      )
+    }
+    Cat(mergedBytes(3), mergedBytes(2), mergedBytes(1), mergedBytes(0))
+  }
 
-  // ---- 符号扩展辅助函数 ----
-  // 从合并后的 32 位字中按 funct3 和 offset 提取并扩展
+  // ---- 辅助函数：按 funct3 / offset 对合并后的 32 位字进行提取和扩展 ----
   private def signExtendLoad(mergedWord: UInt, f3: UInt, off: UInt): UInt = {
     val result = Wire(UInt(32.W))
     val byte = (mergedWord >> (off << 3.U))(7, 0)
-    val half = Mux(off(1),
-      mergedWord(31, 16),
-      mergedWord(15, 0))
+    val half = Mux(off(1), mergedWord(31, 16), mergedWord(15, 0))
     result := MuxLookup(f3, mergedWord)(Seq(
-      "b000".U -> Cat(Fill(24, byte(7)), byte),  // LB：符号扩展
-      "b001".U -> Cat(Fill(16, half(15)), half), // LH：符号扩展
-      "b010".U -> mergedWord,                    // LW：全字
-      "b100".U -> Cat(0.U(24.W), byte),          // LBU：零扩展
-      "b101".U -> Cat(0.U(16.W), half)           // LHU：零扩展
+      "b000".U -> Cat(Fill(24, byte(7)), byte),
+      "b001".U -> Cat(Fill(16, half(15)), half),
+      "b010".U -> mergedWord,
+      "b100".U -> Cat(0.U(24.W), byte),
+      "b101".U -> Cat(0.U(16.W), half)
     ))
     result
   }
@@ -153,52 +174,47 @@ class Memory extends Module {
   switch(state) {
     is(sIdle) {
       when(in.valid && lType) {
-        // ---- Load 指令处理 ----
         when(sbQuery.olderUnknown) {
-          // 情况 A：有更老 Store 地址未知 → 停顿
+          // 更老 speculative store 地址未知时，必须先停住，不能越过这道边界。
           memStall := true.B
-        }.elsewhen(sbQuery.fullCover) {
-          // 情况 B：SB 完全覆盖 → 纯转发，不需要外部读
-          loadResult := signExtendLoad(sbQuery.fwdData, funct3, offset)
+        }.elsewhen(needAfterSQ === 0.U) {
+          // SB + SQ 已经把本次 load 需要的字节全部覆盖，不需要访问 DRAM。
+          val fullyMergedWord = mergeLoadSources(
+            sbFwdMask,
+            sbQuery.fwdData,
+            sqVisibleMask,
+            sqVisibleData,
+            0.U(32.W)
+          )
+          loadResult := signExtendLoad(fullyMergedWord, funct3, offset)
           memStall := false.B
         }.otherwise {
-          // 情况 C/D：需要外部读 → 发出 LSU 请求
-          lsuLoadReq.valid       := true.B
-          lsuLoadReq.bits.isWrite := false.B
-          lsuLoadReq.bits.addr   := Cat(addr(31, 2), 0.U(2.W)) // 字对齐地址
-          lsuLoadReq.bits.wdata  := 0.U
-          lsuLoadReq.bits.wstrb  := 0.U
-          when(lsuLoadReq.fire) {
-            // 请求发出成功 → 保存 SB 转发快照，进入等待状态
-            savedFwdMask := sbQuery.fwdMask
-            savedFwdData := sbQuery.fwdData
+          // 仍有未覆盖字节，需要通过 AXIStoreQueue 发起外部读。
+          sqLoadReq.valid := true.B
+          sqLoadReq.needMask := needAfterSQ
+          when(sqLoadReq.valid && sqLoadReq.ready) {
+            savedSbFwdMask := sbFwdMask
+            savedSbFwdData := sbQuery.fwdData
+            savedSqFwdMask := sqVisibleMask
+            savedSqFwdData := sqVisibleData
             state := sWaitResp
           }
-          memStall := true.B  // 请求未完成期间停顿
+          memStall := true.B
         }
       }
-      // Store / 其他指令在 sIdle 直接透传，不停顿
     }
 
     is(sWaitResp) {
-      // 等待外部 Load 响应
-      lsuLoadResp.ready := true.B
-      memStall := true.B  // 等待期间停顿
-
-      when(lsuLoadResp.fire) {
-        // 响应到达 → 合并 SB 转发和外部读回的数据
-        val externalRdata = lsuLoadResp.bits.rdata
-        // 按字节合并：fwdMask 对应位用 SB 数据，否则用外部数据
-        val mergedWord = Wire(UInt(32.W))
-        val mergedBytes = Wire(Vec(4, UInt(8.W)))
-        for (b <- 0 until 4) {
-          mergedBytes(b) := Mux(savedFwdMask(b),
-            savedFwdData(b * 8 + 7, b * 8),      // SB 转发字节
-            externalRdata(b * 8 + 7, b * 8))      // 外部读回字节
-        }
-        mergedWord := Cat(mergedBytes(3), mergedBytes(2), mergedBytes(1), mergedBytes(0))
-
-        // 符号扩展
+      sqLoadResp.ready := true.B
+      memStall := true.B
+      when(sqLoadResp.valid && sqLoadResp.ready) {
+        val mergedWord = mergeLoadSources(
+          savedSbFwdMask,
+          savedSbFwdData,
+          savedSqFwdMask,
+          savedSqFwdData,
+          sqLoadResp.rdata
+        )
         loadResult := signExtendLoad(mergedWord, funct3, offset)
         memStall := false.B
         state := sIdle
@@ -206,18 +222,14 @@ class Memory extends Module {
     }
   }
 
-  // ========================================================================
-  // 重定向逻辑（仅 sIdle 且非停顿时触发）
-  // ========================================================================
-  redirect.valid         := in.valid && in.bits.mispredict && !memStall
-  redirect.addr          := in.bits.actual_target
-  redirect.robIdx        := in.bits.robIdx
-  redirect.storeSeqSnap  := in.bits.storeSeqSnap
+  // ===================== 重定向逻辑 =====================
+  redirect.valid := in.valid && in.bits.mispredict && !memStall
+  redirect.addr := in.bits.actual_target
+  redirect.robIdx := in.bits.robIdx
+  redirect.storeSeqSnap := in.bits.storeSeqSnap
   redirect.checkpointIdx := in.bits.checkpointIdx
 
-  // ========================================================================
-  // 输出打包
-  // ========================================================================
+  // ===================== 输出打包 =====================
   out.bits.pc := in.bits.pc
   out.bits.inst_rd := Mux(uType || jal || jalr || lType || iType || rType, in.bits.inst_rd, 0.U)
   out.bits.pdst := Mux(uType || jal || jalr || lType || iType || rType, in.bits.pdst, 0.U)
@@ -227,20 +239,17 @@ class Memory extends Module {
     (bType || sType) -> 0.U(32.W)
   ))
   out.bits.type_decode_together := in.bits.type_decode_together
-  out.bits.robIdx         := in.bits.robIdx
+  out.bits.robIdx := in.bits.robIdx
   out.bits.regWriteEnable := in.bits.regWriteEnable
-  out.bits.isBranch       := in.bits.isBranch
-  out.bits.isJump         := in.bits.isJump
-  out.bits.predict_taken  := in.bits.predict_taken
+  out.bits.isBranch := in.bits.isBranch
+  out.bits.isJump := in.bits.isJump
+  out.bits.predict_taken := in.bits.predict_taken
   out.bits.predict_target := in.bits.predict_target
-  out.bits.actual_taken   := in.bits.actual_taken
-  out.bits.actual_target  := in.bits.actual_target
-  out.bits.mispredict     := in.bits.mispredict
-  out.bits.bht_meta       := in.bits.bht_meta
+  out.bits.actual_taken := in.bits.actual_taken
+  out.bits.actual_target := in.bits.actual_target
+  out.bits.mispredict := in.bits.mispredict
+  out.bits.bht_meta := in.bits.bht_meta
 
-  // ========================================================================
-  // 握手信号
-  // ========================================================================
-  in.ready  := out.ready && !memStall
+  in.ready := out.ready && !memStall
   out.valid := in.valid && !memStall
 }

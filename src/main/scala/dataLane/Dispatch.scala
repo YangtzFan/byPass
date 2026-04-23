@@ -32,32 +32,26 @@ class Dispatch extends Module {
   val iqAlloc = IO(new IQAllocIO)
   val out = IO(Output(new IQWriteData))
 
-  val validCount = in.bits.validCount // 取出 Rename 统计的有效指令数量
-  val storeCount = in.bits.storeCount // 取出 Rename 统计的既是 store 又有效的指令数量
+  val validCount = in.bits.validCount // 取出 Rename 阶段统计的有效指令数量
+  val storeCount = in.bits.storeCount // 取出 Rename 阶段统计的既是 store 又有效的指令数量
 
   // ---- 派遣条件判断 ----
-  val robCanAlloc = robAlloc.canAlloc // ROB 是否可以容纳所有有效指令
-  // 这里不能再直接依赖 StoreBuffer 侧给出的“固定阈值 canAlloc”：
-  //   - Rename 已经提前把本拍真实的 Store 数量统计成了 storeCount；
-  //   - Dispatch 只需要判断“当前空槽是否 >= 这次真实需求”；
-  //   - 当本拍没有有效输入时，把需求视为 0，这样不会因为无效拍里的脏 bits 把 ready 错误拉低。
-  //
-  // 这样就能覆盖 TASK.md 提到的关键场景：
-  //   - StoreBuffer 还剩 3 个空槽；
-  //   - 本拍 4-wide 中实际只有 1 条 Store；
-  //   - 现在会正确放行，而不是被 “>= 4” 的保守判定误伤。
-  val sbNeedCount = Mux(in.valid, storeCount, 0.U)
-  val sbCanAlloc  = sbAlloc.availCount >= sbNeedCount // StoreBuffer 是否足够容纳本拍真实的 Store 请求
-  val iqCanAlloc  = iqAlloc.canAlloc // IssueQueue 是否有足够空间
+  // ROB 的 canAlloc 采用“fixed 4 空槽”语义，不依赖 request，避免与 Dispatch 构成组合环路；
+  // SB/IQ 则直接把各自的空槽计数 availCount 暴露出来，由 Dispatch 用 Rename 已经统计好的
+  // storeCount / validCount 做精确比较，同样绕开 request→canAlloc 的反向边。
+  val robCanAlloc = robAlloc.availCount >= validCount       // ROB 是否可以容纳 4 条
+  val sbCanAlloc  = sbAlloc.availCount  >= storeCount       // SB 是否足够容纳本拍真实的 Store 请求
+  val iqCanAlloc  = iqAlloc.availCount  >= validCount       // IQ 是否足够容纳本拍真实的有效指令
   val canDispatch = robCanAlloc && sbCanAlloc && iqCanAlloc // 所有资源充足才能派遣
-  val doDispatch  = in.valid && canDispatch && !flush      // 流水线冲刷时不派遣
+  val doDispatch  = in.valid && canDispatch && !flush       // 流水线冲刷时不派遣
 
-  // ---- 向 ROB、StoreBuffer、IssueQueue 发送分配请求，返回请求分配表项数目 ----
+  // ---- 向 ROB、StoreBuffer、IssueQueue 发送分配请求 ----
+  // 关键点：必须用 doDispatch 统一门控三者的 request，否则当其中一个资源不足导致 canDispatch=false 时，
+  //   ROB（其 doAlloc 仅看 request > 0）会误判为可分配并重复写入相同指令，
+  //   造成 ROB 表项污染与提交数据错乱。
   robAlloc.request := Mux(doDispatch, validCount, 0.U)
-  // request 仍然只在“真正派发成功”时拉高，确保 StoreBuffer 不会在 ROB / IQ 资源不足时提前消耗槽位。
-  // 精确的容量预判已经在上面的 sbNeedCount / availCount 比较中完成，因此这里保留原有的提交式语义即可。
-  sbAlloc.request := Mux(doDispatch, storeCount, 0.U)
-  iqAlloc.request := Mux(doDispatch, validCount, 0.U)
+  sbAlloc.request  := Mux(doDispatch, storeCount, 0.U)
+  iqAlloc.request  := Mux(doDispatch, validCount, 0.U)
 
   // ---- 计算每条 Store 指令在 StoreBuffer 分配返回指针中的偏移 ----
   // sbAlloc.idxs(0..3) 是连续分配的 StoreBuffer 指针，需要将它们按 Store 指令出现的先后顺序映射

@@ -29,22 +29,30 @@ class myCPU extends Module {
   val inst_addr_o = IO(Output(UInt(14.W)))
   val inst_i = IO(Input(UInt(128.W)))
 
-  // ---- LSU 外部存储器接口（DecoupledIO，替代旧的直连 DRAM 端口）----
-  val memReq  = IO(Decoupled(new MemReqBundle)) // 统一 Load/Store 请求
-  val memResp = IO(Flipped(Decoupled(new MemRespBundle))) // 统一响应
+  // ---- AXIStoreQueue 前端接口 ----
+  // myCPU 只暴露“commit enqueue / committed-query / load req&resp”前端协议，
+  // 由 SoC_Top 在核外实例化 AXIStoreQueue 并统一连接 DRAM。
+  val sqEnq = IO(new AXISQEnqIO)
+  val sqQuery = IO(new AXISQQueryIO)
+  val sqLoadReq = IO(new AXISQLoadReqIO)
+  val sqLoadResp = IO(new AXISQLoadRespIO)
 
   val io = IO(new Bundle {
     // ---- Commit 阶段观测端口（用于 difftest 对比仿真）----
-    val commit_valid     = Output(Bool())
-    val commit_pc        = Output(UInt(32.W))
-    val commit_reg_wen   = Output(Bool())
-    val commit_reg_waddr = Output(UInt(5.W))
-    val commit_reg_wdata = Output(UInt(32.W))
-    // ---- DRAM 写端口观测（difftest 用，由 drain 完成事件驱动）----
-    val commit_ram_wen   = Output(Bool())
-    val commit_ram_waddr = Output(UInt(32.W))
-    val commit_ram_wdata = Output(UInt(32.W))
-    val commit_ram_wmask = Output(UInt(3.W))
+    // 采用 Vec + commitCount 形式，支持一拍提交多条指令，
+    // 便于后续切换至乱序双发射/四发射时无需改动顶层与验证框架接口。
+    // 当前 commitWidth = 1；verilog 端会生成:
+    //   io_commit_count              -> 本拍提交的指令数（0..commitWidth）
+    //   io_commit_0_pc / _reg_wen / _reg_waddr / _reg_wdata / _is_store
+    //   io_commit_1_... (commitWidth>=2 时)
+    val commit_count = Output(UInt(log2Ceil(CPUConfig.commitWidth + 1).W))
+    val commit = Output(Vec(CPUConfig.commitWidth, new Bundle {
+      val pc        = UInt(32.W)
+      val is_store  = Bool()
+      val reg_wen   = Bool()
+      val reg_waddr = UInt(5.W)
+      val reg_wdata = UInt(32.W)
+    }))
   })
 
   // ---- 全局控制信号 ----
@@ -189,11 +197,6 @@ class myCPU extends Module {
   val uIssRRDff = Module(new BaseDff(new Issue_ReadReg_Payload, supportFlush = true))
   uIssRRDff.in <> uIssue.out
   uIssRRDff.flush.get := memRedirectValid
-  // ---- Load-Use 冒险检测信号连接 ----
-  // Issue 阶段需要知道紧邻的指令 IssRRDff 寄存器中是否是 Load
-  // 使用物理目的寄存器 pdst 进行冒险匹配
-  uIssue.hazard.pdst        := uIssRRDff.out.bits.pdst
-  uIssue.hazard.isValidLoad := uIssRRDff.out.valid && uIssRRDff.out.bits.type_decode_together(4)
 
   // =====================================================
   // ============ ReadReg（从 PRF 读取物理寄存器值）============
@@ -235,6 +238,22 @@ class myCPU extends Module {
   uExMemDff.in <> uExecute.out
   uExMemDff.flush.get := memRedirectValid
 
+  // ---- Load-Use 冒险检测信号连接 ----
+  // Issue 阶段需要知道下游所有尚未把 Load 数据写回 PRF 的 Load 位置，
+  // 以便在这些 Load 数据对 PRF 可见之前阻止依赖指令进入流水线。
+  // 覆盖 3 级：ReadReg(IssRRDff) / Execute(RRExDff) / Memory(ExMemDff)。
+  // Refresh 级（MemRefDff）本拍写 PRF，Issue 同拍放行的依赖指令在下一拍才 ReadReg 读 PRF，
+  // 已能看到新值，不必加入冒险源。
+  uIssue.hazard(0).pdst        := uIssRRDff.out.bits.pdst
+  uIssue.hazard(0).isValidLoad := uIssRRDff.out.valid &&
+    uIssRRDff.out.bits.type_decode_together(4) && uIssRRDff.out.bits.regWriteEnable
+  uIssue.hazard(1).pdst        := uRRExDff.out.bits.pdst
+  uIssue.hazard(1).isValidLoad := uRRExDff.out.valid &&
+    uRRExDff.out.bits.type_decode_together(4) && uRRExDff.out.bits.regWriteEnable
+  uIssue.hazard(2).pdst        := uExMemDff.out.bits.pdst
+  uIssue.hazard(2).isValidLoad := uExMemDff.out.valid &&
+    uExMemDff.out.bits.type_decode_together(4) && uExMemDff.out.bits.regWriteEnable
+
   // =====================================================
   // ============ Memory（访存 + StoreBuffer 转发 + 分支纠错重定向）============
   // =====================================================
@@ -253,16 +272,10 @@ class myCPU extends Module {
   memRedirectRobIdx       := uMemory.redirect.robIdx
   memRedirectStoreSeqSnap := uMemory.redirect.storeSeqSnap
 
-  // ---- LSU Arbiter（Load/Store 外部访存仲裁）----
-  val uLSUArbiter = Module(new LSUArbiter)
-
-  // Memory 阶段 Load 请求/响应 ↔ LSU Arbiter
-  uLSUArbiter.io.loadReq  <> uMemory.lsuLoadReq
-  uLSUArbiter.io.loadResp <> uMemory.lsuLoadResp
-
-  // LSU Arbiter ↔ 外部接口
-  memReq  <> uLSUArbiter.io.memReq
-  memResp <> uLSUArbiter.io.memResp
+  // Memory 阶段通过顶层暴露的 AXIStoreQueue 前端接口访问 committed queue / DRAM。
+  uMemory.sqQuery <> sqQuery
+  uMemory.sqLoadReq <> sqLoadReq
+  uMemory.sqLoadResp <> sqLoadResp
 
   // ROB 回滚：Memory redirect 时将 tail 回滚到误预测指令之后
   uROB.rollback.valid  := memRedirectValid
@@ -322,88 +335,50 @@ class myCPU extends Module {
   val commitBranch = uROB.commit.valid && uROB.commit.hasCheckpoint
   uBCT.io.freeValid := commitBranch
 
-  // Store 提交标记（通过 StoreBuffer 标记 committed）
-  // 关键：使用 headReady && headIsStore，不受 commitBlocked 门控
-  // 避免死锁：commitBlocked 依赖 drain 完成，drain 依赖 committed 标记
-  val headIsStore = uROB.commit.isStore  // ROB head 是否是 Store（headEntry 始终可读）
-  uStoreBuffer.commit.valid    := uROB.headReady && headIsStore
+  // Store 提交路径：
+  //   1. ROB head 是 Store 时，先按 storeSeq 向 SB 索引候选；
+  //   2. 只有 AXIStoreQueue enqueue 成功，同拍才允许 ROB 真正提交；
+  //   3. SB 也只在同一个 enqueue-success 脉冲下释放表项。
+  val headIsStore = uROB.commit.isStore
+  val headStoreLookupValid = uROB.headReady && headIsStore
+
+  uStoreBuffer.commit.valid := headStoreLookupValid
   uStoreBuffer.commit.storeSeq := uROB.commit.storeSeq
+  sqEnq.valid := headStoreLookupValid && uStoreBuffer.commit.entryValid
+  sqEnq.addr := uStoreBuffer.commit.addr
+  sqEnq.data := uStoreBuffer.commit.data
+  sqEnq.mask := uStoreBuffer.commit.mask
+  sqEnq.wordAddr := uStoreBuffer.commit.wordAddr
+  sqEnq.wstrb := uStoreBuffer.commit.wstrb
+  sqEnq.wdata := uStoreBuffer.commit.wdata
+  sqEnq.storeSeq := uROB.commit.storeSeq
 
-  // =====================================================
-  // ============ Store Drain 状态机（将 SB 写入外部存储器）============
-  // =====================================================
-  // 当 ROB head 是已完成的 Store 且 SB 有可 drain 表项时：
-  //   1. 发送 drain 写请求到 LSU Arbiter
-  //   2. 等待写响应返回
-  //   3. drainComplete → 解除 commitBlocked → ROB 提交 Store
-  //
-  // 状态机：sDrainIdle → sDrainSent → sDrainIdle（每个 Store 2 周期）
-  val sDrainIdle :: sDrainSent :: Nil = Enum(2)
-  val drainState = RegInit(sDrainIdle)
-  val drainComplete = WireDefault(false.B) // 当前周期 drain 是否完成
+  val sqEnqFire = sqEnq.valid && sqEnq.ready
+  uStoreBuffer.commit.enqSuccess := sqEnqFire
 
-  // 保存 drain 信息（用于 difftest 信号输出）
-  val savedDrainAddr = RegInit(0.U(32.W))
-  val savedDrainData = RegInit(0.U(32.W))
-  val savedDrainMask = RegInit(0.U(3.W))
-
-  // Drain 请求（通过 LSU Arbiter）
-  val drainReq = uLSUArbiter.io.drainReq
-  val drainResp = uLSUArbiter.io.drainResp
-
-  // 默认值
-  drainReq.valid := false.B
-  drainReq.bits  := 0.U.asTypeOf(new MemReqBundle)
-  drainResp.ready := false.B
-
-  switch(drainState) {
-    is(sDrainIdle) {
-      // 当 ROB head 是 Store 且 SB 有可 drain 表项时发送写请求
-      when(uROB.headReady && headIsStore && uStoreBuffer.drain.valid) {
-        drainReq.valid        := true.B
-        drainReq.bits.isWrite := true.B
-        drainReq.bits.addr    := Cat(uStoreBuffer.drain.wordAddr, 0.U(2.W)) // 字对齐地址
-        drainReq.bits.wdata   := uStoreBuffer.drain.wdata
-        drainReq.bits.wstrb   := uStoreBuffer.drain.wstrb
-        when(drainReq.fire) {
-          // 保存原始值用于 difftest
-          savedDrainAddr := uStoreBuffer.drain.addr
-          savedDrainData := uStoreBuffer.drain.data
-          savedDrainMask := uStoreBuffer.drain.mask
-          drainState := sDrainSent
-        }
-      }
-    }
-
-    is(sDrainSent) {
-      // 等待写响应
-      drainResp.ready := true.B
-      when(drainResp.fire) {
-        drainComplete := true.B
-        drainState := sDrainIdle
-      }
-    }
-  }
-
-  // StoreBuffer drainAck：写响应返回后释放 SB 槽位
-  uStoreBuffer.drain.drainAck := drainComplete
-
-  // ROB commitBlocked：ROB head 是 Store 且 drain 未完成时阻塞提交
-  uROB.commitBlocked := uROB.headReady && headIsStore && !drainComplete
-
-  // DRAM 写端口观测（difftest 用）：drain 完成时输出保存的原始值
-  io.commit_ram_wen   := drainComplete
-  io.commit_ram_waddr := savedDrainAddr
-  io.commit_ram_wdata := savedDrainData
-  io.commit_ram_wmask := savedDrainMask
+  // P0 语义：head store 只有成功进入 AXIStoreQueue 才算提交，否则持续阻塞 ROB head。
+  uROB.commitBlocked := uROB.headReady && headIsStore && !sqEnqFire
 
   // Commit 观测信号（供 difftest 使用）
-  // difftest 需要逻辑寄存器编号和数据
-  io.commit_valid     := uROB.commit.valid
-  io.commit_pc        := uROB.commit.pc
-  io.commit_reg_wen   := uROB.commit.regWen
-  io.commit_reg_waddr := uROB.commit.rd        // difftest 使用逻辑寄存器编号
-  io.commit_reg_wdata := uROB.commit.regWBData
+  // 现在 store 的 difftest 比对点已经前移到 AXIStoreQueue enqueue 成功同拍，
+  // 因此顶层可以直接使用这里的 commit 输出，不再额外做重排。
+  // Commit 观测信号（供 difftest 使用）
+  // 当前 ROB 仍为单条提交（commitWidth=1），因此只有 lane 0 真正输出信号。
+  // 后续若扩展 ROB 多条提交，只需新增 uROB.commitVec 并逐 lane 连接即可。
+  io.commit_count := Mux(uROB.commit.valid, 1.U, 0.U)
+  io.commit(0).pc        := uROB.commit.pc
+  io.commit(0).is_store  := uROB.commit.valid && uROB.commit.isStore
+  io.commit(0).reg_wen   := uROB.commit.regWen
+  io.commit(0).reg_waddr := uROB.commit.rd        // difftest 使用逻辑寄存器编号
+  io.commit(0).reg_wdata := uROB.commit.regWBData
+  // 如果 commitWidth > 1，多出的高位 lane 默认为无效。
+  for (i <- 1 until CPUConfig.commitWidth) {
+    io.commit(i).pc        := 0.U
+    io.commit(i).is_store  := false.B
+    io.commit(i).reg_wen   := false.B
+    io.commit(i).reg_waddr := 0.U
+    io.commit(i).reg_wdata := 0.U
+  }
 
   // =====================================================
   // ============ 分支恢复逻辑 ============
@@ -443,8 +418,7 @@ class myCPU extends Module {
   // 优先级（距离 Execute 越近的越优先）：
   //   1. Memory 级（Execute 前 1 条指令的结果，Load 除外——数据还没读回来）
   //   2. Refresh 级（Execute 前 2 条指令的结果，Load 数据已可用）
-  //   3. Post-Refresh 级（上一周期 Refresh 写回的结果，覆盖 Load-Use 停顿导致的转发间隙）
-  //   4. Commit 级（同周期正在提交的指令结果）
+  //   3. Commit 级（同周期正在提交的指令结果）
   //   兜底：ReadReg 阶段读取的寄存器值（经 RRExDff 传入）
 
   // 第 1 级旁路：来自 ExMemDff（Memory 级）
@@ -455,42 +429,13 @@ class myCPU extends Module {
   uExecute.fwd.mem_data := uExMemDff.out.bits.data
   uExecute.fwd.mem_wen  := wen_Memory
 
-  // Execute 级 Load-Use 冒险检测信号（用于检测 ExMemDff 中 Load 导致的 RAW 冒险）
-  uExecute.memLoadIsValid := uExMemDff.out.valid
-  uExecute.memLoadIsLoad  := uExMemDff.out.bits.type_decode_together(4)
-
   // 第 2 级旁路：来自 MemRefDff（Refresh 级，Load 数据已可用）
   val refWen = uMemRefDff.out.valid && uMemRefDff.out.bits.regWriteEnable
   uExecute.fwd.ref_pdst := uMemRefDff.out.bits.pdst
   uExecute.fwd.ref_data := uMemRefDff.out.bits.data
   uExecute.fwd.ref_wen  := refWen
 
-  // 第 3 级旁路：Post-Refresh（上一周期或更早 Refresh 写 PRF 的结果）
-  // 解决 Load-Use 停顿导致的转发间隙：当 Execute 因 Load-Use 冒险停顿时，
-  // MemRefDff 中的数据可能被下一条指令覆盖，而 ReadReg 读取 PRF 的时机早于该 Refresh
-  // 写入，导致 ReadReg 兜底值为旧值。此级用寄存器保存最近一次 Refresh 写入的
-  // {pdst, data, wen}，在停顿期间持续保持有效，直到 Execute 消耗指令后清除。
-  // 这样即使多周期停顿（如外部 Load 阻塞 Memory 导致 Load-Use 冒险持续多周期），
-  // 该转发源也不会丢失。
-  val postRefWen  = RegInit(false.B)
-  val postRefPdst = Reg(UInt(CPUConfig.prfAddrWidth.W))
-  val postRefData = Reg(UInt(32.W))
-  when(refreshValid) {
-    // 新的 Refresh 写回有效：捕获最新数据（优先于清除）
-    postRefWen  := true.B
-    postRefPdst := uRefresh.robRefresh.pdst
-    postRefData := uRefresh.robRefresh.regWBData
-  }.elsewhen(uRRExDff.out.fire) {
-    // Execute 成功消耗了一条指令（停顿已解除）：清除 Post-Refresh
-    // 新进入 Execute 的指令的 ReadReg 阶段在 Refresh 写入之后，PRF 已是最新值
-    postRefWen := false.B
-  }
-  // 停顿期间（refreshValid=false 且 Execute 未消耗）：隐式保持寄存器值不变
-  uExecute.fwd.postRef_pdst := postRefPdst
-  uExecute.fwd.postRef_data := postRefData
-  uExecute.fwd.postRef_wen  := postRefWen
-
-  // 第 4 级旁路：Commit 级（同周期 ROB 正在提交的指令结果）
+  // 第 3 级旁路：Commit 级（同周期 ROB 正在提交的指令结果）
   uExecute.fwd.commit_pdst := uROB.commit.pdst
   uExecute.fwd.commit_data := uROB.commit.regWBData
   uExecute.fwd.commit_wen  := uROB.commit.regWen
