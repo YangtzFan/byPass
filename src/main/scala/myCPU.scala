@@ -4,6 +4,7 @@ import chisel3._
 import chisel3.util._
 import mycpu.dataLane._
 import mycpu.device._
+import mycpu.memory._
 
 // ============================================================================
 // myCPU —— 10 级流水线 RISC-V RV32I 处理器核心（乱序四发射过渡版本 + 统一 PRF 方案）

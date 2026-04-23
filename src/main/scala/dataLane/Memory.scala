@@ -3,9 +3,9 @@ package mycpu.dataLane
 import chisel3._
 import chisel3.util._
 import mycpu.CPUConfig
-import mycpu.AXISQQueryIO
-import mycpu.AXISQLoadReqIO
-import mycpu.AXISQLoadRespIO
+import mycpu.memory.AXISQQueryIO
+import mycpu.memory.AXISQLoadReqIO
+import mycpu.memory.AXISQLoadRespIO
 
 // ============================================================================
 // Memory（访存阶段）—— StoreBuffer / AXIStoreQueue / DRAM 三级访存前端

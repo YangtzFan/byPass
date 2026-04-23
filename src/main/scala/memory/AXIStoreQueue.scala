@@ -1,4 +1,4 @@
-package mycpu
+package mycpu.memory
 
 import chisel3._
 import chisel3.util._
@@ -82,7 +82,7 @@ class AXISQMemRespIO extends Bundle {
 }
 
 // ---- AXIStoreQueue 调试输出接口 ----
-// difftest 现在在 store 成功进入 AXIStoreQueue 的同拍进行比对，
+// difftest 现在在 store 成功进入 AXIStoreQueue 的同拍进行比对，``
 // 因此该调试口直接反映 enqueue 握手成功时的原始 store 信息。
 class AXISQDebugIO extends Bundle {
   val commitRamWen   = Output(Bool())
