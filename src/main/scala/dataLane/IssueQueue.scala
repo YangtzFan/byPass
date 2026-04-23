@@ -148,12 +148,23 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
 
   // ===================== 回滚逻辑（Memory 重定向）=====================
   // flush 时清除所有有效条目；由于 IQ 中仅保存尚未发射的投机指令，直接全部丢弃即可。
-  // 注意：nextInstSeq 不再在 flush 时强制归零——与 StoreBuffer 保持一致，
-  // 让计数器自然回绕即可，循环比较仍然正确。
+  //
+  // 仿照 StoreBuffer 的 rollback 处理思路：在精确清理的同时，
+  // 将 nextInstSeq 重置为 0。原因如下：
+  //   1. 旧实现把 nextInstSeq 当成一个“永远只增、靠循环回绕维持正确性”的全局计数器。
+  //      虽然 seqOlderThan 使用了减法最高位、理论上对自然回绕鲁棒，但它要求“当前活跃
+  //      条目的最大序号距离”严格 < 2^(seqWidth-1)。一旦某次软件触发频繁的 flush + 大量
+  //      派发，nextInstSeq 在没有任何机会归零的情况下持续滚动，万一未来扩容 IQ、或
+  //      Dispatch 与 Issue 不再 1:1 对齐，活跃窗口就有可能逼近半区间，从而出现
+  //      “溢出后比较错位”的隐患。
+  //   2. flush 拍上所有 valid 表项都会被清空，没有任何遗留序号需要兼容；
+  //      此刻把 nextInstSeq 复位到 0，是与 StoreBuffer rollback 把 nextStoreSeq 复位到
+  //      snapshot 同构的精确做法，能让序号空间始终从最干净的状态重新出发。
   when(flush) {
     for (i <- 0 until depth) {
       validVec(i) := false.B
       freeVec(i)  := true.B
     }
+    nextInstSeq := 0.U
   }
 }

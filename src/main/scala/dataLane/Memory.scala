@@ -4,8 +4,6 @@ import chisel3._
 import chisel3.util._
 import mycpu.CPUConfig
 import mycpu.memory.AXISQQueryIO
-import mycpu.memory.AXISQLoadReqIO
-import mycpu.memory.AXISQLoadRespIO
 
 // ============================================================================
 // Memory（访存阶段）—— StoreBuffer / AXIStoreQueue / DRAM 三级访存前端
@@ -30,9 +28,10 @@ class Memory extends Module {
   val sbWrite = IO(Output(new SBWriteIO))
 
   // ---- AXIStoreQueue 前端接口 ----
-  val sqQuery = IO(new AXISQQueryIO)
-  val sqLoadReq = IO(new AXISQLoadReqIO)
-  val sqLoadResp = IO(new AXISQLoadRespIO)
+  // committed-store 查询为纯组合接口；外部读请求/响应统一改为 Decoupled。
+  val sqQuery    = IO(new AXISQQueryIO)
+  val sqLoadAddr  = IO(Decoupled(UInt(32.W)))
+  val sqLoadData = IO(Flipped(Decoupled(UInt(32.W))))
 
   // ---- Memory 阶段重定向输出 ----
   val redirect = IO(new Bundle {
@@ -105,10 +104,10 @@ class Memory extends Module {
   sqQuery.wordAddr := addr(31, 2)
   sqQuery.loadMask := 0.U
 
-  sqLoadReq.valid := false.B
-  sqLoadReq.addr := Cat(addr(31, 2), 0.U(2.W))
-  sqLoadReq.needMask := 0.U
-  sqLoadResp.ready := false.B
+  sqLoadAddr.valid := false.B
+  // 外部读取始终对齐到字（4 字节）边界。
+  sqLoadAddr.bits  := Cat(addr(31, 2), 0.U(2.W))
+  sqLoadData.ready := false.B
 
   // SQ forwarding 掩码只覆盖 SB 未覆盖的部分。
   val sqVisibleMask = WireInit(0.U(4.W))
@@ -193,9 +192,8 @@ class Memory extends Module {
           memStall := false.B
         }.otherwise {
           // 仍有未覆盖字节，需要通过 AXIStoreQueue 发起外部读。
-          sqLoadReq.valid := true.B
-          sqLoadReq.needMask := needAfterSQ
-          when(sqLoadReq.valid && sqLoadReq.ready) {
+          sqLoadAddr.valid := true.B
+          when(sqLoadAddr.fire) {
             savedSbFwdMask := sbFwdMask
             savedSbFwdData := sbQuery.fwdData
             savedSqFwdMask := sqVisibleMask
@@ -208,15 +206,15 @@ class Memory extends Module {
     }
 
     is(sWaitResp) {
-      sqLoadResp.ready := true.B
+      sqLoadData.ready := true.B
       memStall := true.B
-      when(sqLoadResp.valid && sqLoadResp.ready) {
+      when(sqLoadData.fire) {
         val mergedWord = mergeLoadSources(
           savedSbFwdMask,
           savedSbFwdData,
           savedSqFwdMask,
           savedSqFwdData,
-          sqLoadResp.rdata
+          sqLoadData.bits
         )
         loadResult := signExtendLoad(mergedWord, funct3, offset)
         memStall := false.B

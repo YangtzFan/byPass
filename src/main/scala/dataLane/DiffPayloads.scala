@@ -247,7 +247,6 @@ class SBCommitIO extends Bundle {
   val addr       = Input(UInt(32.W))                          // 原始 Store 完整字节地址（difftest 用）
   val data       = Input(UInt(32.W))                          // 原始 Store 数据（rs2 值，difftest 用）
   val mask       = Input(UInt(3.W))                           // 原始 Store 宽度掩码（funct3，difftest 用）
-  val wordAddr   = Input(UInt(30.W))                          // 字对齐地址（addr[31:2]）
   val wstrb      = Input(UInt(4.W))                           // 字节写使能掩码
   val wdata      = Input(UInt(32.W))                          // 字节对齐后的写数据
   val enqSuccess = Output(Bool())                             // AXIStoreQueue enqueue 成功脉冲：SB 仅在此时释放表项

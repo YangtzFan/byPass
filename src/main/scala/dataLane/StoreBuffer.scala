@@ -155,7 +155,7 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   commit.addr := commitEntry.addr
   commit.data := commitEntry.data
   commit.mask := commitEntry.mask
-  commit.wordAddr := commitEntry.addr(31, 2)
+  // commit.wordAddr 已不再被任何下游消费（AXIStoreQueue 自行从 addr 派生），故移除该冗余输出。
   commit.wstrb := commitEntry.byteMask
   commit.wdata := commitEntry.byteData
 

@@ -38,7 +38,7 @@ class SoC_Top extends Module {
     }))
   })
 
-  val coreCpu = Module(new myCPU)
+  val coreCpu = Module(new MyCPU)
   val axiStoreQueue = Module(new AXIStoreQueue)
 
   // ---- IROM ----
@@ -49,32 +49,14 @@ class SoC_Top extends Module {
   // ---- 内核前端接口 ↔ 核外 AXIStoreQueue ----
   coreCpu.sqEnq <> axiStoreQueue.enq
   coreCpu.sqQuery <> axiStoreQueue.query
-  coreCpu.sqLoadReq <> axiStoreQueue.loadReq
-  coreCpu.sqLoadResp <> axiStoreQueue.loadResp
+  coreCpu.sqLoadAddr <> axiStoreQueue.loadAddr
+  coreCpu.sqLoadData <> axiStoreQueue.loadData
 
-  // ---- DRAM 驱动器 ----
-  val uDramDriver = Module(new dram_driver)
-
-  // ========================================================================
-  // AXIStoreQueue 后端的一拍请求 / 响应适配
-  // dram_driver 本身是“组合读 + 时钟写”，而 AXIStoreQueue 已经在内部保证
-  // 任意时刻最多只有一笔后端请求在飞，所以这里不需要再维护额外状态机。
-  // 只需完成两件事：
-  //   1. 请求握手当拍，把地址/写数据直接送到 dram_driver；
-  //   2. 下一拍给 AXIStoreQueue 返回一个 response 脉冲，维持它当前的 waitResp 时序假设。
-  // ========================================================================
-  val memReqFire = axiStoreQueue.memReq.valid
-  val memRespValid = RegNext(memReqFire, false.B)
-  val memRespRdata = RegEnable(uDramDriver.io.rdata, 0.U(32.W), memReqFire)
-
-  axiStoreQueue.memReq.ready := true.B
-  axiStoreQueue.memResp.valid := memRespValid
-  axiStoreQueue.memResp.rdata := memRespRdata
-
-  uDramDriver.io.addr := axiStoreQueue.memReq.addr(17, 0)
-  uDramDriver.io.wdata := axiStoreQueue.memReq.wdata
-  uDramDriver.io.wstrb := axiStoreQueue.memReq.wstrb
-  uDramDriver.io.we := memReqFire && axiStoreQueue.memReq.isWrite
+  // ---- DRAM AXI Slave 接口适配器 ----
+  // AXIStoreQueue 以 AXI 主设备身份对外发送 read/write 请求，
+  // DRAM_AXIInterface 在内部将 AXI 时序桥接到原有的“组合读 + 时钟写”DRAM。
+  val uDramAxiIf = Module(new DRAM_AXIInterface)
+  axiStoreQueue.axi <> uDramAxiIf.axi
 
   // ------------------------------------------------------------------
   // 转发多条提交观测信号

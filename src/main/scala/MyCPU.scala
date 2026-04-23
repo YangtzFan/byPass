@@ -25,7 +25,7 @@ import mycpu.memory._
 //   6. 分支恢复：从 BranchCheckpointTable 恢复 RAT/FreeList/ReadyTable
 //   7. 数据旁路使用物理寄存器编号 pdst 进行匹配
 // ============================================================================
-class myCPU extends Module {
+class MyCPU extends Module {
   // ---- IROM 指令存储器接口 ----
   val inst_addr_o = IO(Output(UInt(14.W)))
   val inst_i = IO(Input(UInt(128.W)))
@@ -33,10 +33,10 @@ class myCPU extends Module {
   // ---- AXIStoreQueue 前端接口 ----
   // myCPU 只暴露“commit enqueue / committed-query / load req&resp”前端协议，
   // 由 SoC_Top 在核外实例化 AXIStoreQueue 并统一连接 DRAM。
-  val sqEnq = IO(new AXISQEnqIO)
+  val sqEnq = IO(Decoupled(new SQEnqPayload))
   val sqQuery = IO(new AXISQQueryIO)
-  val sqLoadReq = IO(new AXISQLoadReqIO)
-  val sqLoadResp = IO(new AXISQLoadRespIO)
+  val sqLoadAddr = IO(Decoupled(UInt(32.W)))
+  val sqLoadData = IO(Flipped(Decoupled(UInt(32.W))))
 
   val io = IO(new Bundle {
     // ---- Commit 阶段观测端口（用于 difftest 对比仿真）----
@@ -275,8 +275,8 @@ class myCPU extends Module {
 
   // Memory 阶段通过顶层暴露的 AXIStoreQueue 前端接口访问 committed queue / DRAM。
   uMemory.sqQuery <> sqQuery
-  uMemory.sqLoadReq <> sqLoadReq
-  uMemory.sqLoadResp <> sqLoadResp
+  uMemory.sqLoadAddr <> sqLoadAddr
+  uMemory.sqLoadData <> sqLoadData
 
   // ROB 回滚：Memory redirect 时将 tail 回滚到误预测指令之后
   uROB.rollback.valid  := memRedirectValid
@@ -346,15 +346,14 @@ class myCPU extends Module {
   uStoreBuffer.commit.valid := headStoreLookupValid
   uStoreBuffer.commit.storeSeq := uROB.commit.storeSeq
   sqEnq.valid := headStoreLookupValid && uStoreBuffer.commit.entryValid
-  sqEnq.addr := uStoreBuffer.commit.addr
-  sqEnq.data := uStoreBuffer.commit.data
-  sqEnq.mask := uStoreBuffer.commit.mask
-  sqEnq.wordAddr := uStoreBuffer.commit.wordAddr
-  sqEnq.wstrb := uStoreBuffer.commit.wstrb
-  sqEnq.wdata := uStoreBuffer.commit.wdata
-  sqEnq.storeSeq := uROB.commit.storeSeq
+  sqEnq.bits.addr := uStoreBuffer.commit.addr
+  sqEnq.bits.data := uStoreBuffer.commit.data
+  sqEnq.bits.mask := uStoreBuffer.commit.mask
+  sqEnq.bits.wstrb := uStoreBuffer.commit.wstrb
+  sqEnq.bits.wdata := uStoreBuffer.commit.wdata
+  sqEnq.bits.storeSeq := uROB.commit.storeSeq
 
-  val sqEnqFire = sqEnq.valid && sqEnq.ready
+  val sqEnqFire = sqEnq.fire
   uStoreBuffer.commit.enqSuccess := sqEnqFire
 
   // P0 语义：head store 只有成功进入 AXIStoreQueue 才算提交，否则持续阻塞 ROB head。
