@@ -4,6 +4,7 @@ import chisel3._
 import chisel3.util._
 import mycpu.dataLane._
 import mycpu.device._
+import mycpu.memory._
 
 // ============================================================================
 // myCPU —— 10 级流水线 RISC-V RV32I 处理器核心（乱序四发射过渡版本 + 统一 PRF 方案）
@@ -24,28 +25,35 @@ import mycpu.device._
 //   6. 分支恢复：从 BranchCheckpointTable 恢复 RAT/FreeList/ReadyTable
 //   7. 数据旁路使用物理寄存器编号 pdst 进行匹配
 // ============================================================================
-class myCPU extends Module {
+class MyCPU extends Module {
+  // ---- IROM 指令存储器接口 ----
+  val inst_addr_o = IO(Output(UInt(14.W)))
+  val inst_i = IO(Input(UInt(128.W)))
+
+  // ---- AXIStoreQueue 前端接口 ----
+  // myCPU 只暴露“commit enqueue / committed-query / load req&resp”前端协议，
+  // 由 SoC_Top 在核外实例化 AXIStoreQueue 并统一连接 DRAM。
+  val sqEnq = IO(Decoupled(new SQEnqPayload))
+  val sqQuery = IO(new AXISQQueryIO)
+  val sqLoadAddr = IO(Decoupled(UInt(32.W)))
+  val sqLoadData = IO(Flipped(Decoupled(UInt(32.W))))
+
   val io = IO(new Bundle {
-    // ---- IROM 指令存储器接口 ----
-    val inst_addr_o = Output(UInt(14.W))
-    val inst_i = Input(UInt(128.W))
-
-    // ---- DRAM 数据存储器读端口（Memory 阶段 Load 使用）----
-    val ram_addr_o  = Output(UInt(32.W))
-    val ram_mask_o  = Output(UInt(3.W))
-    val ram_rdata_i = Input(UInt(32.W))
-
     // ---- Commit 阶段观测端口（用于 difftest 对比仿真）----
-    val commit_valid     = Output(Bool())
-    val commit_pc        = Output(UInt(32.W))
-    val commit_reg_wen   = Output(Bool())
-    val commit_reg_waddr = Output(UInt(5.W))
-    val commit_reg_wdata = Output(UInt(32.W))
-    // ---- DRAM 写端口（仅 Commit 阶段 Store 才写入，通过 StoreBuffer）----
-    val commit_ram_wen   = Output(Bool())
-    val commit_ram_waddr  = Output(UInt(32.W))
-    val commit_ram_wdata = Output(UInt(32.W))
-    val commit_ram_wmask  = Output(UInt(3.W))
+    // 采用 Vec + commitCount 形式，支持一拍提交多条指令，
+    // 便于后续切换至乱序双发射/四发射时无需改动顶层与验证框架接口。
+    // 当前 commitWidth = 1；verilog 端会生成:
+    //   io_commit_count              -> 本拍提交的指令数（0..commitWidth）
+    //   io_commit_0_pc / _reg_wen / _reg_waddr / _reg_wdata / _is_store
+    //   io_commit_1_... (commitWidth>=2 时)
+    val commit_count = Output(UInt(log2Ceil(CPUConfig.commitWidth + 1).W))
+    val commit = Output(Vec(CPUConfig.commitWidth, new Bundle {
+      val pc        = UInt(32.W)
+      val is_store  = Bool()
+      val reg_wen   = Bool()
+      val reg_waddr = UInt(5.W)
+      val reg_wdata = UInt(32.W)
+    }))
   })
 
   // ---- 全局控制信号 ----
@@ -70,8 +78,8 @@ class myCPU extends Module {
   // =====================================================
   val uFetch = Module(new Fetch)
   uFetch.in <> uPc.out
-  io.inst_addr_o := uFetch.irom.inst_addr_o
-  uFetch.irom.inst_i := io.inst_i
+  inst_addr_o := uFetch.irom.inst_addr_o
+  uFetch.irom.inst_i := inst_i
   // ---- BHT 顶层实例化并连接到 Fetch ----
   val uBHT = Option.when(CPUConfig.useBHT)(Module(new BHT(CPUConfig.bhtEntries)))
   if (CPUConfig.useBHT) {
@@ -127,23 +135,21 @@ class myCPU extends Module {
   // ---- Rename ↔ FreeList 连接 ----
   uRename.freeList <> uFreeList.renameIO
 
-  // ---- Rename ↔ ReadyTable 连接（置 busy）----
+  // ---- Rename ↔ ReadyTable 连接（仅置 busy）----
   uReadyTable.io.busyVen  := uRename.readyTable.busyVen
   uReadyTable.io.busyAddr := uRename.readyTable.busyAddr
-  // ReadyTable 读端口暂时未使用（将来用于 IssueQueue wakeup），先绑 0
-  for (i <- 0 until 8) { uReadyTable.io.raddr(i) := 0.U }
+  // 阶段 1：ReadyTable 读端口改由 IssueQueue 入队当拍使用，避免 Rename→IQ
+  // 两级流水间丢失 wakeup。具体连接在 IssueQueue 实例化之后。
 
   // ---- Rename ↔ BranchCheckpointTable 连接（保存 checkpoint）----
   uBCT.renameRequest <> uRename.ckPointReq
 
   uBCT.save1.rat     := uRename.ckptRAT.postRename1
   uBCT.save1.flHead  := uFreeList.io.snapHead1
-  uBCT.save1.flTail  := uFreeList.io.snapTail
   uBCT.save1.readyTb := uReadyTable.io.snapData
 
   uBCT.save2.rat     := uRename.ckptRAT.postRename2
   uBCT.save2.flHead  := uFreeList.io.snapHead2
-  uBCT.save2.flTail  := uFreeList.io.snapTail
   uBCT.save2.readyTb := uReadyTable.io.snapData
 
   // =====================================================
@@ -175,6 +181,10 @@ class myCPU extends Module {
   uIssueQueue.alloc <> uDisp.iqAlloc
   uIssueQueue.write := uDisp.out
   uIssueQueue.flush := memRedirectValid
+  uIssueQueue.flushBranchRobIdx := memRedirectRobIdx
+  // 阶段 1：IssueQueue 同拍查询 ReadyTable（8 端口：4 条指令 × 2 源）
+  uReadyTable.io.raddr          := uIssueQueue.readyQuery.raddr
+  uIssueQueue.readyQuery.rdata  := uReadyTable.io.rdata
 
   // =====================================================
   // ============ Issue（当前 1-wide，Load-Use 冒险检测）============
@@ -182,19 +192,20 @@ class myCPU extends Module {
   val uIssue = Module(new Issue)
   // IssueQueue 发射选择接口 ↔ Issue 控制接口
   uIssue.flush := memRedirectValid
+  uIssue.flushBranchRobIdx := memRedirectRobIdx
   uIssue.iqIssue <> uIssueQueue.issue
 
   // =====================================================
   // ============ Issue → ReadReg 流水线寄存器（IssRRDff）============
   // =====================================================
-  val uIssRRDff = Module(new BaseDff(new Issue_ReadReg_Payload, supportFlush = true))
+  val uIssRRDff = Module(new BaseDff(
+    new Issue_ReadReg_Payload,
+    supportFlush = true,
+    getRobIdx = Some((b: Issue_ReadReg_Payload) => b.lanes(0).robIdx)
+  ))
   uIssRRDff.in <> uIssue.out
   uIssRRDff.flush.get := memRedirectValid
-  // ---- Load-Use 冒险检测信号连接 ----
-  // Issue 阶段需要知道紧邻的指令 IssRRDff 寄存器中是否是 Load
-  // 使用物理目的寄存器 pdst 进行冒险匹配
-  uIssue.hazard.pdst        := uIssRRDff.out.bits.pdst
-  uIssue.hazard.isValidLoad := uIssRRDff.out.valid && uIssRRDff.out.bits.type_decode_together(4)
+  uIssRRDff.flushBranchRobIdx.get := memRedirectRobIdx
 
   // =====================================================
   // ============ ReadReg（从 PRF 读取物理寄存器值）============
@@ -212,9 +223,14 @@ class myCPU extends Module {
   // =====================================================
   // ============ ReadReg → Execute 流水线寄存器（RRExDff）============
   // =====================================================
-  val uRRExDff = Module(new BaseDff(new ReadReg_Execute_Payload, supportFlush = true))
+  val uRRExDff = Module(new BaseDff(
+    new ReadReg_Execute_Payload,
+    supportFlush = true,
+    getRobIdx = Some((b: ReadReg_Execute_Payload) => b.lanes(0).robIdx)
+  ))
   uRRExDff.in <> uReadReg.out
   uRRExDff.flush.get := memRedirectValid
+  uRRExDff.flushBranchRobIdx.get := memRedirectRobIdx
 
   // =====================================================
   // ============ Execute（执行，ALU + 分支验证）============
@@ -232,35 +248,53 @@ class myCPU extends Module {
   // =====================================================
   // ============ Execute → Memory 流水线寄存器（ExMemDff）============
   // =====================================================
-  val uExMemDff = Module(new BaseDff(new Execute_Memory_Payload, supportFlush = true))
+  val uExMemDff = Module(new BaseDff(
+    new Execute_Memory_Payload,
+    supportFlush = true,
+    getRobIdx = Some((b: Execute_Memory_Payload) => b.lanes(0).robIdx)
+  ))
   uExMemDff.in <> uExecute.out
   uExMemDff.flush.get := memRedirectValid
+  uExMemDff.flushBranchRobIdx.get := memRedirectRobIdx
+
+  // ---- Load-Use 冒险检测信号连接 ----
+  // Issue 阶段需要知道下游所有尚未把 Load 数据写回 PRF 的 Load 位置，
+  // 以便在这些 Load 数据对 PRF 可见之前阻止依赖指令进入流水线。
+  // 覆盖 3 级：ReadReg(IssRRDff) / Execute(RRExDff) / Memory(ExMemDff)。
+  // Refresh 级（MemRefDff）本拍写 PRF，Issue 同拍放行的依赖指令在下一拍才 ReadReg 读 PRF，
+  // 已能看到新值，不必加入冒险源。
+  uIssue.hazard(0).pdst        := uIssRRDff.out.bits.lanes(0).pdst
+  uIssue.hazard(0).isValidLoad := uIssRRDff.out.valid &&
+    uIssRRDff.out.bits.lanes(0).type_decode_together(4) && uIssRRDff.out.bits.lanes(0).regWriteEnable
+  uIssue.hazard(1).pdst        := uRRExDff.out.bits.lanes(0).pdst
+  uIssue.hazard(1).isValidLoad := uRRExDff.out.valid &&
+    uRRExDff.out.bits.lanes(0).type_decode_together(4) && uRRExDff.out.bits.lanes(0).regWriteEnable
+  uIssue.hazard(2).pdst        := uExMemDff.out.bits.lanes(0).pdst
+  uIssue.hazard(2).isValidLoad := uExMemDff.out.valid &&
+    uExMemDff.out.bits.lanes(0).type_decode_together(4) && uExMemDff.out.bits.lanes(0).regWriteEnable
 
   // =====================================================
   // ============ Memory（访存 + StoreBuffer 转发 + 分支纠错重定向）============
   // =====================================================
   val uMemory = Module(new Memory)
   uMemory.in <> uExMemDff.out
-  io.ram_addr_o := uMemory.io.ram_addr_o
-  io.ram_mask_o := uMemory.io.ram_mask_o
-  uMemory.io.ram_rdata_i := io.ram_rdata_i
 
-  // ---- Store StoreBuffer 写入连接（Memory 阶段将地址和数据写入 StoreBuffer）----
+  // ---- Store StoreBuffer 写入连接（Memory 阶段将地址、数据、字节掩码写入 StoreBuffer）----
   uStoreBuffer.write := uMemory.sbWrite
 
-  // ---- Load StoreBuffer 查询连接（Memory 阶段指令查询 Store-to-Load 转发，使用 <> 自动连接）----
+  // ---- Load StoreBuffer 查询连接（Memory 阶段字节级转发查询）----
   uStoreBuffer.query <> uMemory.sbQuery
-
-  // ---- Memory 阶段 DRAM 端口冲突信号：drain 正在写时 Load 需要停顿 ----
-  // drain.valid 在 effectiveCommitted 旁路下可以在 Store commit 同周期为 true
-  // 此时 Load 不能读 DRAM，必须等 drain 完成后重试
-  uMemory.drainActive := uStoreBuffer.drain.valid
 
   // Memory 阶段重定向信号
   memRedirectValid        := uMemory.redirect.valid
   memRedirectAddr         := uMemory.redirect.addr
   memRedirectRobIdx       := uMemory.redirect.robIdx
   memRedirectStoreSeqSnap := uMemory.redirect.storeSeqSnap
+
+  // Memory 阶段通过顶层暴露的 AXIStoreQueue 前端接口访问 committed queue / DRAM。
+  uMemory.sqQuery <> sqQuery
+  uMemory.sqLoadAddr <> sqLoadAddr
+  uMemory.sqLoadData <> sqLoadData
 
   // ROB 回滚：Memory redirect 时将 tail 回滚到误预测指令之后
   uROB.rollback.valid  := memRedirectValid
@@ -309,6 +343,13 @@ class myCPU extends Module {
   uReadyTable.io.readyVen  := refreshValid
   uReadyTable.io.readyAddr := uRefresh.robRefresh.pdst
 
+  // ---- 阶段 1：Refresh → IssueQueue 的 wakeup 广播 ----
+  // 与 ReadyTable 置 ready 同拍发出：命中的 IQ 条目在下一拍把对应 src 置 ready。
+  // 由于 IQ 发射看到的是“寄存器化”的 ready 位，wakeup 与 issue 差一拍；
+  // 与此同时 Refresh 结果通过 3 级数据旁路送入 Execute，填补这一拍的数据空档。
+  uIssueQueue.wakeup(0).valid := refreshValid
+  uIssueQueue.wakeup(0).pdst  := uRefresh.robRefresh.pdst
+
   // ---- FreeList 释放（Commit 时将 stalePdst 归还）----
   // 条件：指令写寄存器 && ldst != x0（x0 不产生真正的物理寄存器分配）
   uFreeList.io.freeValid := commitRegWen
@@ -320,24 +361,55 @@ class myCPU extends Module {
   val commitBranch = uROB.commit.valid && uROB.commit.hasCheckpoint
   uBCT.io.freeValid := commitBranch
 
-  // Store 提交标记（通过 StoreBuffer 标记 committed）
-  val storeCommitValid = uROB.commit.valid && uROB.commit.isStore && !uROB.commit.mispredict
-  uStoreBuffer.commit.valid    := storeCommitValid
-  uStoreBuffer.commit.storeSeq := uROB.commit.storeSeq
+  // ---- 告知 BCT 本拍的 Refresh，用于维护每 slot 的 refreshedSinceSnap ----
+  // 避免分支恢复时陈旧 ReadyTable 快照把“已经就绪”的旧 pdst 重新标成 busy，
+  // 这是 ready-based IQ 发射在旁路/wakeup 之外必须补齐的一致性保护。
+  uBCT.io.refreshValid := refreshValid
+  uBCT.io.refreshAddr  := uRefresh.robRefresh.pdst
 
-  // DRAM 写端口：由 StoreBuffer 的 Drain 逻辑驱动
-  io.commit_ram_wen   := uStoreBuffer.drain.valid
-  io.commit_ram_waddr := uStoreBuffer.drain.addr
-  io.commit_ram_wdata := uStoreBuffer.drain.data
-  io.commit_ram_wmask := uStoreBuffer.drain.mask
+  // Store 提交路径：
+  //   1. ROB head 是 Store 时，先按 storeSeq 向 SB 索引候选；
+  //   2. 只有 AXIStoreQueue enqueue 成功，同拍才允许 ROB 真正提交；
+  //   3. SB 也只在同一个 enqueue-success 脉冲下释放表项。
+  val headIsStore = uROB.commit.isStore
+  val headStoreLookupValid = uROB.headReady && headIsStore
+
+  uStoreBuffer.commit.valid := headStoreLookupValid
+  uStoreBuffer.commit.storeSeq := uROB.commit.storeSeq
+  sqEnq.valid := headStoreLookupValid && uStoreBuffer.commit.entryValid
+  sqEnq.bits.addr := uStoreBuffer.commit.addr
+  sqEnq.bits.data := uStoreBuffer.commit.data
+  sqEnq.bits.mask := uStoreBuffer.commit.mask
+  sqEnq.bits.wstrb := uStoreBuffer.commit.wstrb
+  sqEnq.bits.wdata := uStoreBuffer.commit.wdata
+  sqEnq.bits.storeSeq := uROB.commit.storeSeq
+
+  val sqEnqFire = sqEnq.fire
+  uStoreBuffer.commit.enqSuccess := sqEnqFire
+
+  // P0 语义：head store 只有成功进入 AXIStoreQueue 才算提交，否则持续阻塞 ROB head。
+  uROB.commitBlocked := uROB.headReady && headIsStore && !sqEnqFire
 
   // Commit 观测信号（供 difftest 使用）
-  // difftest 需要逻辑寄存器编号和数据
-  io.commit_valid     := uROB.commit.valid
-  io.commit_pc        := uROB.commit.pc
-  io.commit_reg_wen   := uROB.commit.regWen
-  io.commit_reg_waddr := uROB.commit.rd        // difftest 使用逻辑寄存器编号
-  io.commit_reg_wdata := uROB.commit.regWBData
+  // 现在 store 的 difftest 比对点已经前移到 AXIStoreQueue enqueue 成功同拍，
+  // 因此顶层可以直接使用这里的 commit 输出，不再额外做重排。
+  // Commit 观测信号（供 difftest 使用）
+  // 当前 ROB 仍为单条提交（commitWidth=1），因此只有 lane 0 真正输出信号。
+  // 后续若扩展 ROB 多条提交，只需新增 uROB.commitVec 并逐 lane 连接即可。
+  io.commit_count := Mux(uROB.commit.valid, 1.U, 0.U)
+  io.commit(0).pc        := uROB.commit.pc
+  io.commit(0).is_store  := uROB.commit.valid && uROB.commit.isStore
+  io.commit(0).reg_wen   := uROB.commit.regWen
+  io.commit(0).reg_waddr := uROB.commit.rd        // difftest 使用逻辑寄存器编号
+  io.commit(0).reg_wdata := uROB.commit.regWBData
+  // 如果 commitWidth > 1，多出的高位 lane 默认为无效。
+  for (i <- 1 until CPUConfig.commitWidth) {
+    io.commit(i).pc        := 0.U
+    io.commit(i).is_store  := false.B
+    io.commit(i).reg_wen   := false.B
+    io.commit(i).reg_waddr := 0.U
+    io.commit(i).reg_wdata := 0.U
+  }
 
   // =====================================================
   // ============ 分支恢复逻辑 ============
@@ -361,7 +433,6 @@ class myCPU extends Module {
   // FreeList 恢复
   uFreeList.io.recover     := memRedirectValid
   uFreeList.io.recoverHead := uBCT.io.recoverFLHead
-  uFreeList.io.recoverTail := uBCT.io.recoverFLTail
 
   // ReadyTable 恢复
   uReadyTable.io.recover     := memRedirectValid
@@ -382,20 +453,16 @@ class myCPU extends Module {
 
   // 第 1 级旁路：来自 ExMemDff（Memory 级）
   // 使用物理目的寄存器 pdst 进行旁路匹配
-  val wen_Memory = uExMemDff.out.valid && uExMemDff.out.bits.regWriteEnable &&
-    !uExMemDff.out.bits.type_decode_together(4)  // Load 此时数据不可用
-  uExecute.fwd.mem_pdst := uExMemDff.out.bits.pdst
-  uExecute.fwd.mem_data := uExMemDff.out.bits.data
+  val wen_Memory = uExMemDff.out.valid && uExMemDff.out.bits.lanes(0).regWriteEnable &&
+    !uExMemDff.out.bits.lanes(0).type_decode_together(4)  // Load 此时数据不可用
+  uExecute.fwd.mem_pdst := uExMemDff.out.bits.lanes(0).pdst
+  uExecute.fwd.mem_data := uExMemDff.out.bits.lanes(0).data
   uExecute.fwd.mem_wen  := wen_Memory
 
-  // Execute 级 Load-Use 冒险检测信号（用于检测 ExMemDff 中 Load 导致的 RAW 冒险）
-  uExecute.memLoadIsValid := uExMemDff.out.valid
-  uExecute.memLoadIsLoad  := uExMemDff.out.bits.type_decode_together(4)
-
   // 第 2 级旁路：来自 MemRefDff（Refresh 级，Load 数据已可用）
-  val refWen = uMemRefDff.out.valid && uMemRefDff.out.bits.regWriteEnable
-  uExecute.fwd.ref_pdst := uMemRefDff.out.bits.pdst
-  uExecute.fwd.ref_data := uMemRefDff.out.bits.data
+  val refWen = uMemRefDff.out.valid && uMemRefDff.out.bits.lanes(0).regWriteEnable
+  uExecute.fwd.ref_pdst := uMemRefDff.out.bits.lanes(0).pdst
+  uExecute.fwd.ref_data := uMemRefDff.out.bits.lanes(0).data
   uExecute.fwd.ref_wen  := refWen
 
   // 第 3 级旁路：Commit 级（同周期 ROB 正在提交的指令结果）

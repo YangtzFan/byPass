@@ -5,7 +5,6 @@ import chisel3.util._
 import mycpu.CPUConfig
 import mycpu.device.RATReadWriteIO
 import mycpu.device.RenameIO
-import chisel3.{UIntIntf => i}
 import mycpu.device.saveRequestRename
 
 // ============================================================================
@@ -118,12 +117,20 @@ class Rename extends Module {
     for (j <- 0 until i) { // 如果更老的 lane j 写了同一逻辑寄存器，使用其 pdst
       when(needAlloc(j) && rds(j) === rs1s(i) && rs1s(i) =/= 0.U) { psrc1s(i) := pdsts(j) }
       when(needAlloc(j) && rds(j) === rs2s(i) && rs2s(i) =/= 0.U) { psrc2s(i) := pdsts(j) }
-      when(needAlloc(j) && rds(j) === rds(i) && rds(i) =/= 0.U) { stalePdsts(i) := pdsts(j) }
+      when(needAlloc(j) && rds(j) === rds(i) && rds(i) =/= 0.U)   { stalePdsts(i) := pdsts(j) }
     }
     when(rs1s(i) === 0.U) { psrc1s(i) := 0.U } // x0 永远映射到 p0
     when(rs2s(i) === 0.U) { psrc2s(i) := 0.U }
-    when(rds(i) === 0.U) { stalePdsts(i) := 0.U }
+    when(rds(i) === 0.U)  { stalePdsts(i) := 0.U }
   }
+  // 阶段 1 设计决策：src{1,2}Ready 改为在 IQ 入队当拍读取 ReadyTable，
+  // 而不是在 Rename 阶段提前读取。原因：Rename→IQ 之间存在两级流水寄存器
+  // （RenDisDff、Dispatch 内部逻辑、DispatchEntry 本身），中间若发生
+  // wakeup（Refresh 到 ReadyTable 的 set），在 Rename 阶段提前采样会丢失
+  // 该事件，导致 IQ 表项初始 ready 仍为 false 且后续 wakeup 已过，形成死锁。
+  // 改为 IQ 入队当拍读 ReadyTable 后，采样时刻与 wakeup 状态机对齐，
+  // 同一批内被 bypass 的源（指向本批新分配 pdst）在 2 拍前已被 busy，
+  // 此时读出 false，天然满足“等待唤醒”的语义，无需额外 bypassed 标记。
 
   // ---- ReadyTable 置 busy（新分配的 pdst 还没有执行结果）----
   for (i <- 0 until 4) {
@@ -205,6 +212,7 @@ class Rename extends Module {
                                                   Mux(secondPredictedBranch(i), ckPointReq.saveIdx2, 0.U))
     // hasCheckpoint：第一个和第二个被预测分支都为 true（各自对应不同的 BCT 表项）
     out.bits.entries(i).hasCheckpoint        := firstPredictedBranch(i) || secondPredictedBranch(i)
+    // 阶段 1：IQ 入队当拍读取 ReadyTable 获得 src{1,2}Ready 初值（见 IssueQueue.scala）。
   }
   out.bits.validCount := PopCount(in.bits.map(_.valid))
   out.bits.storeCount := PopCount((in.bits.map(_.valid) zip memWriteEnables).map {

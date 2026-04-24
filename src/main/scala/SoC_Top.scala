@@ -1,62 +1,92 @@
 package mycpu
 
 import chisel3._
+import chisel3.util._
 import mycpu.memory._
+import mycpu.dataLane._
 
 // ============================================================================
-// SoC_Top —— 片上系统顶层模块
+// SoC_Top —— 片上系统顶层
 // ============================================================================
-// 将 CPU 核心、指令存储器（IROM）、数据存储器驱动（DRAM driver）连接在一起
-// 并对外暴露 difftest 调试接口
+// 新架构中，AXIStoreQueue 被放在核外：
+//   1. myCPU 仅暴露前端 enqueue / query / load req&resp 接口；
+//   2. AXIStoreQueue 统一仲裁 committed store 写回和 load miss 外读；
+//   3. DRAM 仍沿用当前的一拍请求 / 响应适配器；
+//   4. difftest 现在允许在 store 成功写入 AXIStoreQueue 的同拍进行比对，
+//      因此顶层不再需要额外缓存 commit / store-write 事件来重排观察时机。
 // ============================================================================
 class SoC_Top extends Module {
-  val io = IO(new Bundle {
-    // ---- difftest 调试观测端口（供仿真框架对比验证）----
-    val debug_commit_have_inst = Output(Bool())    // 本周期是否有指令提交
-    val debug_commit_pc = Output(UInt(32.W))       // 提交指令的 PC
-    val debug_commit_reg_wen = Output(Bool())          // 是否写寄存器
-    val debug_commit_reg_waddr = Output(UInt(5.W))     // 写入的寄存器编号
-    val debug_commit_reg_wdata = Output(UInt(32.W))    // 写入的数据值
+  // difftest 多条提交观测：
+  //   1) io.debug_commit_count 标示本周期 commit 的指令条数（0..commitWidth）；
+  //   2) 每个 lane 有独立的 pc / reg_wen / reg_waddr / reg_wdata / is_store；
+  //   3) 每个 lane 有独立的 ram_wen / ram_waddr / ram_wdata / ram_wmask；
+  // 当前 commitWidth=1，但接口已按 Vec 暴露，后续扩宽 retire 时只需改配置。
+  val commitWidth = CPUConfig.commitWidth
 
-    val debug_commit_ram_wen = Output(Bool())    // 写入的数据值
-    val debug_commit_ram_waddr = Output(UInt(32.W))    // 写入的数据值
-    val debug_commit_ram_wdata = Output(UInt(32.W))    // 写入的数据值
-    val debug_commit_ram_wmask = Output(UInt(32.W))    // 写入的数据值
+  val io = IO(new Bundle {
+    val debug_commit_count = Output(UInt(log2Ceil(commitWidth + 1).W))
+    val debug_commit = Output(Vec(commitWidth, new Bundle {
+      val pc        = UInt(32.W)
+      val reg_wen   = Bool()
+      val reg_waddr = UInt(5.W)
+      val reg_wdata = UInt(32.W)
+
+      val ram_wen   = Bool()
+      val ram_waddr = UInt(32.W)
+      val ram_wdata = UInt(32.W)
+      val ram_wmask = UInt(32.W)
+    }))
   })
 
-  // CPU 核心实例
-  val coreCpu = Module(new myCPU)
+  val coreCpu = Module(new MyCPU)
+  val axiStoreQueue = Module(new AXIStoreQueue)
 
-  // ---- IROM（指令 ROM，只读）----
-  // 128 位宽单读端口，每次返回 4 条指令
-  val memIrom = Module(new IROM)
-  memIrom.io.a := coreCpu.io.inst_addr_o       // CPU 输出 14 位地址
-  coreCpu.io.inst_i := memIrom.io.spo          // IROM 返回 128 位指令数据
+  // ---- IROM ----
+  val irom = Module(new IROM)
+  irom.io.a := coreCpu.inst_addr_o
+  coreCpu.inst_i := irom.io.spo
 
-  // ---- DRAM 驱动器（数据存储器读写控制）----
-  // DRAM 的读写端口被 Load 和 Store 共享，通过 MUX 切换
-  // Store 优先（Commit 阶段写入时，地址/掩码切换为 Store 的）
-  val uDramDriver = Module(new dram_driver)
+  // ---- 内核前端接口 ↔ 核外 AXIStoreQueue ----
+  coreCpu.sqEnq <> axiStoreQueue.enq
+  coreCpu.sqQuery <> axiStoreQueue.query
+  coreCpu.sqLoadAddr <> axiStoreQueue.loadAddr
+  coreCpu.sqLoadData <> axiStoreQueue.loadData
 
-  // 地址和掩码：Store 优先于 Load
-  uDramDriver.io.perip_addr := Mux(coreCpu.io.commit_ram_wen,
-    coreCpu.io.commit_ram_waddr(17, 0),       // Store 地址
-    coreCpu.io.ram_addr_o(17, 0))            // Load 地址
-  uDramDriver.io.perip_wdata := coreCpu.io.commit_ram_wdata  // Store 写数据
-  uDramDriver.io.perip_mask := Mux(coreCpu.io.commit_ram_wen,
-    coreCpu.io.commit_ram_wmask,              // Store 宽度掩码
-    coreCpu.io.ram_mask_o)                     // Load 宽度掩码
-  uDramDriver.io.dram_wen := coreCpu.io.commit_ram_wen       // 写使能
-  coreCpu.io.ram_rdata_i := uDramDriver.io.perip_rdata         // DRAM 读回数据
+  // ---- DRAM AXI Slave 接口适配器 ----
+  // AXIStoreQueue 以 AXI 主设备身份对外发送 read/write 请求，
+  // DRAM_AXIInterface 在内部将 AXI 时序桥接到原有的“组合读 + 时钟写”DRAM。
+  val uDramAxiIf = Module(new DRAM_AXIInterface)
+  axiStoreQueue.axi <> uDramAxiIf.axi
 
-  // ---- Commit 阶段调试观测 ----
-  io.debug_commit_have_inst := coreCpu.io.commit_valid
-  io.debug_commit_pc        := coreCpu.io.commit_pc
-  io.debug_commit_reg_wen   := coreCpu.io.commit_reg_wen
-  io.debug_commit_reg_waddr := coreCpu.io.commit_reg_waddr
-  io.debug_commit_reg_wdata := coreCpu.io.commit_reg_wdata
-  io.debug_commit_ram_wen   := coreCpu.io.commit_ram_wen
-  io.debug_commit_ram_waddr := coreCpu.io.commit_ram_waddr
-  io.debug_commit_ram_wdata := coreCpu.io.commit_ram_wdata
-  io.debug_commit_ram_wmask := coreCpu.io.commit_ram_wmask
+  // ------------------------------------------------------------------
+  // 转发多条提交观测信号
+  // ------------------------------------------------------------------
+  // commit_count 由核内 ROB 提交端直接给出。
+  // 当前实现中 axiStoreQueue.debug.commitRamWen 一拍内至多有 1 个 store 成功入队，
+  // 与 commitWidth=1 场景完全对应；一旦扩宽到多提交，需在 AXIStoreQueue
+  // debug 接口中同步提供 Vec 形式，否则多 lane 的 ram 观测会失准。
+  io.debug_commit_count := coreCpu.io.commit_count
+
+  // lane 0：寄存器写回信息来自 coreCpu.io.commit(0)，store 信息来自 axiStoreQueue.debug。
+  io.debug_commit(0).pc        := Mux(coreCpu.io.commit_count =/= 0.U, coreCpu.io.commit(0).pc, 0.U)
+  io.debug_commit(0).reg_wen   := coreCpu.io.commit(0).reg_wen
+  io.debug_commit(0).reg_waddr := Mux(coreCpu.io.commit(0).reg_wen, coreCpu.io.commit(0).reg_waddr, 0.U)
+  io.debug_commit(0).reg_wdata := Mux(coreCpu.io.commit(0).reg_wen, coreCpu.io.commit(0).reg_wdata, 0.U)
+
+  io.debug_commit(0).ram_wen   := axiStoreQueue.debug.commitRamWen
+  io.debug_commit(0).ram_waddr := Mux(axiStoreQueue.debug.commitRamWen, axiStoreQueue.debug.commitRamWaddr, 0.U)
+  io.debug_commit(0).ram_wdata := Mux(axiStoreQueue.debug.commitRamWen, axiStoreQueue.debug.commitRamWdata, 0.U)
+  io.debug_commit(0).ram_wmask := Mux(axiStoreQueue.debug.commitRamWen, axiStoreQueue.debug.commitRamWmask, 0.U)
+
+  // 高位 lane 在 commitWidth>1 时使用。当前保持安全默认值。
+  for (i <- 1 until commitWidth) {
+    io.debug_commit(i).pc        := 0.U
+    io.debug_commit(i).reg_wen   := false.B
+    io.debug_commit(i).reg_waddr := 0.U
+    io.debug_commit(i).reg_wdata := 0.U
+    io.debug_commit(i).ram_wen   := false.B
+    io.debug_commit(i).ram_waddr := 0.U
+    io.debug_commit(i).ram_wdata := 0.U
+    io.debug_commit(i).ram_wmask := 0.U
+  }
 }

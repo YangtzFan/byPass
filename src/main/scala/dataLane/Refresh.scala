@@ -20,15 +20,15 @@ class Refresh extends Module {
   // ---- ROB 完成标记接口 ----
   val robRefresh = IO(new ROBRefreshIO)
 
+  // ---- 阶段 2 lane 访问别名（refreshWidth=1，仅使用 lanes(0)）----
+  val inL = in.bits.lanes(0)
+
   // ROB 完成：组合逻辑直接透传
-  robRefresh.valid          := in.valid
-  robRefresh.idx            := in.bits.robIdx
-  robRefresh.regWBData      := in.bits.data
-  robRefresh.actualTaken    := in.bits.actual_taken
-  robRefresh.actualTarget   := in.bits.actual_target
-  robRefresh.mispredict     := in.bits.mispredict
-  robRefresh.pdst           := in.bits.pdst           // 物理目的寄存器（PRF 写入 + ReadyTable 标记 ready）
-  robRefresh.regWriteEnable := in.bits.regWriteEnable // 是否需要写回
+  robRefresh.valid          := in.valid && in.bits.validMask(0)
+  robRefresh.idx            := inL.robIdx
+  robRefresh.regWBData      := inL.data
+  robRefresh.pdst           := inL.pdst           // 物理目的寄存器（PRF 写入 + ReadyTable 标记 ready）
+  robRefresh.regWriteEnable := inL.regWriteEnable // 是否需要写回
 
   in.ready := true.B  // Refresh 始终准备好接收
 }

@@ -28,16 +28,36 @@ object CPUConfig {
   // ---- FetchBuffer 参数 ----
   val fetchBufferEntries: Int = 16 // FetchBuffer 容量
 
+  // ---- Commit 参数 ----
+  // 提交宽度：一拍内 ROB 最多按序提交几条指令。
+  // 过渡期暂定 1；后续做完“乱序发射 + 双宽 retire”后会提升到 2。
+  // difftest 验证框架已按 Vec 接口接入，此处修改即可自动扩展验证路径。
+  val commitWidth: Int = 1
+
+  // ---- OoO 后端宽度参数（TASK 3.1 草拟；阶段 1-2 全部保持 1，后续阶段再向上翻）----
+  // 这些参数从“过渡期默认 1”起步，所有下游模块都按 Vec(width, T) 接口铺管；
+  // 扩展到 2 / 4 发射时只需修改这里，并在对应阶段打开 Vec 内部的并行逻辑。
+  val issueWidth:    Int = 1                      // 每拍 Issue 发射数（= Vec 宽度）
+  val executeWidth:  Int = issueWidth             // 每拍 Execute 执行数（约束：≥ issueWidth）
+  val memoryWidth:   Int = issueWidth             // 每拍 Memory 处理数（≥ 发访存指令的 lane 数）
+  val refreshWidth:  Int = executeWidth           // 每拍 Refresh 写回数（= executeWidth）
+  val prfReadPorts:  Int = 2 * issueWidth         // PRF 读口数（每 lane 2 个源操作数）
+  val prfWritePorts: Int = refreshWidth           // PRF 写口数（= refreshWidth）
+
   // ---- IssueQueue 参数 ----
   val issueQueueEntries: Int = 16  // IssueQueue 容量
   val iqIdxWidth: Int = log2Ceil(issueQueueEntries)  // IssueQueue 物理槽位索引位宽（4 位）
-  val instSeqWidth: Int = 32       // instSeq 指令逻辑年龄位宽（32 位，避免回绕）
+  // instSeq 采用循环序号 + 减法最高位比较（与 StoreBuffer 的 storeSeq 同构）。
+  // 只要活跃条目数（≤ issueQueueEntries = 16）远小于半区间 2^(instSeqWidth-1)，
+  // 比较即正确；这里取 8 位，半区间 128 >> 16，留足余量且与 storeSeqWidth 保持一致。
+  val instSeqWidth: Int = 8
 
   // ---- StoreBuffer 参数 ----
   val sbEntries: Int = 32                   // StoreBuffer 深度
   val sbIdxWidth: Int = log2Ceil(sbEntries) // StoreBuffer 索引位宽（5 位）
-  val sbPtrWidth: Int = sbIdxWidth + 1      // StoreBuffer 指针位宽（含回绕位，6 位）——保留兼容
-  val storeSeqWidth: Int = 32               // storeSeq 逻辑年龄位宽（使用 32 位避免回绕导致的比较错误）
+  val storeSeqWidth: Int = 8                // storeSeq 逻辑年龄位宽（8 位，使用循环比较处理回绕，半区间 128 > sbEntries 故安全）
+  val axiSqEntries: Int = 16                // AXIStoreQueue 深度：保存已提交但尚未写回 DRAM 的 store
+  val axiSqStoreBurstLimit: Int = 8         // 在有 load miss 等待时，最多连续优先处理的 store 数量，避免 load 饥饿
 
   // ---- PRF（物理寄存器堆）参数 ----
   val prfEntries: Int = 128                    // 物理寄存器数量（p0~p127）

@@ -3,128 +3,249 @@ package mycpu.dataLane
 import chisel3._
 import chisel3.util._
 import mycpu.CPUConfig
+import mycpu.memory.AXISQQueryIO
 
 // ============================================================================
-// Memory（访存阶段，原 MEM）+ 分支纠错重定向 + StoreBuffer 转发
+// Memory（访存阶段）—— StoreBuffer / AXIStoreQueue / DRAM 三级访存前端
 // ============================================================================
-// - Load 指令：
-//     1. 先检查 StoreBuffer 中是否有更老的 Store 命中同一地址
-//        a) 如果有且地址已知 → 从 StoreBuffer 转发数据
-//        b) 如果有更老的 Store 但地址未知 → 流水线停顿（等待 Store 地址计算完成）
-//        c) 没有匹配 → 从 DRAM 读取数据
-//     2. 最终输出 Load 读回的数据
-// - Store 指令：在此阶段写入DRAM
-//   延迟到 Commit 阶段才实际写入内存
-// - 其他指令：直接透传 Execute 阶段的结果
+// 新版 load 处理顺序：
+//   1. 先查 StoreBuffer（speculative store）；
+//   2. 若无 olderUnknown，再按剩余 needMask 查 AXIStoreQueue（committed store）；
+//   3. 若仍未 full cover，向 AXIStoreQueue 发起外部读请求；
+//   4. 最终按优先级 StoreBuffer > AXIStoreQueue > DRAM 合并字节。
 //
-// 分支纠错重定向：
-//   - Execute 在上一阶段计算分支真值并标记 mispredict
-//   - Memory 阶段读取 mispredict 标志，输出重定向信号到 PC 模块
-//   - 同时冲刷 Memory 级前面所有流水寄存器，回退 ROB 指针
-//   - PC 优先级：Memory redirect > Fetch predict > sequential
+// 这样可以同时保证：
+//   - 更老未知地址 store 仍会阻断 load；
+//   - 已提交但未落地 DRAM 的 store 仍对后续 load 可见；
+//   - 同一个 load 的不同字节可以分别来自 SB / SQ / DRAM。
 // ============================================================================
 class Memory extends Module {
-  val in  = IO(Flipped(Decoupled(new Execute_Memory_Payload)))  // 输入：来自 ExMemDff
-  val out = IO(Decoupled(new Memory_Refresh_Payload))           // 输出：送往 MemRefDff → Refresh
+  val in = IO(Flipped(Decoupled(new Execute_Memory_Payload)))
+  val out = IO(Decoupled(new Memory_Refresh_Payload))
 
-  // ---- DRAM 读端口接口（Load 使用）----
-  val io = IO(new Bundle {
-    val ram_addr_o  = Output(UInt(32.W))          // DRAM 读地址
-    val ram_mask_o  = Output(UInt(3.W))           // 访存宽度掩码
-    val ram_rdata_i = Input(UInt(32.W))           // DRAM 读回数据
-  })
+  // ---- StoreBuffer 接口 ----
+  val sbQuery = IO(new SBQueryIO)
+  val sbWrite = IO(Output(new SBWriteIO))
+
+  // ---- AXIStoreQueue 前端接口 ----
+  // committed-store 查询为纯组合接口；外部读请求/响应统一改为 Decoupled。
+  val sqQuery    = IO(new AXISQQueryIO)
+  val sqLoadAddr  = IO(Decoupled(UInt(32.W)))
+  val sqLoadData = IO(Flipped(Decoupled(UInt(32.W))))
 
   // ---- Memory 阶段重定向输出 ----
   val redirect = IO(new Bundle {
-    val valid        = Output(Bool())                              // 需要重定向
-    val addr         = Output(UInt(32.W))                          // 正确的跳转目标地址
-    val robIdx       = Output(UInt(CPUConfig.robPtrWidth.W))       // 误预测指令的 ROB 指针（用于 ROB 回滚）
-    val storeSeqSnap = Output(UInt(CPUConfig.storeSeqWidth.W))     // 误预测指令的 storeSeqSnap（用于 StoreBuffer 精确回滚）
-    val checkpointIdx = Output(UInt(CPUConfig.ckptPtrWidth.W)) // 误预测指令的 checkpoint 全指针（含回绕位，用于 BCT 恢复）
+    val valid = Output(Bool())
+    val addr = Output(UInt(32.W))
+    val robIdx = Output(UInt(CPUConfig.robPtrWidth.W))
+    val storeSeqSnap = Output(UInt(CPUConfig.storeSeqWidth.W))
+    val checkpointIdx = Output(UInt(CPUConfig.ckptPtrWidth.W))
   })
 
-  // ---- StoreBuffer 写入端口（将 Store 地址和数据写入 StoreBuffer）----
-  val sbWrite = IO(Output(new SBWriteIO))
+  // ---- 阶段 2 lane 访问别名（memoryWidth=1，仅使用 lanes(0)）----
+  val inL  = in.bits.lanes(0)
+  val outL = out.bits.lanes(0)
+  out.bits := DontCare
+  out.bits.validMask := in.bits.validMask
 
-  // ---- StoreBuffer 查询接口（Load 指令需要检查 Store-to-Load 转发）----
-  val sbQuery = IO(new SBQueryIO)
+  // 指令类型解码
+  val uType = inL.type_decode_together(8)
+  val jal   = inL.type_decode_together(7)
+  val jalr  = inL.type_decode_together(6)
+  val bType = inL.type_decode_together(5)
+  val lType = inL.type_decode_together(4)
+  val iType = inL.type_decode_together(3)
+  val sType = inL.type_decode_together(2)
+  val rType = inL.type_decode_together(1)
+  val addr  = inL.data
 
-  // ---- 外部 Store drain 信号：当 drain 正在写 DRAM 时，Load 不能读 DRAM（端口冲突）----
-  val drainActive = IO(Input(Bool()))
+  val offset = addr(1, 0)
+  val funct3 = inL.inst_funct3
+  val func3_OH = UIntToOH(funct3(1, 0))
 
-  // 从类型编码中提取各指令类型
-  val uType = in.bits.type_decode_together(8)
-  val jal   = in.bits.type_decode_together(7)
-  val jalr  = in.bits.type_decode_together(6)
-  val lType = in.bits.type_decode_together(4)  // Load
-  val iType = in.bits.type_decode_together(3)
-  val sType = in.bits.type_decode_together(2)  // Store
-  val rType = in.bits.type_decode_together(1)
-
-  // ---- StoreBuffer 写入（Store 指令）
-  sbWrite.valid := in.valid && sType && in.bits.isSbAlloc
-  sbWrite.idx   := in.bits.sbIdx
-  sbWrite.addr  := in.bits.data                // Store 地址 = rs1 + 立即数（ALU 计算结果）
-  sbWrite.data  := in.bits.reg_rdata2          // Store 数据 = rs2 的值
-  sbWrite.mask  := in.bits.inst_funct3         // Store 宽度掩码 = funct3
-
-  // ---- StoreBuffer 查询（Load 指令）----
-  sbQuery.valid        := in.valid && lType
-  sbQuery.addr         := in.bits.data       // Load 地址 = ALU 计算结果
-  sbQuery.storeSeqSnap := in.bits.storeSeqSnap  // 只查 storeSeq < snap 的更老 Store
-
-  // ---- Store-to-Load 冒险检测 ----
-  // 停顿条件（hit 或 pending 任一成立）：
-  //   hit=true：有更老 Store 地址命中但当前不支持字节/半字提取的转发，需等 Store drain 后读 DRAM
-  //   pending=true：有更老 Store 地址未知，可能冲突，需等 Store 地址写入后重新检查
-  val sbStall = sbQuery.hit || sbQuery.pending
-
-  // ---- DRAM 端口冲突停顿 ----
-  // 当 Store drain 正在占用 DRAM 端口时，Load 必须停顿（否则读到 Store 地址对应的数据）
-  // 只有 Load 指令需要 DRAM 端口，其他指令不受影响
-  val dramConflict = lType && drainActive
-
-  // 综合停顿信号：SB 停顿或 DRAM 端口冲突（仅 Load 时有效）
-  val memStall = sbStall || dramConflict
-
-  // DRAM 读端口：只有 Load 指令且不从 StoreBuffer 转发时才需要读 DRAM
-  io.ram_addr_o := Mux(lType && !sbQuery.hit, in.bits.data, 0.U)
-  io.ram_mask_o := Mux(lType, in.bits.inst_funct3, 0.U)
-
-  // ---- 重定向逻辑 ----
-  // 当 Execute 阶段检测到分支预测错误时，Memory 阶段发出重定向信号
-  redirect.valid        := in.valid && in.bits.mispredict && !memStall
-  redirect.addr         := in.bits.actual_target
-  redirect.robIdx       := in.bits.robIdx
-  redirect.storeSeqSnap := in.bits.storeSeqSnap  // 传递给 StoreBuffer 用于精确回滚
-  redirect.checkpointIdx := in.bits.checkpointIdx // 传递 checkpoint 索引用于 BCT 恢复
-
-  // ---- Load 数据来源选择 ----
-  // 优先级：StoreBuffer 转发 > DRAM 读取
-  val loadData = Mux(sbQuery.hit, sbQuery.data, io.ram_rdata_i)
-
-  // ---- 输出结果打包 ----
-  out.bits.pc := in.bits.pc
-  out.bits.inst_rd := Mux(uType || jal || jalr || lType || iType || rType, in.bits.inst_rd, 0.U)
-  out.bits.pdst := Mux(uType || jal || jalr || lType || iType || rType, in.bits.pdst, 0.U) // 物理目的寄存器透传
-  out.bits.data := MuxCase(0.U, Seq(
-    (uType || jal || jalr || iType || rType) -> in.bits.data,  // 非访存指令：透传 ALU 结果
-    lType -> loadData                                           // Load：StoreBuffer 转发或 DRAM 读回
+  // ---- Store 字节对齐 ----
+  val storeRawData = inL.reg_rdata2
+  val storeByteMask = Mux1H(Seq(
+    func3_OH(0) -> (1.U(4.W) << offset),
+    func3_OH(1) -> Mux(offset(1), "b1100".U(4.W), "b0011".U(4.W)),
+    func3_OH(2) -> "b1111".U(4.W),
+    func3_OH(3) -> 0.U(4.W)
   ))
-  out.bits.type_decode_together := in.bits.type_decode_together
-  out.bits.robIdx         := in.bits.robIdx
-  out.bits.regWriteEnable := in.bits.regWriteEnable
-  out.bits.isBranch       := in.bits.isBranch
-  out.bits.isJump         := in.bits.isJump
-  out.bits.predict_taken  := in.bits.predict_taken
-  out.bits.predict_target := in.bits.predict_target
-  out.bits.actual_taken   := in.bits.actual_taken
-  out.bits.actual_target  := in.bits.actual_target
-  out.bits.mispredict     := in.bits.mispredict
-  out.bits.bht_meta       := in.bits.bht_meta
+  val storeByteData = Mux1H(Seq(
+    func3_OH(0) -> (storeRawData(7, 0) << (offset << 3.U)),
+    func3_OH(1) -> Mux(offset(1), Cat(storeRawData(15, 0), 0.U(16.W)), Cat(0.U(16.W), storeRawData(15, 0))),
+    func3_OH(2) -> storeRawData,
+    func3_OH(3) -> 0.U(32.W)
+  ))
 
-  // ---- 握手信号 ----
-  // StoreBuffer 地址未知停顿时：不消费输入，不输出
-  in.ready  := out.ready && !memStall
+  // ---- Load 字节需求 ----
+  val loadByteMask = Mux1H(Seq(
+    func3_OH(0) -> (1.U(4.W) << offset),
+    func3_OH(1) -> Mux(offset(1), "b1100".U(4.W), "b0011".U(4.W)),
+    func3_OH(2) -> "b1111".U(4.W),
+    func3_OH(3) -> 0.U(4.W)
+  ))
+
+  // ===================== StoreBuffer 写入 =====================
+  sbWrite.valid := in.valid && sType && inL.isSbAlloc
+  sbWrite.idx := inL.sbIdx
+  sbWrite.addr := addr
+  sbWrite.data := storeRawData
+  sbWrite.mask := funct3
+  sbWrite.byteMask := storeByteMask
+  sbWrite.byteData := storeByteData
+
+  // ===================== StoreBuffer 查询 =====================
+  sbQuery.valid := in.valid && lType
+  sbQuery.wordAddr := addr(31, 2)
+  sbQuery.loadMask := loadByteMask
+  sbQuery.storeSeqSnap := inL.storeSeqSnap
+
+  // SB 只负责 speculative store，因此先把它已经覆盖的字节扣掉，再去查 committed queue。
+  val sbFwdMask = sbQuery.fwdMask & loadByteMask
+  val needAfterSB = loadByteMask & ~sbFwdMask
+
+  // ===================== AXIStoreQueue 查询 / 外读接口默认值 =====================
+  sqQuery.valid := false.B
+  sqQuery.wordAddr := addr(31, 2)
+  sqQuery.loadMask := 0.U
+
+  sqLoadAddr.valid := false.B
+  // 外部读取始终对齐到字（4 字节）边界。
+  sqLoadAddr.bits  := Cat(addr(31, 2), 0.U(2.W))
+  sqLoadData.ready := false.B
+
+  // SQ forwarding 掩码只覆盖 SB 未覆盖的部分。
+  val sqVisibleMask = WireInit(0.U(4.W))
+  val sqVisibleData = WireInit(0.U(32.W))
+  val needAfterSQ = WireInit(needAfterSB)
+
+  when(in.valid && lType && !sbQuery.olderUnknown && (needAfterSB =/= 0.U)) {
+    sqQuery.valid := true.B
+    sqQuery.loadMask := needAfterSB
+    sqVisibleMask := sqQuery.fwdMask & needAfterSB
+    sqVisibleData := sqQuery.fwdData
+    needAfterSQ := needAfterSB & ~sqVisibleMask
+  }
+
+  // ===================== 状态机 =====================
+  val sIdle :: sWaitResp :: Nil = Enum(2)
+  val state = RegInit(sIdle)
+
+  // 进入等待外部读状态时，保存当拍的 SB/SQ forwarding 结果。
+  val savedSbFwdMask = RegInit(0.U(4.W))
+  val savedSbFwdData = RegInit(0.U(32.W))
+  val savedSqFwdMask = RegInit(0.U(4.W))
+  val savedSqFwdData = RegInit(0.U(32.W))
+
+  val memStall = WireInit(false.B)
+  val loadResult = WireInit(0.U(32.W))
+
+  // ---- 辅助函数：按优先级合并 SB / SQ / DRAM 三路字节来源 ----
+  private def mergeLoadSources(
+    sbMask: UInt,
+    sbData: UInt,
+    sqMask: UInt,
+    sqData: UInt,
+    dramData: UInt
+  ): UInt = {
+    val mergedBytes = Wire(Vec(4, UInt(8.W)))
+    for (b <- 0 until 4) {
+      mergedBytes(b) := Mux(
+        sbMask(b),
+        sbData(b * 8 + 7, b * 8),
+        Mux(
+          sqMask(b),
+          sqData(b * 8 + 7, b * 8),
+          dramData(b * 8 + 7, b * 8)
+        )
+      )
+    }
+    Cat(mergedBytes(3), mergedBytes(2), mergedBytes(1), mergedBytes(0))
+  }
+
+  // ---- 辅助函数：按 funct3 / offset 对合并后的 32 位字进行提取和扩展 ----
+  private def signExtendLoad(mergedWord: UInt, f3: UInt, off: UInt): UInt = {
+    val result = Wire(UInt(32.W))
+    val byte = (mergedWord >> (off << 3.U))(7, 0)
+    val half = Mux(off(1), mergedWord(31, 16), mergedWord(15, 0))
+    result := MuxLookup(f3, mergedWord)(Seq(
+      "b000".U -> Cat(Fill(24, byte(7)), byte),
+      "b001".U -> Cat(Fill(16, half(15)), half),
+      "b010".U -> mergedWord,
+      "b100".U -> Cat(0.U(24.W), byte),
+      "b101".U -> Cat(0.U(16.W), half)
+    ))
+    result
+  }
+
+  switch(state) {
+    is(sIdle) {
+      when(in.valid && lType) {
+        when(sbQuery.olderUnknown) {
+          // 更老 speculative store 地址未知时，必须先停住，不能越过这道边界。
+          memStall := true.B
+        }.elsewhen(needAfterSQ === 0.U) {
+          // SB + SQ 已经把本次 load 需要的字节全部覆盖，不需要访问 DRAM。
+          val fullyMergedWord = mergeLoadSources(
+            sbFwdMask,
+            sbQuery.fwdData,
+            sqVisibleMask,
+            sqVisibleData,
+            0.U(32.W)
+          )
+          loadResult := signExtendLoad(fullyMergedWord, funct3, offset)
+          memStall := false.B
+        }.otherwise {
+          // 仍有未覆盖字节，需要通过 AXIStoreQueue 发起外部读。
+          sqLoadAddr.valid := true.B
+          when(sqLoadAddr.fire) {
+            savedSbFwdMask := sbFwdMask
+            savedSbFwdData := sbQuery.fwdData
+            savedSqFwdMask := sqVisibleMask
+            savedSqFwdData := sqVisibleData
+            state := sWaitResp
+          }
+          memStall := true.B
+        }
+      }
+    }
+
+    is(sWaitResp) {
+      sqLoadData.ready := true.B
+      memStall := true.B
+      when(sqLoadData.fire) {
+        val mergedWord = mergeLoadSources(
+          savedSbFwdMask,
+          savedSbFwdData,
+          savedSqFwdMask,
+          savedSqFwdData,
+          sqLoadData.bits
+        )
+        loadResult := signExtendLoad(mergedWord, funct3, offset)
+        memStall := false.B
+        state := sIdle
+      }
+    }
+  }
+
+  // ===================== 重定向逻辑 =====================
+  redirect.valid := in.valid && inL.mispredict && !memStall
+  redirect.addr := inL.actual_target
+  redirect.robIdx := inL.robIdx
+  redirect.storeSeqSnap := inL.storeSeqSnap
+  redirect.checkpointIdx := inL.checkpointIdx
+
+  // ===================== 输出打包 =====================
+  outL.pdst := Mux(uType || jal || jalr || lType || iType || rType, inL.pdst, 0.U)
+  outL.data := Mux1H(Seq(
+    (uType || jal || jalr || iType || rType) -> inL.data,
+    lType -> loadResult,
+    (bType || sType) -> 0.U(32.W)
+  ))
+  outL.robIdx := inL.robIdx
+  outL.regWriteEnable := inL.regWriteEnable
+
+  in.ready := out.ready && !memStall
   out.valid := in.valid && !memStall
 }

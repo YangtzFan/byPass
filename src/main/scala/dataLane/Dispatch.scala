@@ -32,20 +32,26 @@ class Dispatch extends Module {
   val iqAlloc = IO(new IQAllocIO)
   val out = IO(Output(new IQWriteData))
 
-  val validCount = in.bits.validCount // 取出 Rename 统计的有效指令数量
-  val storeCount = in.bits.storeCount // 取出 Rename 统计的既是 store 又有效的指令数量
+  val validCount = in.bits.validCount // 取出 Rename 阶段统计的有效指令数量
+  val storeCount = in.bits.storeCount // 取出 Rename 阶段统计的既是 store 又有效的指令数量
 
   // ---- 派遣条件判断 ----
-  val robCanAlloc = robAlloc.canAlloc // ROB 是否可以容纳所有有效指令
-  val sbCanAlloc  = sbAlloc.canAlloc // StoreBuffer 是否有足够空间（仅当有 Store 指令时才需要检查）
-  val iqCanAlloc  = iqAlloc.canAlloc // IssueQueue 是否有足够空间
+  // ROB 的 canAlloc 采用“fixed 4 空槽”语义，不依赖 request，避免与 Dispatch 构成组合环路；
+  // SB/IQ 则直接把各自的空槽计数 availCount 暴露出来，由 Dispatch 用 Rename 已经统计好的
+  // storeCount / validCount 做精确比较，同样绕开 request→canAlloc 的反向边。
+  val robCanAlloc = robAlloc.availCount >= validCount       // ROB 是否可以容纳 4 条
+  val sbCanAlloc  = sbAlloc.availCount  >= storeCount       // SB 是否足够容纳本拍真实的 Store 请求
+  val iqCanAlloc  = iqAlloc.availCount  >= validCount       // IQ 是否足够容纳本拍真实的有效指令
   val canDispatch = robCanAlloc && sbCanAlloc && iqCanAlloc // 所有资源充足才能派遣
-  val doDispatch  = in.valid && canDispatch && !flush      // 流水线冲刷时不派遣
+  val doDispatch  = in.valid && canDispatch && !flush       // 流水线冲刷时不派遣
 
-  // ---- 向 ROB、StoreBuffer、IssueQueue 发送分配请求，返回请求分配表项数目 ----
+  // ---- 向 ROB、StoreBuffer、IssueQueue 发送分配请求 ----
+  // 关键点：必须用 doDispatch 统一门控三者的 request，否则当其中一个资源不足导致 canDispatch=false 时，
+  //   ROB（其 doAlloc 仅看 request > 0）会误判为可分配并重复写入相同指令，
+  //   造成 ROB 表项污染与提交数据错乱。
   robAlloc.request := Mux(doDispatch, validCount, 0.U)
-  sbAlloc.request := Mux(doDispatch, storeCount, 0.U)
-  iqAlloc.request := Mux(doDispatch, validCount, 0.U)
+  sbAlloc.request  := Mux(doDispatch, storeCount, 0.U)
+  // IQ 不再需要 request：其内部根据 iqWrite.valid/validCount 分配
 
   // ---- 计算每条 Store 指令在 StoreBuffer 分配返回指针中的偏移 ----
   // sbAlloc.idxs(0..3) 是连续分配的 StoreBuffer 指针，需要将它们按 Store 指令出现的先后顺序映射
@@ -72,17 +78,10 @@ class Dispatch extends Module {
 
     // ---- ROB 分配数据 ----
     robAlloc.data(i).pc            := entry.pc
-    robAlloc.data(i).inst          := entry.inst
     robAlloc.data(i).rd            := rd
     robAlloc.data(i).regWen        := entry.regWriteEnable
-    robAlloc.data(i).isLoad        := lType
     robAlloc.data(i).isStore       := sType
-    robAlloc.data(i).isBranch      := bType
-    robAlloc.data(i).isJump        := jal || jalr
     robAlloc.data(i).hasCheckpoint := entry.hasCheckpoint  // 从 Rename 传递：仅该组第一个被预测分支为 true
-    robAlloc.data(i).predictTaken  := entry.predict_taken
-    robAlloc.data(i).predictTarget := entry.predict_target
-    robAlloc.data(i).bhtMeta       := entry.bht_meta
     // Store 指令的 storeSeq：从 SBAllocIO 返回值中按 sbOffsets 映射获取
     // 非 Store 指令的 storeSeq 字段为 0（ROB Commit 时不会使用）
     robAlloc.data(i).storeSeq      := Mux(sType, sbAlloc.storeSeqs(sbOffsets(i)), 0.U)
@@ -120,8 +119,6 @@ class Dispatch extends Module {
     out.entries(i).psrc1                := entry.psrc1
     out.entries(i).psrc2                := entry.psrc2
     out.entries(i).pdst                 := entry.pdst
-    out.entries(i).stalePdst            := entry.stalePdst
-    out.entries(i).ldst                 := entry.ldst
     out.entries(i).checkpointIdx        := entry.checkpointIdx // 分支 checkpoint 索引透传
   }
   out.validCount := validCount // 来自 Rename 阶段的有效指令信息
