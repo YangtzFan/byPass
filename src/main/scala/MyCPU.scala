@@ -135,23 +135,21 @@ class MyCPU extends Module {
   // ---- Rename ↔ FreeList 连接 ----
   uRename.freeList <> uFreeList.renameIO
 
-  // ---- Rename ↔ ReadyTable 连接（置 busy）----
+  // ---- Rename ↔ ReadyTable 连接（仅置 busy）----
   uReadyTable.io.busyVen  := uRename.readyTable.busyVen
   uReadyTable.io.busyAddr := uRename.readyTable.busyAddr
-  // ReadyTable 读端口暂时未使用（将来用于 IssueQueue wakeup），先绑 0
-  for (i <- 0 until 8) { uReadyTable.io.raddr(i) := 0.U }
+  // 阶段 1：ReadyTable 读端口改由 IssueQueue 入队当拍使用，避免 Rename→IQ
+  // 两级流水间丢失 wakeup。具体连接在 IssueQueue 实例化之后。
 
   // ---- Rename ↔ BranchCheckpointTable 连接（保存 checkpoint）----
   uBCT.renameRequest <> uRename.ckPointReq
 
   uBCT.save1.rat     := uRename.ckptRAT.postRename1
   uBCT.save1.flHead  := uFreeList.io.snapHead1
-  uBCT.save1.flTail  := uFreeList.io.snapTail
   uBCT.save1.readyTb := uReadyTable.io.snapData
 
   uBCT.save2.rat     := uRename.ckptRAT.postRename2
   uBCT.save2.flHead  := uFreeList.io.snapHead2
-  uBCT.save2.flTail  := uFreeList.io.snapTail
   uBCT.save2.readyTb := uReadyTable.io.snapData
 
   // =====================================================
@@ -183,6 +181,10 @@ class MyCPU extends Module {
   uIssueQueue.alloc <> uDisp.iqAlloc
   uIssueQueue.write := uDisp.out
   uIssueQueue.flush := memRedirectValid
+  uIssueQueue.flushBranchRobIdx := memRedirectRobIdx
+  // 阶段 1：IssueQueue 同拍查询 ReadyTable（8 端口：4 条指令 × 2 源）
+  uReadyTable.io.raddr          := uIssueQueue.readyQuery.raddr
+  uIssueQueue.readyQuery.rdata  := uReadyTable.io.rdata
 
   // =====================================================
   // ============ Issue（当前 1-wide，Load-Use 冒险检测）============
@@ -190,14 +192,20 @@ class MyCPU extends Module {
   val uIssue = Module(new Issue)
   // IssueQueue 发射选择接口 ↔ Issue 控制接口
   uIssue.flush := memRedirectValid
+  uIssue.flushBranchRobIdx := memRedirectRobIdx
   uIssue.iqIssue <> uIssueQueue.issue
 
   // =====================================================
   // ============ Issue → ReadReg 流水线寄存器（IssRRDff）============
   // =====================================================
-  val uIssRRDff = Module(new BaseDff(new Issue_ReadReg_Payload, supportFlush = true))
+  val uIssRRDff = Module(new BaseDff(
+    new Issue_ReadReg_Payload,
+    supportFlush = true,
+    getRobIdx = Some((b: Issue_ReadReg_Payload) => b.lanes(0).robIdx)
+  ))
   uIssRRDff.in <> uIssue.out
   uIssRRDff.flush.get := memRedirectValid
+  uIssRRDff.flushBranchRobIdx.get := memRedirectRobIdx
 
   // =====================================================
   // ============ ReadReg（从 PRF 读取物理寄存器值）============
@@ -215,9 +223,14 @@ class MyCPU extends Module {
   // =====================================================
   // ============ ReadReg → Execute 流水线寄存器（RRExDff）============
   // =====================================================
-  val uRRExDff = Module(new BaseDff(new ReadReg_Execute_Payload, supportFlush = true))
+  val uRRExDff = Module(new BaseDff(
+    new ReadReg_Execute_Payload,
+    supportFlush = true,
+    getRobIdx = Some((b: ReadReg_Execute_Payload) => b.lanes(0).robIdx)
+  ))
   uRRExDff.in <> uReadReg.out
   uRRExDff.flush.get := memRedirectValid
+  uRRExDff.flushBranchRobIdx.get := memRedirectRobIdx
 
   // =====================================================
   // ============ Execute（执行，ALU + 分支验证）============
@@ -235,9 +248,14 @@ class MyCPU extends Module {
   // =====================================================
   // ============ Execute → Memory 流水线寄存器（ExMemDff）============
   // =====================================================
-  val uExMemDff = Module(new BaseDff(new Execute_Memory_Payload, supportFlush = true))
+  val uExMemDff = Module(new BaseDff(
+    new Execute_Memory_Payload,
+    supportFlush = true,
+    getRobIdx = Some((b: Execute_Memory_Payload) => b.lanes(0).robIdx)
+  ))
   uExMemDff.in <> uExecute.out
   uExMemDff.flush.get := memRedirectValid
+  uExMemDff.flushBranchRobIdx.get := memRedirectRobIdx
 
   // ---- Load-Use 冒险检测信号连接 ----
   // Issue 阶段需要知道下游所有尚未把 Load 数据写回 PRF 的 Load 位置，
@@ -245,15 +263,15 @@ class MyCPU extends Module {
   // 覆盖 3 级：ReadReg(IssRRDff) / Execute(RRExDff) / Memory(ExMemDff)。
   // Refresh 级（MemRefDff）本拍写 PRF，Issue 同拍放行的依赖指令在下一拍才 ReadReg 读 PRF，
   // 已能看到新值，不必加入冒险源。
-  uIssue.hazard(0).pdst        := uIssRRDff.out.bits.pdst
+  uIssue.hazard(0).pdst        := uIssRRDff.out.bits.lanes(0).pdst
   uIssue.hazard(0).isValidLoad := uIssRRDff.out.valid &&
-    uIssRRDff.out.bits.type_decode_together(4) && uIssRRDff.out.bits.regWriteEnable
-  uIssue.hazard(1).pdst        := uRRExDff.out.bits.pdst
+    uIssRRDff.out.bits.lanes(0).type_decode_together(4) && uIssRRDff.out.bits.lanes(0).regWriteEnable
+  uIssue.hazard(1).pdst        := uRRExDff.out.bits.lanes(0).pdst
   uIssue.hazard(1).isValidLoad := uRRExDff.out.valid &&
-    uRRExDff.out.bits.type_decode_together(4) && uRRExDff.out.bits.regWriteEnable
-  uIssue.hazard(2).pdst        := uExMemDff.out.bits.pdst
+    uRRExDff.out.bits.lanes(0).type_decode_together(4) && uRRExDff.out.bits.lanes(0).regWriteEnable
+  uIssue.hazard(2).pdst        := uExMemDff.out.bits.lanes(0).pdst
   uIssue.hazard(2).isValidLoad := uExMemDff.out.valid &&
-    uExMemDff.out.bits.type_decode_together(4) && uExMemDff.out.bits.regWriteEnable
+    uExMemDff.out.bits.lanes(0).type_decode_together(4) && uExMemDff.out.bits.lanes(0).regWriteEnable
 
   // =====================================================
   // ============ Memory（访存 + StoreBuffer 转发 + 分支纠错重定向）============
@@ -325,6 +343,13 @@ class MyCPU extends Module {
   uReadyTable.io.readyVen  := refreshValid
   uReadyTable.io.readyAddr := uRefresh.robRefresh.pdst
 
+  // ---- 阶段 1：Refresh → IssueQueue 的 wakeup 广播 ----
+  // 与 ReadyTable 置 ready 同拍发出：命中的 IQ 条目在下一拍把对应 src 置 ready。
+  // 由于 IQ 发射看到的是“寄存器化”的 ready 位，wakeup 与 issue 差一拍；
+  // 与此同时 Refresh 结果通过 3 级数据旁路送入 Execute，填补这一拍的数据空档。
+  uIssueQueue.wakeup(0).valid := refreshValid
+  uIssueQueue.wakeup(0).pdst  := uRefresh.robRefresh.pdst
+
   // ---- FreeList 释放（Commit 时将 stalePdst 归还）----
   // 条件：指令写寄存器 && ldst != x0（x0 不产生真正的物理寄存器分配）
   uFreeList.io.freeValid := commitRegWen
@@ -335,6 +360,12 @@ class MyCPU extends Module {
   // JAL 是无条件跳转，不保存 checkpoint，因此不能释放
   val commitBranch = uROB.commit.valid && uROB.commit.hasCheckpoint
   uBCT.io.freeValid := commitBranch
+
+  // ---- 告知 BCT 本拍的 Refresh，用于维护每 slot 的 refreshedSinceSnap ----
+  // 避免分支恢复时陈旧 ReadyTable 快照把“已经就绪”的旧 pdst 重新标成 busy，
+  // 这是 ready-based IQ 发射在旁路/wakeup 之外必须补齐的一致性保护。
+  uBCT.io.refreshValid := refreshValid
+  uBCT.io.refreshAddr  := uRefresh.robRefresh.pdst
 
   // Store 提交路径：
   //   1. ROB head 是 Store 时，先按 storeSeq 向 SB 索引候选；
@@ -402,7 +433,6 @@ class MyCPU extends Module {
   // FreeList 恢复
   uFreeList.io.recover     := memRedirectValid
   uFreeList.io.recoverHead := uBCT.io.recoverFLHead
-  uFreeList.io.recoverTail := uBCT.io.recoverFLTail
 
   // ReadyTable 恢复
   uReadyTable.io.recover     := memRedirectValid
@@ -423,16 +453,16 @@ class MyCPU extends Module {
 
   // 第 1 级旁路：来自 ExMemDff（Memory 级）
   // 使用物理目的寄存器 pdst 进行旁路匹配
-  val wen_Memory = uExMemDff.out.valid && uExMemDff.out.bits.regWriteEnable &&
-    !uExMemDff.out.bits.type_decode_together(4)  // Load 此时数据不可用
-  uExecute.fwd.mem_pdst := uExMemDff.out.bits.pdst
-  uExecute.fwd.mem_data := uExMemDff.out.bits.data
+  val wen_Memory = uExMemDff.out.valid && uExMemDff.out.bits.lanes(0).regWriteEnable &&
+    !uExMemDff.out.bits.lanes(0).type_decode_together(4)  // Load 此时数据不可用
+  uExecute.fwd.mem_pdst := uExMemDff.out.bits.lanes(0).pdst
+  uExecute.fwd.mem_data := uExMemDff.out.bits.lanes(0).data
   uExecute.fwd.mem_wen  := wen_Memory
 
   // 第 2 级旁路：来自 MemRefDff（Refresh 级，Load 数据已可用）
-  val refWen = uMemRefDff.out.valid && uMemRefDff.out.bits.regWriteEnable
-  uExecute.fwd.ref_pdst := uMemRefDff.out.bits.pdst
-  uExecute.fwd.ref_data := uMemRefDff.out.bits.data
+  val refWen = uMemRefDff.out.valid && uMemRefDff.out.bits.lanes(0).regWriteEnable
+  uExecute.fwd.ref_pdst := uMemRefDff.out.bits.lanes(0).pdst
+  uExecute.fwd.ref_data := uMemRefDff.out.bits.lanes(0).data
   uExecute.fwd.ref_wen  := refWen
 
   // 第 3 级旁路：Commit 级（同周期 ROB 正在提交的指令结果）

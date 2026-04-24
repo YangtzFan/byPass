@@ -85,7 +85,6 @@ class AXIStoreQueue(val depth: Int = CPUConfig.axiSqEntries) extends Module {
   val head = RegInit(0.U(ptrWidth.W))
   val tail = RegInit(0.U(ptrWidth.W))
   val count = RegInit(0.U((ptrWidth + 1).W))
-
   private def idx(ptr: UInt): UInt = ptr(idxWidth - 1, 0)
   private def seqNewerOrEq(a: UInt, b: UInt): Bool = !(a - b)(seqWidth - 1)
 

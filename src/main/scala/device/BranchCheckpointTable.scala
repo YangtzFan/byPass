@@ -33,7 +33,6 @@ class saveRequestRename extends Bundle {
 class saveData extends Bundle { // checkpoint 保存的数据
   val rat     = Vec(32, UInt(CPUConfig.prfAddrWidth.W))
   val flHead  = UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W)
-  val flTail  = UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W)
   val readyTb = Vec(CPUConfig.prfEntries, Bool())
 }
 
@@ -53,14 +52,24 @@ class BranchCheckpointTable extends Module {
     // 恢复输出的数据
     val recoverRAT    = Output(Vec(32, UInt(CPUConfig.prfAddrWidth.W)))
     val recoverFLHead = Output(UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W))
-    val recoverFLTail = Output(UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W))
     val recoverReady  = Output(Vec(CPUConfig.prfEntries, Bool()))
     // ---- 释放 checkpoint（分支正确提交时）----
     val freeValid     = Input(Bool())
+    // ---- Refresh 通告：执行结果写回后，需要把 pdst 同步记录到所有在飞 checkpoint 的
+    //      “快照之后已就绪”位向量里，防止分支恢复时用陈旧快照覆盖掉已就绪的寄存器。
+    val refreshValid  = Input(Bool())
+    val refreshAddr   = Input(UInt(CPUConfig.prfAddrWidth.W))
   })
 
   // ---- checkpoint 存储 ----
   val ckPointTable = Reg(Vec(numCkpts, new saveData))
+
+  // ---- 每个 checkpoint slot 独立维护的 “快照之后已就绪” 位向量 ----
+  // 语义：refreshedSinceSnap(k)(p) = 1 表示自该 slot 上次被保存以来，物理寄存器 p 已经在 Refresh
+  // 阶段写回过结果。若发生分支预测失败，根据 recoverIdx 选出对应 slot，将其 OR 到快照 readyTb
+  // 上再输出，避免陈旧快照把“已经就绪”的寄存器重新标记为 busy，从而引发 IQ 中的永久等待。
+  // 占用约 numCkpts * prfEntries 个 bit（默认 8*128 = 1024 bit），开销可忽略。
+  val refreshedSinceSnap = RegInit(VecInit(Seq.fill(numCkpts)(VecInit(Seq.fill(CPUConfig.prfEntries)(false.B)))))
 
   // ---- FIFO 分配/释放管理 ----
   val head  = RegInit(0.U((ckptIdxW + 1).W)) // 最老分支的 checkpoint（释放端）
@@ -86,6 +95,36 @@ class BranchCheckpointTable extends Module {
     }
   }
 
+  // ---- 每拍维护 refreshedSinceSnap ----
+  // 默认：若本拍 Refresh 写回了某个 pdst，则把它记到所有 slot 的 refreshed 向量里
+  when(io.refreshValid && io.refreshAddr =/= 0.U) {
+    for (k <- 0 until numCkpts) {
+      refreshedSinceSnap(k)(io.refreshAddr) := true.B
+    }
+  }
+  // 若本拍正在保存新的 checkpoint，则对应 slot 的 refreshed 向量整体清零，
+  // 表示以保存时刻为基准重新开始追踪。
+  when(renameRequest.saveValid1) {
+    for (p <- 0 until CPUConfig.prfEntries) {
+      refreshedSinceSnap(idx(tail))(p) := false.B
+    }
+  }
+  when(renameRequest.saveValid2) {
+    for (p <- 0 until CPUConfig.prfEntries) {
+      refreshedSinceSnap(idx(tail + 1.U))(p) := false.B
+    }
+  }
+  // 同拍保存 + 同拍 Refresh：snapshot 取的是 Reg 更新前的值，不包含本拍 refresh，
+  // 因此清零后必须把本拍的 refresh 重新写回，避免真实“已就绪”位在恢复时丢失。
+  when(io.refreshValid && io.refreshAddr =/= 0.U) {
+    when(renameRequest.saveValid1) {
+      refreshedSinceSnap(idx(tail))(io.refreshAddr) := true.B
+    }
+    when(renameRequest.saveValid2) {
+      refreshedSinceSnap(idx(tail + 1.U))(io.refreshAddr) := true.B
+    }
+  }
+
   // ---- 恢复逻辑（分支预测失败时）----
   // 恢复时，tail 回退到 recoverIdx + 1（丢弃该分支及所有更年轻分支的 checkpoint）
   when(io.recoverValid) {
@@ -103,6 +142,9 @@ class BranchCheckpointTable extends Module {
   val ri = idx(io.recoverIdx) // 从全指针中提取索引位访问表项
   io.recoverRAT    := ckPointTable(ri).rat
   io.recoverFLHead := ckPointTable(ri).flHead
-  io.recoverFLTail := ckPointTable(ri).flTail
-  io.recoverReady  := ckPointTable(ri).readyTb
+  // 恢复时：原始 readyTb 快照 OR 对应 slot 的 refreshedSinceSnap，
+  // 把“比该分支更老、在快照后才真正就绪”的 pdst 也标记为 ready。
+  for (p <- 0 until CPUConfig.prfEntries) {
+    io.recoverReady(p) := ckPointTable(ri).readyTb(p) || refreshedSinceSnap(ri)(p)
+  }
 }

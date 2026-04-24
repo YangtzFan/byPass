@@ -48,9 +48,12 @@ class ReadyTable extends Module {
   val table = RegInit(VecInit(Seq.fill(CPUConfig.prfEntries)(true.B)))
 
   // ---- 批量恢复逻辑 ----
+  // 注意：恢复与 Refresh 同拍时，Refresh 来自比误预测分支更老的指令（位于 Memory/Refresh 级），
+  // 必须与 recover 合流，否则会丢失“同拍就绪”位，导致 IQ 内依赖该 pdst 的老指令永远等待。
   when(io.recover) {
     for (i <- 0 until CPUConfig.prfEntries) {
-      table(i) := io.recoverData(i)
+      val setByRefresh = io.readyVen && (io.readyAddr =/= 0.U) && (io.readyAddr === i.U)
+      table(i) := io.recoverData(i) || setByRefresh
     }
   }.otherwise {
     // ---- Rename 阶段：新分配的 pdst 置 busy ----

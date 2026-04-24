@@ -42,23 +42,29 @@ class Memory extends Module {
     val checkpointIdx = Output(UInt(CPUConfig.ckptPtrWidth.W))
   })
 
+  // ---- 阶段 2 lane 访问别名（memoryWidth=1，仅使用 lanes(0)）----
+  val inL  = in.bits.lanes(0)
+  val outL = out.bits.lanes(0)
+  out.bits := DontCare
+  out.bits.validMask := in.bits.validMask
+
   // 指令类型解码
-  val uType = in.bits.type_decode_together(8)
-  val jal   = in.bits.type_decode_together(7)
-  val jalr  = in.bits.type_decode_together(6)
-  val bType = in.bits.type_decode_together(5)
-  val lType = in.bits.type_decode_together(4)
-  val iType = in.bits.type_decode_together(3)
-  val sType = in.bits.type_decode_together(2)
-  val rType = in.bits.type_decode_together(1)
-  val addr  = in.bits.data
+  val uType = inL.type_decode_together(8)
+  val jal   = inL.type_decode_together(7)
+  val jalr  = inL.type_decode_together(6)
+  val bType = inL.type_decode_together(5)
+  val lType = inL.type_decode_together(4)
+  val iType = inL.type_decode_together(3)
+  val sType = inL.type_decode_together(2)
+  val rType = inL.type_decode_together(1)
+  val addr  = inL.data
 
   val offset = addr(1, 0)
-  val funct3 = in.bits.inst_funct3
+  val funct3 = inL.inst_funct3
   val func3_OH = UIntToOH(funct3(1, 0))
 
   // ---- Store 字节对齐 ----
-  val storeRawData = in.bits.reg_rdata2
+  val storeRawData = inL.reg_rdata2
   val storeByteMask = Mux1H(Seq(
     func3_OH(0) -> (1.U(4.W) << offset),
     func3_OH(1) -> Mux(offset(1), "b1100".U(4.W), "b0011".U(4.W)),
@@ -81,8 +87,8 @@ class Memory extends Module {
   ))
 
   // ===================== StoreBuffer 写入 =====================
-  sbWrite.valid := in.valid && sType && in.bits.isSbAlloc
-  sbWrite.idx := in.bits.sbIdx
+  sbWrite.valid := in.valid && sType && inL.isSbAlloc
+  sbWrite.idx := inL.sbIdx
   sbWrite.addr := addr
   sbWrite.data := storeRawData
   sbWrite.mask := funct3
@@ -93,7 +99,7 @@ class Memory extends Module {
   sbQuery.valid := in.valid && lType
   sbQuery.wordAddr := addr(31, 2)
   sbQuery.loadMask := loadByteMask
-  sbQuery.storeSeqSnap := in.bits.storeSeqSnap
+  sbQuery.storeSeqSnap := inL.storeSeqSnap
 
   // SB 只负责 speculative store，因此先把它已经覆盖的字节扣掉，再去查 committed queue。
   val sbFwdMask = sbQuery.fwdMask & loadByteMask
@@ -224,32 +230,21 @@ class Memory extends Module {
   }
 
   // ===================== 重定向逻辑 =====================
-  redirect.valid := in.valid && in.bits.mispredict && !memStall
-  redirect.addr := in.bits.actual_target
-  redirect.robIdx := in.bits.robIdx
-  redirect.storeSeqSnap := in.bits.storeSeqSnap
-  redirect.checkpointIdx := in.bits.checkpointIdx
+  redirect.valid := in.valid && inL.mispredict && !memStall
+  redirect.addr := inL.actual_target
+  redirect.robIdx := inL.robIdx
+  redirect.storeSeqSnap := inL.storeSeqSnap
+  redirect.checkpointIdx := inL.checkpointIdx
 
   // ===================== 输出打包 =====================
-  out.bits.pc := in.bits.pc
-  out.bits.inst_rd := Mux(uType || jal || jalr || lType || iType || rType, in.bits.inst_rd, 0.U)
-  out.bits.pdst := Mux(uType || jal || jalr || lType || iType || rType, in.bits.pdst, 0.U)
-  out.bits.data := Mux1H(Seq(
-    (uType || jal || jalr || iType || rType) -> in.bits.data,
+  outL.pdst := Mux(uType || jal || jalr || lType || iType || rType, inL.pdst, 0.U)
+  outL.data := Mux1H(Seq(
+    (uType || jal || jalr || iType || rType) -> inL.data,
     lType -> loadResult,
     (bType || sType) -> 0.U(32.W)
   ))
-  out.bits.type_decode_together := in.bits.type_decode_together
-  out.bits.robIdx := in.bits.robIdx
-  out.bits.regWriteEnable := in.bits.regWriteEnable
-  out.bits.isBranch := in.bits.isBranch
-  out.bits.isJump := in.bits.isJump
-  out.bits.predict_taken := in.bits.predict_taken
-  out.bits.predict_target := in.bits.predict_target
-  out.bits.actual_taken := in.bits.actual_taken
-  out.bits.actual_target := in.bits.actual_target
-  out.bits.mispredict := in.bits.mispredict
-  out.bits.bht_meta := in.bits.bht_meta
+  outL.robIdx := inL.robIdx
+  outL.regWriteEnable := inL.regWriteEnable
 
   in.ready := out.ready && !memStall
   out.valid := in.valid && !memStall

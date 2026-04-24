@@ -27,9 +27,11 @@ class LoadHazardSource extends Bundle {
 class Issue extends Module {
   val out = IO(Decoupled(new Issue_ReadReg_Payload))          // 输出：送往 IssRRDff → ReadReg
   val flush = IO(Input(Bool()))                               // 流水线冲刷信号
+  // OoO 场景下，flush 携带误预测分支的 robIdx，仅比它更年轻的条目才真正被丢弃。
+  val flushBranchRobIdx = IO(Input(UInt(CPUConfig.robPtrWidth.W)))
 
   // ---- IssueQueue 发射选择接口 ----
-  val iqIssue = IO(Flipped(new IQIssueIO))
+  val iqIssue = IO(Flipped(Decoupled(new DispatchEntry)))
 
   // ---- Load-Use 冒险检测接口 ----
   // 为避免 Post-Refresh 这一级旁路带来的复杂度，将全部 Load-Use 冒险检测上提到 Issue 阶段：
@@ -47,7 +49,7 @@ class Issue extends Module {
   val hazard = IO(Input(Vec(NumLoadHazardSrcs, new LoadHazardSource)))
 
   // ---- 从 IssueQueue 获取最老的有效指令 ----
-  val entry = iqIssue.entry
+  val entry = iqIssue.bits
   val entryValid = iqIssue.valid
 
   // ---- 指令字段提取 ----
@@ -77,32 +79,41 @@ class Issue extends Module {
   }.reduce(_ || _)
 
   // ---- 是否可以发射当前指令 ----
-  val canIssue = entryValid && !loadUseStall && !flush
+  // OoO 选择性 flush：即便处于 flush 拍，若当前待发射条目的 robIdx ≤ 分支 robIdx（即不比分支年轻），
+  // 仍允许其发射，使老指令继续推进以完成 ROB 提交，避免头阻塞死锁。
+  private val robW = CPUConfig.robPtrWidth
+  val entryYoungerThanBranch =
+    ((entry.robIdx - flushBranchRobIdx)(robW - 1) === 0.U) && (entry.robIdx =/= flushBranchRobIdx)
+  val canIssue = entryValid && !loadUseStall && (!flush || !entryYoungerThanBranch)
 
   // ---- 输出结果打包（最老指令信息）----
-  out.bits.pc                   := entry.pc
-  out.bits.inst                 := entry.inst
-  out.bits.imm                  := entry.imm
-  out.bits.type_decode_together := td
-  out.bits.predict_taken        := entry.predict_taken
-  out.bits.predict_target       := entry.predict_target
-  out.bits.bht_meta             := entry.bht_meta
-  out.bits.robIdx               := entry.robIdx
-  out.bits.regWriteEnable       := entry.regWriteEnable
-  out.bits.sbIdx                := entry.sbIdx
-  out.bits.isSbAlloc            := entry.isSbAlloc
-  out.bits.storeSeqSnap         := entry.storeSeqSnap
+  // 阶段 2 起 payload 改为 Vec(issueWidth, Lane)+validMask 形式；宽度 1 时
+  // 仅写 lanes(0)，其余 lane 置默认值（DontCare）。
+  out.bits := DontCare
+  val outLane0 = out.bits.lanes(0)
+  outLane0.pc                   := entry.pc
+  outLane0.inst                 := entry.inst
+  outLane0.imm                  := entry.imm
+  outLane0.type_decode_together := td
+  outLane0.predict_taken        := entry.predict_taken
+  outLane0.predict_target       := entry.predict_target
+  outLane0.bht_meta             := entry.bht_meta
+  outLane0.robIdx               := entry.robIdx
+  outLane0.regWriteEnable       := entry.regWriteEnable
+  outLane0.sbIdx                := entry.sbIdx
+  outLane0.isSbAlloc            := entry.isSbAlloc
+  outLane0.storeSeqSnap         := entry.storeSeqSnap
   // 物理寄存器映射信息透传
-  out.bits.psrc1                := entry.psrc1
-  out.bits.psrc2                := entry.psrc2
-  out.bits.pdst                 := entry.pdst
-  out.bits.stalePdst            := entry.stalePdst
-  out.bits.ldst                 := entry.ldst
-  out.bits.checkpointIdx        := entry.checkpointIdx // 分支 checkpoint 索引透传
+  outLane0.psrc1                := entry.psrc1
+  outLane0.psrc2                := entry.psrc2
+  outLane0.pdst                 := entry.pdst
+  outLane0.checkpointIdx        := entry.checkpointIdx // 分支 checkpoint 索引透传
+  // validMask：Issue 按 lane 标记实际有效位；宽度 1 时即 1.U
+  out.bits.validMask := canIssue.asUInt
 
   // ---- 握手信号 ----
   out.valid := canIssue
 
   // 通知 IssueQueue 确认发射，释放该槽位
-  iqIssue.fire := canIssue && out.ready
+  iqIssue.ready := canIssue && out.ready
 }

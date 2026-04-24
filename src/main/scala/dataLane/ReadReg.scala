@@ -29,8 +29,12 @@ class ReadReg extends Module {
     val rdata2 = Input(UInt(32.W))                         // psrc2 数据
   })
 
+  // ---- 阶段 2 lane 访问别名：当前 issueWidth=1，仅使用 lanes(0) ----
+  val inL  = in.bits.lanes(0)
+  val outL = out.bits.lanes(0)
+
   // ---- 指令类型提取 ----
-  val td    = in.bits.type_decode_together
+  val td    = inL.type_decode_together
   val jalr  = td(6)
   val bType = td(5)
   val lType = td(4)
@@ -43,31 +47,32 @@ class ReadReg extends Module {
   val use_rs2 = bType || sType || rType
 
   // ---- PRF 读取（使用物理寄存器编号）----
-  prfRead.raddr1 := Mux(use_rs1, in.bits.psrc1, 0.U)
-  prfRead.raddr2 := Mux(use_rs2, in.bits.psrc2, 0.U)
+  prfRead.raddr1 := Mux(use_rs1, inL.psrc1, 0.U)
+  prfRead.raddr2 := Mux(use_rs2, inL.psrc2, 0.U)
 
   // ---- 输出结果打包 ----
-  out.bits.pc                   := in.bits.pc
-  out.bits.inst                 := in.bits.inst
-  out.bits.robIdx               := in.bits.robIdx
-  out.bits.src1Data             := prfRead.rdata1 // PRF 读取的 psrc1 值（旁路链兜底值）
-  out.bits.src2Data             := prfRead.rdata2 // PRF 读取的 psrc2 值（旁路链兜底值）
-  out.bits.imm                  := in.bits.imm
-  out.bits.type_decode_together := td
-  out.bits.predict_taken        := in.bits.predict_taken
-  out.bits.predict_target       := in.bits.predict_target
-  out.bits.bht_meta             := in.bits.bht_meta
-  out.bits.regWriteEnable       := in.bits.regWriteEnable
-  out.bits.sbIdx                := in.bits.sbIdx
-  out.bits.isSbAlloc            := in.bits.isSbAlloc
-  out.bits.storeSeqSnap         := in.bits.storeSeqSnap  // 传递 storeSeq 快照到 Execute 阶段
+  out.bits := DontCare
+  outL.pc                   := inL.pc
+  outL.inst                 := inL.inst
+  outL.robIdx               := inL.robIdx
+  outL.src1Data             := prfRead.rdata1 // PRF 读取的 psrc1 值（旁路链兜底值）
+  outL.src2Data             := prfRead.rdata2 // PRF 读取的 psrc2 值（旁路链兜底值）
+  outL.imm                  := inL.imm
+  outL.type_decode_together := td
+  outL.predict_taken        := inL.predict_taken
+  outL.predict_target       := inL.predict_target
+  outL.bht_meta             := inL.bht_meta
+  outL.regWriteEnable       := inL.regWriteEnable
+  outL.sbIdx                := inL.sbIdx
+  outL.isSbAlloc            := inL.isSbAlloc
+  outL.storeSeqSnap         := inL.storeSeqSnap  // 传递 storeSeq 快照到 Execute 阶段
   // 物理寄存器映射信息透传
-  out.bits.psrc1                := in.bits.psrc1
-  out.bits.psrc2                := in.bits.psrc2
-  out.bits.pdst                 := in.bits.pdst
-  out.bits.stalePdst            := in.bits.stalePdst
-  out.bits.ldst                 := in.bits.ldst
-  out.bits.checkpointIdx        := in.bits.checkpointIdx // 分支 checkpoint 索引透传
+  outL.psrc1                := inL.psrc1
+  outL.psrc2                := inL.psrc2
+  outL.pdst                 := inL.pdst
+  outL.checkpointIdx        := inL.checkpointIdx // 分支 checkpoint 索引透传
+  // validMask 逐 lane 透传（宽度 1 时即单 bit）
+  out.bits.validMask := in.bits.validMask
 
   // ---- 握手信号 ----
   // ReadReg 是纯组合逻辑阶段，直接透传握手

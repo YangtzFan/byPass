@@ -42,17 +42,13 @@ class FreeList extends Module {
     val freePdst   = Input(UInt(CPUConfig.prfAddrWidth.W)) // 待释放的物理寄存器编号
 
     // ---- 恢复端口（分支预测失败时恢复 FreeList 状态）----
-    val recover      = Input(Bool())                                       // 恢复使能
-    val recoverHead  = Input(UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W))  // 恢复的 head 指针
-    val recoverTail  = Input(UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W))  // 恢复的 tail 指针
+    // 只恢复 head：已提交指令释放的物理寄存器应留在空闲池里，不恢复 tail
+    val recover      = Input(Bool())
+    val recoverHead  = Input(UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W))
 
     // ---- Checkpoint 读取端口（Rename 阶段保存 checkpoint 用）----
-    // snapAllocReq：第一个 checkpoint 中实际需要计入的分配数量（仅第一个分支及之前的 lane）
-    // snapAllocReq2：第二个 checkpoint 中实际需要计入的分配数量（仅第二个分支及之前的 lane）
-    // 与 allocReq（全组分配数）不同，用于精确计算 checkpoint 的 head 快照
-    val snapHead1 = Output(UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W))  // 第一个 checkpoint head 快照
-    val snapHead2 = Output(UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W))  // 第二个 checkpoint head 快照
-    val snapTail  = Output(UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W))  // 当前 tail 指针快照
+    val snapHead1 = Output(UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W))
+    val snapHead2 = Output(UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W))
   })
 
   val numFree = CPUConfig.freeListEntries  // 实际空闲物理寄存器数量（96）
@@ -104,5 +100,4 @@ class FreeList extends Module {
   // 恢复时，对应 checkpoint 之后 lane 分配的物理寄存器会回到空闲池
   io.snapHead1 := Mux(renameIO.doAlloc, head + renameIO.snapAllocReq1, head)
   io.snapHead2 := Mux(renameIO.doAlloc, head + renameIO.snapAllocReq2, head)
-  io.snapTail  := tail
 }

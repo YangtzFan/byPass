@@ -51,7 +51,7 @@ class Dispatch extends Module {
   //   造成 ROB 表项污染与提交数据错乱。
   robAlloc.request := Mux(doDispatch, validCount, 0.U)
   sbAlloc.request  := Mux(doDispatch, storeCount, 0.U)
-  iqAlloc.request  := Mux(doDispatch, validCount, 0.U)
+  // IQ 不再需要 request：其内部根据 iqWrite.valid/validCount 分配
 
   // ---- 计算每条 Store 指令在 StoreBuffer 分配返回指针中的偏移 ----
   // sbAlloc.idxs(0..3) 是连续分配的 StoreBuffer 指针，需要将它们按 Store 指令出现的先后顺序映射
@@ -78,17 +78,10 @@ class Dispatch extends Module {
 
     // ---- ROB 分配数据 ----
     robAlloc.data(i).pc            := entry.pc
-    robAlloc.data(i).inst          := entry.inst
     robAlloc.data(i).rd            := rd
     robAlloc.data(i).regWen        := entry.regWriteEnable
-    robAlloc.data(i).isLoad        := lType
     robAlloc.data(i).isStore       := sType
-    robAlloc.data(i).isBranch      := bType
-    robAlloc.data(i).isJump        := jal || jalr
     robAlloc.data(i).hasCheckpoint := entry.hasCheckpoint  // 从 Rename 传递：仅该组第一个被预测分支为 true
-    robAlloc.data(i).predictTaken  := entry.predict_taken
-    robAlloc.data(i).predictTarget := entry.predict_target
-    robAlloc.data(i).bhtMeta       := entry.bht_meta
     // Store 指令的 storeSeq：从 SBAllocIO 返回值中按 sbOffsets 映射获取
     // 非 Store 指令的 storeSeq 字段为 0（ROB Commit 时不会使用）
     robAlloc.data(i).storeSeq      := Mux(sType, sbAlloc.storeSeqs(sbOffsets(i)), 0.U)
@@ -126,8 +119,6 @@ class Dispatch extends Module {
     out.entries(i).psrc1                := entry.psrc1
     out.entries(i).psrc2                := entry.psrc2
     out.entries(i).pdst                 := entry.pdst
-    out.entries(i).stalePdst            := entry.stalePdst
-    out.entries(i).ldst                 := entry.ldst
     out.entries(i).checkpointIdx        := entry.checkpointIdx // 分支 checkpoint 索引透传
   }
   out.validCount := validCount // 来自 Rename 阶段的有效指令信息

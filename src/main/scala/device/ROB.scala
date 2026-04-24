@@ -52,20 +52,12 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
   headReady := !empty && headEntry.done  // headReady 不受 commitBlocked 影响（用于触发 drain）
   commit.valid        := canCommit
   commit.pc           := headEntry.pc
-  commit.inst         := headEntry.inst
   commit.rd           := headEntry.rd
   commit.regWen       := headEntry.regWen && canCommit
   commit.regWBData    := headEntry.regWBData
   commit.isStore      := headEntry.isStore
   commit.storeSeq     := headEntry.storeSeq   // ROB 提交时传递 Store 的 storeSeq 给 StoreBuffer
-  commit.isBranch     := headEntry.isBranch
-  commit.isJump       := headEntry.isJump
   commit.hasCheckpoint := headEntry.hasCheckpoint  // 传递 checkpoint 标记，用于 BCT 释放
-  commit.mispredict   := headEntry.mispredict && canCommit
-  commit.actualTaken  := headEntry.actualTaken
-  commit.actualTarget := headEntry.actualTarget
-  commit.predictTaken := headEntry.predictTaken
-  commit.bhtMeta      := headEntry.bhtMeta
   // 物理寄存器映射信息：Commit 时用于更新 RRAT 和释放 stalePdst
   commit.pdst         := headEntry.pdst
   commit.stalePdst    := headEntry.stalePdst
@@ -83,23 +75,12 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
           val entry = rob(idx(tail + i.U)) // 分配下一表项
           entry.done          := false.B
           entry.pc            := alloc.data(i).pc
-          entry.inst          := alloc.data(i).inst
           entry.rd            := alloc.data(i).rd
           entry.regWen        := alloc.data(i).regWen
           entry.regWBData     := 0.U
-          entry.isLoad        := alloc.data(i).isLoad
           entry.isStore       := alloc.data(i).isStore
           entry.storeSeq      := alloc.data(i).storeSeq  // 写入 Store 的逻辑年龄（Commit 时传给 StoreBuffer 用于定位表项）
-          entry.isBranch      := alloc.data(i).isBranch
-          entry.isJump        := alloc.data(i).isJump
           entry.hasCheckpoint := alloc.data(i).hasCheckpoint  // 标记该指令是否保存了 BCT checkpoint
-          entry.predictTaken  := alloc.data(i).predictTaken
-          entry.predictTarget := alloc.data(i).predictTarget
-          entry.actualTaken   := false.B
-          entry.actualTarget  := 0.U
-          entry.mispredict    := false.B
-          entry.exception     := false.B
-          entry.bhtMeta       := alloc.data(i).bhtMeta
           // 物理寄存器映射信息存入 ROB 表项
           entry.pdst          := alloc.data(i).pdst
           entry.stalePdst     := alloc.data(i).stalePdst
@@ -114,9 +95,6 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
     val refEntry = rob(idx(refresh.idx))
     refEntry.done         := true.B
     refEntry.regWBData    := refresh.regWBData
-    refEntry.actualTaken  := refresh.actualTaken
-    refEntry.actualTarget := refresh.actualTarget
-    refEntry.mispredict   := refresh.mispredict
   }
   // ===================== Commit 指针更新 =====================
   when(canCommit) {
