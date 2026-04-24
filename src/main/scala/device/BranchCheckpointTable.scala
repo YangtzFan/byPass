@@ -54,11 +54,14 @@ class BranchCheckpointTable extends Module {
     val recoverFLHead = Output(UInt((log2Ceil(CPUConfig.freeListEntries) + 1).W))
     val recoverReady  = Output(Vec(CPUConfig.prfEntries, Bool()))
     // ---- 释放 checkpoint（分支正确提交时）----
+    // 多 lane 同拍可能同时提交多条分支，需要按数量一并推进 head 指针
     val freeValid     = Input(Bool())
+    val freeCount     = Input(UInt(2.W)) // 本拍实际提交的分支数量（0/1/2），用于 head += freeCount
     // ---- Refresh 通告：执行结果写回后，需要把 pdst 同步记录到所有在飞 checkpoint 的
-    //      “快照之后已就绪”位向量里，防止分支恢复时用陈旧快照覆盖掉已就绪的寄存器。
-    val refreshValid  = Input(Bool())
-    val refreshAddr   = Input(UInt(CPUConfig.prfAddrWidth.W))
+    //      "快照之后已就绪"位向量里，防止分支恢复时用陈旧快照覆盖掉已就绪的寄存器。
+    //      多 Refresh lane 时每 lane 一个 (valid, addr) 端口，各自 OR 到 refreshedSinceSnap。
+    val refreshValid  = Input(Vec(CPUConfig.refreshWidth, Bool()))
+    val refreshAddr   = Input(Vec(CPUConfig.refreshWidth, UInt(CPUConfig.prfAddrWidth.W)))
   })
 
   // ---- checkpoint 存储 ----
@@ -96,10 +99,12 @@ class BranchCheckpointTable extends Module {
   }
 
   // ---- 每拍维护 refreshedSinceSnap ----
-  // 默认：若本拍 Refresh 写回了某个 pdst，则把它记到所有 slot 的 refreshed 向量里
-  when(io.refreshValid && io.refreshAddr =/= 0.U) {
-    for (k <- 0 until numCkpts) {
-      refreshedSinceSnap(k)(io.refreshAddr) := true.B
+  // 默认：若本拍 Refresh 任一 lane 写回了某个 pdst，则把它记到所有 slot 的 refreshed 向量里。
+  for (r <- 0 until CPUConfig.refreshWidth) {
+    when(io.refreshValid(r) && io.refreshAddr(r) =/= 0.U) {
+      for (k <- 0 until numCkpts) {
+        refreshedSinceSnap(k)(io.refreshAddr(r)) := true.B
+      }
     }
   }
   // 若本拍正在保存新的 checkpoint，则对应 slot 的 refreshed 向量整体清零，
@@ -115,13 +120,15 @@ class BranchCheckpointTable extends Module {
     }
   }
   // 同拍保存 + 同拍 Refresh：snapshot 取的是 Reg 更新前的值，不包含本拍 refresh，
-  // 因此清零后必须把本拍的 refresh 重新写回，避免真实“已就绪”位在恢复时丢失。
-  when(io.refreshValid && io.refreshAddr =/= 0.U) {
-    when(renameRequest.saveValid1) {
-      refreshedSinceSnap(idx(tail))(io.refreshAddr) := true.B
-    }
-    when(renameRequest.saveValid2) {
-      refreshedSinceSnap(idx(tail + 1.U))(io.refreshAddr) := true.B
+  // 因此清零后必须把本拍的 refresh 重新写回，避免真实"已就绪"位在恢复时丢失。
+  for (r <- 0 until CPUConfig.refreshWidth) {
+    when(io.refreshValid(r) && io.refreshAddr(r) =/= 0.U) {
+      when(renameRequest.saveValid1) {
+        refreshedSinceSnap(idx(tail))(io.refreshAddr(r)) := true.B
+      }
+      when(renameRequest.saveValid2) {
+        refreshedSinceSnap(idx(tail + 1.U))(io.refreshAddr(r)) := true.B
+      }
     }
   }
 
@@ -135,7 +142,7 @@ class BranchCheckpointTable extends Module {
   // recover 和 free 可以同周期发生：recover 由 Memory redirect 触发，free 由 Commit 触发
   // 提交的分支一定比 mispredict 的分支更老，释放合法，不能抑制
   when(io.freeValid) {
-    head := head + 1.U
+    head := head + io.freeCount // 按本拍实际提交的分支数同时推进，避免多 lane 提交时 BCT 槽泄漏
   }
 
   // ---- 恢复数据输出（组合读取）----

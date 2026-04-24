@@ -38,8 +38,11 @@ class FreeList extends Module {
 
   val io = IO(new Bundle {
     // ---- Commit 端口 ----
-    val freeValid  = Input(Bool())                         // 释放使能
-    val freePdst   = Input(UInt(CPUConfig.prfAddrWidth.W)) // 待释放的物理寄存器编号
+    // commitWidth 个独立释放端口（每 lane 一个 stalePdst）。多 lane 同拍都释放时
+    // tail 按有效个数推进，FIFO 中连续写入。乱序下 stalePdst 乱序提交但 FreeList
+    // 只是“归还池子”，顺序无关紧要。
+    val freeValid  = Input(Vec(CPUConfig.commitWidth, Bool()))                         // 各 lane 释放使能
+    val freePdst   = Input(Vec(CPUConfig.commitWidth, UInt(CPUConfig.prfAddrWidth.W))) // 各 lane 待释放的物理寄存器编号
 
     // ---- 恢复端口（分支预测失败时恢复 FreeList 状态）----
     // 只恢复 head：已提交指令释放的物理寄存器应留在空闲池里，不恢复 tail
@@ -88,10 +91,27 @@ class FreeList extends Module {
 
   // ---- 释放逻辑：独立于恢复逻辑 ----
   // Commit 释放 stalePdst 可以与分支恢复同周期发生（Commit 的指令比 mispredict 更老，释放合法）
-  // p0 不能被释放（p0 硬编码为 0，永远映射到 x0）
-  when(io.freeValid && io.freePdst =/= 0.U) {
-    fifo(idx(tail)) := io.freePdst
-    tail := tail + 1.U
+  // 多 lane 同拍释放时：
+  //   1. 各 lane 的 stalePdst 都可能是有效释放（排除 p0）；
+  //   2. 使用前缀计数 (PrefixCount) 为每 lane 选择对应的 FIFO 写入位置；
+  //   3. tail 按“本拍实际有效的释放数”一次性推进。
+  // 这样保证 FIFO 内连续填充，不留空洞。
+  val freeHits = VecInit((0 until CPUConfig.commitWidth).map { i =>
+    io.freeValid(i) && io.freePdst(i) =/= 0.U
+  })
+  val freeOffsets = Wire(Vec(CPUConfig.commitWidth, UInt(3.W)))
+  freeOffsets(0) := 0.U
+  for (i <- 1 until CPUConfig.commitWidth) {
+    freeOffsets(i) := freeOffsets(i - 1) +& Mux(freeHits(i - 1), 1.U, 0.U)
+  }
+  val freeCount = PopCount(freeHits)
+  for (i <- 0 until CPUConfig.commitWidth) {
+    when(freeHits(i)) {
+      fifo(idx(tail + freeOffsets(i))) := io.freePdst(i)
+    }
+  }
+  when(freeCount =/= 0.U) {
+    tail := tail + freeCount
   }
 
   // ---- Checkpoint 输出 ----

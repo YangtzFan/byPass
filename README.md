@@ -1,11 +1,12 @@
-# byPass — A 10-stage RISC-V CPU (Real OoO 1-issue, Lane-ified Payloads)
+# byPass — A 10-stage RISC-V CPU (Real OoO 2-issue, Lane-ified Backend)
 
-> This branch finishes phases 1 and 2 of `TASK.md` on top of the original
-> 10-stage in-order pipeline: **real out-of-order 1-issue (OoO-1issue)** plus
-> **full `Vec(width, Lane) + validMask` lane-ification of the backend payloads**.
-> The backend is still 1-wide, but every data structure and config knob is now
-> parameterized by `issueWidth / executeWidth / memoryWidth / refreshWidth`,
-> leaving clean hooks for the phase 3~6 extensions to 2-issue and 4-issue.
+> This branch finishes phases 1~5 of `TASK.md` on top of the original
+> 10-stage in-order pipeline: **real out-of-order 2-issue (OoO-2issue)** with
+> full `Vec(width, Lane) + validMask` lane-ification of the backend payloads.
+> Lane 0 is fully featured (branch / memory / ALU); lane 1 is ALU-only.
+> All six width knobs (`issueWidth / executeWidth / memoryWidth / refreshWidth /
+> commitWidth / renameWidth`) are a single entry point — flipping them to 4
+> completes the roadmap to OoO-4issue.
 
 ## Prerequisites
 
@@ -51,22 +52,23 @@ TC=<name> DUMP=1 xmake r Core
 
 ```
 Fetch → FetchBuffer → Decode → Rename → RenDisDff → Dispatch
-      → IssueQueue(4-in / 1-out, oldest-ready)
-      → Issue → ReadReg → Execute → Memory → Refresh → Commit
+      → IssueQueue(4-in / 2-out, dual oldest-ready, lane 1 ALU-only)
+      → Issue → ReadReg → Execute → Memory → Refresh → Commit(2-wide)
 ```
 
 Key parameters (see `src/main/scala/CPUConfig.scala`):
 
 | Parameter | Value | Description |
 |---|---|---|
-| `issueWidth` / `executeWidth` / `memoryWidth` / `refreshWidth` | 1 | Backend lane widths, kept at 1 through phase 2 |
-| `commitWidth` | 1 | In-order commit width |
+| `issueWidth` / `executeWidth` / `memoryWidth` / `refreshWidth` | 2 | Backend lane widths (lane 0 full, lane 1 ALU-only) |
+| `commitWidth` | 2 | In-order 2-wide retire |
 | `renameWidth` | 4 | 4-wide frontend rename |
+| `prfReadPorts` / `prfWritePorts` | 4 / 2 | PRF ports widened for dual issue |
 | `robEntries` | 128 | ROB depth |
 | `issueQueueEntries` | 16 | IssueQueue depth |
 | `prfEntries` | 128 | Physical register file size |
 | `sbEntries` | 32 | StoreBuffer depth |
-| `axiSqEntries` | 16 | AXIStoreQueue depth |
+| `axiSqEntries` | 16 | AXIStoreQueue depth (AXI still 1-in-flight) |
 | `maxBranchCheckpoints` | 8 | Branch checkpoint table slots |
 | `instSeqWidth` / `storeSeqWidth` | 8 | Circular sequence number widths |
 
@@ -134,6 +136,42 @@ Accompanying conventions:
 
 This phase is behaviorally a no-op — `sim-all` keeps passing 41/41.
 
+## Phase 3~5 — OoO-2issue backend
+
+Phase 3 widens IQ / Issue / ReadReg / Execute; phase 4 widens PRF ports and the
+bypass network; phase 5 widens Refresh / ROB / Commit / BCT / FreeList / RAT.
+
+Lane routing rules:
+
+- **Lane 0** handles every op (ALU / Branch / Load / Store).
+- **Lane 1** is ALU-only. Loads, Stores, Branches, and JALRs must go to lane 0.
+- IQ issues a pair only when (a) lane 1's candidate is ALU-only and (b) there
+  is no same-cycle RAW dependency between the two lanes (`rs1/rs2 == pdst0` is
+  forbidden; no cross-lane forwarding is built in this round).
+- `ROB.commitMask(i) := commitMask(i-1) && entry(i).ready && !storeConflict(i)`.
+  Stores are only committed on lane 0; `storeConflict(i)` bars lane 1 from
+  committing a second store in the same cycle.
+- Selective flush, store-buffer ordering, and AXI single-in-flight guarantees
+  are unchanged — phases 3~5 only widen lanes, not the memory / AXI subsystem.
+
+Key multi-lane plumbing:
+
+- `BCT.freeCount : UInt(2.W)` — when two branches commit in the same cycle the
+  BCT head advances by 2 (`head := head + freeCount`). A single-bit free valid
+  would leak checkpoint slots and eventually deadlock rename (`canSave2 = 0`).
+- `FreeList` retires up to `commitWidth` stale pdsts per cycle through a prefix
+  counter that writes back into the free-pdst FIFO.
+- `ReadyTable` gets `busyVen = 4` (Rename) and `readyVen = refreshWidth`
+  (Refresh), with recovery snapshot OR-ed with same-cycle refreshes.
+- `PRF` is parameterized by `wPorts / rPorts` (2 W, 4 R at phase 5).
+- `MyCPU` forwarding now covers 6 hazard sources per lane (2× memory-stage
+  piggyback + 2× refresh + 2× same-cycle commit).
+
+## Validation
+
+41/41 difftest cases pass (`sim-all`). `example` uncovered a latent BCT bug
+whose fix is required for dual commit: see the "BCT multi-lane free" note above.
+
 ## Directory layout
 
 - `src/main/scala/CPUConfig.scala` — global parameter block.
@@ -148,5 +186,11 @@ This phase is behaviorally a no-op — `sim-all` keeps passing 41/41.
 
 ## Next phases
 
-The phase 2~6 change lists live in `TASK.md`. The six width knobs in
-`CPUConfig` are the single entry point — no more scattered `_0 / _1` patches.
+Phase 6 (dual-lane memory front-end with parallel SB / SQ forwarding ports)
+remains — current `Memory.scala` passes lane 1 through and only lane 0 can
+reach the store buffer / store queue. Flipping the six width knobs to 4 and
+duplicating lane 1 (plus teaching Memory to dual-issue loads) completes the
+roadmap to OoO-4issue.
+
+See `TASK.md` for the full phase 1~6 spec and `scripts/STUDY.md` for the
+micro-architecture notes accumulated through this refactor.

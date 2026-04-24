@@ -58,7 +58,11 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
   val write = IO(Input(new IQWriteData))
 
   // ---- 发射选择接口（Issue 阶段使用）----
-  val issue = IO(Decoupled(new DispatchEntry)) // IssueQueue 发射选择接口（Issue 阶段使用）读取最老的有效条目，并通知 IssueQueue 释放该槽位
+  // issueWidth 路并行发射：每路给 Issue 一个独立的 Decoupled 通道。
+  //   lane0 = oldest-ready（所有候选中 instSeq 最老）
+  //   lane1 = 次老 ready（剔除 lane0 之后再选一次 oldest-ready），并且仅限 ALU 型指令
+  // 释放时谁 ready 就释放谁（可各自独立）。
+  val issue = IO(Vec(CPUConfig.issueWidth, Decoupled(new DispatchEntry)))
 
   // ---- 清空信号（Memory 重定向时使用）----
   val flush = IO(Input(Bool()))
@@ -165,17 +169,25 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
     }
   }
 
-  // ===================== 发射选择逻辑（Issue，阶段 1：oldest-ready）=====================
-  // 候选集合 = valid && src1Ready && src2Ready；在该集合中选 instSeq 最老。
-  // 注意：此处沿用原 foldLeft 的 found 标志模式，保证当没有任何 ready 候选时
-  // issueFound 为 false，下游 Issue 看到 issue.valid=false 自然不发射。
-  // ---- 阶段 1：内存顺序约束 ----
-  // 1-wide Memory 流水在 lType 命中 olderUnknown 时会 memStall，阻塞后续指令。
-  // 若 OoO 让年轻 Load 先于更老的 Store 进入 Memory，olderUnknown 会把 Memory 卡死，
-  // 老 Store 永远进不了 Memory → 死锁。因此限制 Load 不得在存在“更老且仍在 IQ 的 Store”时发射。
-  // 不限制 Store 之间或 Store 早于 Load 的情况，保持尽量多的并发。
+  // ===================== 发射选择逻辑（双发射：oldest-ready + 次老 ready）=====================
+  // lane0：所有 ready 候选中 instSeq 最老（全功能，可发 Load/Store/Branch/ALU）。
+  // lane1：剔除 lane0 后再 pick oldest-ready，且限定为"纯 ALU"（iType/rType/lui）。
+  //   之所以限制 lane1 为 ALU：
+  //   (a) Memory 流水单口，lane1 访存会与 lane0 冲突；
+  //   (b) 分支/JALR 需要精确 flush，集中放在 lane0 简化恢复；
+  //   (c) CSR/Trap 同理集中在 lane0。
+  // 同拍 lane0→lane1 RAW 由 Issue 级禁 pair（此处不做）。
   private def lTypeOf(e: DispatchEntry): Bool = e.type_decode_together(4)
   private def sTypeOf(e: DispatchEntry): Bool = e.type_decode_together(2)
+  // 判断条目是否可放在 lane1 发射（纯 ALU：iType/rType/lui）
+  private def aluOnly(e: DispatchEntry): Bool = {
+    val iType = e.type_decode_together(1)
+    val rType = e.type_decode_together(0)
+    val lui   = e.type_decode_together(8)
+    iType || rType || lui
+  }
+
+  // lane0 memOrder：Load 与更老 Store 冲突（继承 1 发射语义）
   val olderStoreInIQ = Wire(Vec(depth, Bool()))
   for (i <- 0 until depth) {
     val hits = (0 until depth).map { j =>
@@ -185,7 +197,9 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
     }
     olderStoreInIQ(i) := hits.reduce(_ || _)
   }
-  val (issueIdx, issueSeq, issueFound) = (0 until depth).foldLeft(
+
+  // ---- lane0：oldest-ready ----
+  val (issueIdx0, issueSeq0, issueFound0) = (0 until depth).foldLeft(
     (0.U(idxWidth.W), 0.U(seqWidth.W), false.B)
   ) { case ((bestIdx, bestSeq, found), i) =>
     val memOrderOK = !(lTypeOf(buffer(i).data) && olderStoreInIQ(i))
@@ -196,16 +210,47 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
      found || entryReady)
   }
 
-  // 发射输出：最老的有效条目
-  issue.valid := issueFound
-  issue.bits := buffer(issueIdx).data
+  // ---- lane1：次老 ready，且 aluOnly ----
+  // 注意 memOrder：lane1 只可能是 ALU，不会是 Load/Store，因此不需要 memOrder 检查
+  val (issueIdx1, _, issueFound1) =
+    if (CPUConfig.issueWidth >= 2) {
+      (0 until depth).foldLeft(
+        (0.U(idxWidth.W), 0.U(seqWidth.W), false.B)
+      ) { case ((bestIdx, bestSeq, found), i) =>
+        val notLane0 = !(issueFound0 && (issueIdx0 === i.U))
+        val entryReady = validVec(i) && buffer(i).src1Ready && buffer(i).src2Ready &&
+          aluOnly(buffer(i).data) && notLane0
+        val better = entryReady && (!found || seqOlderThan(buffer(i).instSeq, bestSeq))
+        (Mux(better, i.U(idxWidth.W), bestIdx),
+         Mux(better, buffer(i).instSeq, bestSeq),
+         found || entryReady)
+      }
+    } else (0.U(idxWidth.W), 0.U(seqWidth.W), false.B)
 
-  // Issue 阶段确认发射后，释放该槽位
-  when(issue.ready) {
-    // OoO 场景：无论本拍是否 flush，只要 IQ 发射了某条指令，就释放该槽位；
-    // 该指令的去留由下游 IssRRDff 的选择性 flush 按 robIdx 精确判定。
-    validVec(issueIdx) := false.B
-    freeVec(issueIdx)  := true.B
+  // 默认发射口：全部不发射
+  for (k <- 0 until CPUConfig.issueWidth) {
+    issue(k).valid := false.B
+    issue(k).bits  := 0.U.asTypeOf(new DispatchEntry)
+  }
+  issue(0).valid := issueFound0
+  issue(0).bits  := buffer(issueIdx0).data
+  if (CPUConfig.issueWidth >= 2) {
+    issue(1).valid := issueFound1
+    issue(1).bits  := buffer(issueIdx1).data
+  }
+
+  // ---- 释放已发射槽位 ----
+  // lane0/lane1 各自独立。若同拍两个 lane 选中同一 slot（理论上已被 notLane0 剔除），
+  // 下面 when 链按顺序执行，最终结果仍正确。
+  when(issue(0).fire) {
+    validVec(issueIdx0) := false.B
+    freeVec(issueIdx0)  := true.B
+  }
+  if (CPUConfig.issueWidth >= 2) {
+    when(issue(1).fire) {
+      validVec(issueIdx1) := false.B
+      freeVec(issueIdx1)  := true.B
+    }
   }
 
   // ===================== 回滚逻辑（Memory 重定向，按 robIdx 精确选择）=====================

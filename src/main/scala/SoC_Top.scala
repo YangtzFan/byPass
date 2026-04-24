@@ -67,26 +67,26 @@ class SoC_Top extends Module {
   // debug 接口中同步提供 Vec 形式，否则多 lane 的 ram 观测会失准。
   io.debug_commit_count := coreCpu.io.commit_count
 
-  // lane 0：寄存器写回信息来自 coreCpu.io.commit(0)，store 信息来自 axiStoreQueue.debug。
-  io.debug_commit(0).pc        := Mux(coreCpu.io.commit_count =/= 0.U, coreCpu.io.commit(0).pc, 0.U)
-  io.debug_commit(0).reg_wen   := coreCpu.io.commit(0).reg_wen
-  io.debug_commit(0).reg_waddr := Mux(coreCpu.io.commit(0).reg_wen, coreCpu.io.commit(0).reg_waddr, 0.U)
-  io.debug_commit(0).reg_wdata := Mux(coreCpu.io.commit(0).reg_wen, coreCpu.io.commit(0).reg_wdata, 0.U)
-
-  io.debug_commit(0).ram_wen   := axiStoreQueue.debug.commitRamWen
-  io.debug_commit(0).ram_waddr := Mux(axiStoreQueue.debug.commitRamWen, axiStoreQueue.debug.commitRamWaddr, 0.U)
-  io.debug_commit(0).ram_wdata := Mux(axiStoreQueue.debug.commitRamWen, axiStoreQueue.debug.commitRamWdata, 0.U)
-  io.debug_commit(0).ram_wmask := Mux(axiStoreQueue.debug.commitRamWen, axiStoreQueue.debug.commitRamWmask, 0.U)
-
-  // 高位 lane 在 commitWidth>1 时使用。当前保持安全默认值。
-  for (i <- 1 until commitWidth) {
-    io.debug_commit(i).pc        := 0.U
-    io.debug_commit(i).reg_wen   := false.B
-    io.debug_commit(i).reg_waddr := 0.U
-    io.debug_commit(i).reg_wdata := 0.U
-    io.debug_commit(i).ram_wen   := false.B
-    io.debug_commit(i).ram_waddr := 0.U
-    io.debug_commit(i).ram_wdata := 0.U
-    io.debug_commit(i).ram_wmask := 0.U
+  // lane 0..commitWidth-1：寄存器写回信息来自 coreCpu.io.commit(i)。
+  // store 信息仅 lane 0 来自 axiStoreQueue.debug（AXI 单事务 + commitMask 保证同拍
+  // 至多 1 个 Store 提交，且位于 lane 0）。
+  for (i <- 0 until commitWidth) {
+    val cmt = coreCpu.io.commit(i)
+    val laneActive = coreCpu.io.commit_count > i.U
+    io.debug_commit(i).pc        := Mux(laneActive, cmt.pc, 0.U)
+    io.debug_commit(i).reg_wen   := cmt.reg_wen
+    io.debug_commit(i).reg_waddr := Mux(cmt.reg_wen, cmt.reg_waddr, 0.U)
+    io.debug_commit(i).reg_wdata := Mux(cmt.reg_wen, cmt.reg_wdata, 0.U)
+    if (i == 0) {
+      io.debug_commit(i).ram_wen   := axiStoreQueue.debug.commitRamWen
+      io.debug_commit(i).ram_waddr := Mux(axiStoreQueue.debug.commitRamWen, axiStoreQueue.debug.commitRamWaddr, 0.U)
+      io.debug_commit(i).ram_wdata := Mux(axiStoreQueue.debug.commitRamWen, axiStoreQueue.debug.commitRamWdata, 0.U)
+      io.debug_commit(i).ram_wmask := Mux(axiStoreQueue.debug.commitRamWen, axiStoreQueue.debug.commitRamWmask, 0.U)
+    } else {
+      io.debug_commit(i).ram_wen   := false.B
+      io.debug_commit(i).ram_waddr := 0.U
+      io.debug_commit(i).ram_wdata := 0.U
+      io.debug_commit(i).ram_wmask := 0.U
+    }
   }
 }

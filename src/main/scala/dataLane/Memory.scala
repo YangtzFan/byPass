@@ -42,11 +42,10 @@ class Memory extends Module {
     val checkpointIdx = Output(UInt(CPUConfig.ckptPtrWidth.W))
   })
 
-  // ---- 阶段 2 lane 访问别名（memoryWidth=1，仅使用 lanes(0)）----
+  // ---- lane0（全功能访存）----
   val inL  = in.bits.lanes(0)
   val outL = out.bits.lanes(0)
   out.bits := DontCare
-  out.bits.validMask := in.bits.validMask
 
   // 指令类型解码
   val uType = inL.type_decode_together(8)
@@ -87,7 +86,9 @@ class Memory extends Module {
   ))
 
   // ===================== StoreBuffer 写入 =====================
-  sbWrite.valid := in.valid && sType && inL.isSbAlloc
+  // 必须门控 validMask(0)，否则 lane0 被选择性 flush 后 sType/isSbAlloc 字段仍可能匹配导致误写
+  val lane0Valid = in.valid && in.bits.validMask(0)
+  sbWrite.valid := lane0Valid && sType && inL.isSbAlloc
   sbWrite.idx := inL.sbIdx
   sbWrite.addr := addr
   sbWrite.data := storeRawData
@@ -96,7 +97,7 @@ class Memory extends Module {
   sbWrite.byteData := storeByteData
 
   // ===================== StoreBuffer 查询 =====================
-  sbQuery.valid := in.valid && lType
+  sbQuery.valid := lane0Valid && lType
   sbQuery.wordAddr := addr(31, 2)
   sbQuery.loadMask := loadByteMask
   sbQuery.storeSeqSnap := inL.storeSeqSnap
@@ -120,7 +121,7 @@ class Memory extends Module {
   val sqVisibleData = WireInit(0.U(32.W))
   val needAfterSQ = WireInit(needAfterSB)
 
-  when(in.valid && lType && !sbQuery.olderUnknown && (needAfterSB =/= 0.U)) {
+  when(lane0Valid && lType && !sbQuery.olderUnknown && (needAfterSB =/= 0.U)) {
     sqQuery.valid := true.B
     sqQuery.loadMask := needAfterSB
     sqVisibleMask := sqQuery.fwdMask & needAfterSB
@@ -181,7 +182,7 @@ class Memory extends Module {
 
   switch(state) {
     is(sIdle) {
-      when(in.valid && lType) {
+      when(lane0Valid && lType) {
         when(sbQuery.olderUnknown) {
           // 更老 speculative store 地址未知时，必须先停住，不能越过这道边界。
           memStall := true.B
@@ -229,12 +230,21 @@ class Memory extends Module {
     }
   }
 
+  // ===================== 握手信号 =====================
+  // memStall 由 Load 的多拍访存（sWaitResp / olderUnknown / sqLoadAddr 未 fire）驱动；
+  // 本阶段无法前进时，既不向上游 ready，也不向下游 valid。
+  in.ready  := !memStall
+  out.valid := in.valid && !memStall
+
   // ===================== 重定向逻辑 =====================
-  redirect.valid := in.valid && inL.mispredict && !memStall
+  redirect.valid := in.valid && in.bits.validMask(0) && inL.mispredict && !memStall
   redirect.addr := inL.actual_target
   redirect.robIdx := inL.robIdx
   redirect.storeSeqSnap := inL.storeSeqSnap
   redirect.checkpointIdx := inL.checkpointIdx
+  // 提前声明 lane0MispredictKill（后续 lane1+ passthrough 会读取）
+  val lane0MispredictKill = WireInit(false.B)
+  lane0MispredictKill := redirect.valid
 
   // ===================== 输出打包 =====================
   outL.pdst := Mux(uType || jal || jalr || lType || iType || rType, inL.pdst, 0.U)
@@ -246,6 +256,25 @@ class Memory extends Module {
   outL.robIdx := inL.robIdx
   outL.regWriteEnable := inL.regWriteEnable
 
-  in.ready := out.ready && !memStall
-  out.valid := in.valid && !memStall
+  // ===================== lane1..W-1 passthrough（纯 ALU，无访存）=====================
+  // lane1 不会是 Load/Store/Branch/JALR，直接把 Execute 的结果搬运到 Refresh。
+  // 如果 lane0 本拍 mispredict，lane1 是同对内的年轻指令，必须被 kill（validMask=0），
+  // 否则会污染 Refresh → ROB/PRF（Memory 已触发 redirect，上游会 flush，但本对的 lane1
+  // 仍在管线中，不 kill 将错误 refresh）。
+  for (k <- 1 until CPUConfig.memoryWidth) {
+    val inLk  = in.bits.lanes(k)
+    val outLk = out.bits.lanes(k)
+    outLk.pdst            := inLk.pdst
+    outLk.data            := inLk.data
+    outLk.robIdx          := inLk.robIdx
+    outLk.regWriteEnable  := inLk.regWriteEnable
+  }
+
+  // 组装 out.bits.validMask（lane0 原样，lane1+ 被 lane0 mispredict 清零）
+  val outMaskBits = Wire(Vec(CPUConfig.memoryWidth, Bool()))
+  outMaskBits(0) := in.bits.validMask(0)
+  for (k <- 1 until CPUConfig.memoryWidth) {
+    outMaskBits(k) := in.bits.validMask(k) && !lane0MispredictKill
+  }
+  out.bits.validMask := outMaskBits.asUInt
 }

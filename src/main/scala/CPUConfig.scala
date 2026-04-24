@@ -32,12 +32,12 @@ object CPUConfig {
   // 提交宽度：一拍内 ROB 最多按序提交几条指令。
   // 过渡期暂定 1；后续做完“乱序发射 + 双宽 retire”后会提升到 2。
   // difftest 验证框架已按 Vec 接口接入，此处修改即可自动扩展验证路径。
-  val commitWidth: Int = 1
+  val commitWidth: Int = 2
 
   // ---- OoO 后端宽度参数（TASK 3.1 草拟；阶段 1-2 全部保持 1，后续阶段再向上翻）----
   // 这些参数从“过渡期默认 1”起步，所有下游模块都按 Vec(width, T) 接口铺管；
   // 扩展到 2 / 4 发射时只需修改这里，并在对应阶段打开 Vec 内部的并行逻辑。
-  val issueWidth:    Int = 1                      // 每拍 Issue 发射数（= Vec 宽度）
+  val issueWidth:    Int = 2                      // 每拍 Issue 发射数（= Vec 宽度）
   val executeWidth:  Int = issueWidth             // 每拍 Execute 执行数（约束：≥ issueWidth）
   val memoryWidth:   Int = issueWidth             // 每拍 Memory 处理数（≥ 发访存指令的 lane 数）
   val refreshWidth:  Int = executeWidth           // 每拍 Refresh 写回数（= executeWidth）

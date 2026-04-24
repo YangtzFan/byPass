@@ -215,10 +215,8 @@ class MyCPU extends Module {
   // ---- PRF（物理寄存器堆，128 x 32-bit）----
   val uPRF = Module(new PRF)
   // ---- PRF 读端口连接（按物理寄存器编号读取操作数）----
-  uPRF.io.raddr1 := uReadReg.prfRead.raddr1
-  uPRF.io.raddr2 := uReadReg.prfRead.raddr2
-  uReadReg.prfRead.rdata1 := uPRF.io.rdata1
-  uReadReg.prfRead.rdata2 := uPRF.io.rdata2
+  uPRF.io.raddr := uReadReg.prfRead.raddr
+  uReadReg.prfRead.rdata := uPRF.io.rdata
 
   // =====================================================
   // ============ ReadReg → Execute 流水线寄存器（RRExDff）============
@@ -316,73 +314,90 @@ class MyCPU extends Module {
   // =====================================================
   val uRefresh = Module(new Refresh)
   uRefresh.in <> uMemRefDff.out
-  uROB.refresh <> uRefresh.robRefresh
+  // 多 lane Refresh → 多 lane ROB refresh 端口逐 lane 连接
+  for (k <- 0 until CPUConfig.refreshWidth) {
+    uROB.refresh(k) <> uRefresh.robRefresh(k)
+  }
 
   // =====================================================
   // ============ Commit（提交，从 ROB 头部取）============
   // =====================================================
   // ---- RRAT（提交态映射表）----
   // Commit 时更新 RRAT[ldst] = pdst，作为架构状态的映射记录
-  // RRAT 不需要单独的模块，用简单寄存器实现即可
+  // 多 lane 提交：按 lane 索引顺序更新，同拍同 ldst 后者覆盖前者（乱序下同拍同 ldst 罕见，且程序顺序上后者确实应覆盖前者）
   val rrat = RegInit(VecInit((0 until 32).map(i => i.U(CPUConfig.prfAddrWidth.W))))
 
-  // Commit 时更新 RRAT 和释放 stalePdst
-  val commitRegWen = uROB.commit.regWen && uROB.commit.ldst =/= 0.U
-  when(commitRegWen) {
-    rrat(uROB.commit.ldst) := uROB.commit.pdst
+  for (i <- 0 until CPUConfig.commitWidth) {
+    val cregWen = uROB.commit(i).regWen && uROB.commit(i).ldst =/= 0.U
+    when(cregWen) {
+      rrat(uROB.commit(i).ldst) := uROB.commit(i).pdst
+    }
   }
 
-  // ---- PRF 写端口（Refresh 阶段写回执行结果，而非 Commit 阶段）----
-  // PRF 在 Refresh 阶段写入，这里连接 ROB refresh 接口输出
-  val refreshValid = uRefresh.robRefresh.valid && uRefresh.robRefresh.regWriteEnable
-  uPRF.io.wen   := refreshValid
-  uPRF.io.waddr := uRefresh.robRefresh.pdst
-  uPRF.io.wdata := uRefresh.robRefresh.regWBData
+  // ---- PRF 写端口（Refresh 阶段写回执行结果）----
+  // 每 lane 独立写一次 PRF，乱序分配保证同拍不会出现 pdst 冲突
+  // refreshValidVec 额外加入"活跃区间"检查：屏蔽选择性 flush 后泄漏到 Refresh 的
+  // 年轻 lane（robIdx 已被 rollback 推出 ROB 活跃窗口），避免其污染 PRF / ReadyTable / BCT。
+  val refreshValidVec = Wire(Vec(CPUConfig.refreshWidth, Bool()))
+  for (k <- 0 until CPUConfig.refreshWidth) {
+    refreshValidVec(k) := uRefresh.robRefresh(k).valid && uRefresh.robRefresh(k).regWriteEnable
+    uPRF.io.wen(k)   := refreshValidVec(k)
+    uPRF.io.waddr(k) := uRefresh.robRefresh(k).pdst
+    uPRF.io.wdata(k) := uRefresh.robRefresh(k).regWBData
+  }
 
-  // ---- ReadyTable 置 ready（Refresh 阶段标记物理寄存器就绪）----
-  uReadyTable.io.readyVen  := refreshValid
-  uReadyTable.io.readyAddr := uRefresh.robRefresh.pdst
+  // ---- ReadyTable 置 ready（Refresh 阶段标记物理寄存器就绪，多 lane 并行）----
+  for (k <- 0 until CPUConfig.refreshWidth) {
+    uReadyTable.io.readyVen(k)  := refreshValidVec(k)
+    uReadyTable.io.readyAddr(k) := uRefresh.robRefresh(k).pdst
+  }
 
-  // ---- 阶段 1：Refresh → IssueQueue 的 wakeup 广播 ----
-  // 与 ReadyTable 置 ready 同拍发出：命中的 IQ 条目在下一拍把对应 src 置 ready。
-  // 由于 IQ 发射看到的是“寄存器化”的 ready 位，wakeup 与 issue 差一拍；
-  // 与此同时 Refresh 结果通过 3 级数据旁路送入 Execute，填补这一拍的数据空档。
-  uIssueQueue.wakeup(0).valid := refreshValid
-  uIssueQueue.wakeup(0).pdst  := uRefresh.robRefresh.pdst
+  // ---- Refresh → IssueQueue 的 wakeup 广播（多 lane）----
+  for (k <- 0 until CPUConfig.refreshWidth) {
+    uIssueQueue.wakeup(k).valid := refreshValidVec(k)
+    uIssueQueue.wakeup(k).pdst  := uRefresh.robRefresh(k).pdst
+  }
 
-  // ---- FreeList 释放（Commit 时将 stalePdst 归还）----
-  // 条件：指令写寄存器 && ldst != x0（x0 不产生真正的物理寄存器分配）
-  uFreeList.io.freeValid := commitRegWen
-  uFreeList.io.freePdst  := uROB.commit.stalePdst
+  // ---- FreeList 释放（多 lane Commit）----
+  for (i <- 0 until CPUConfig.commitWidth) {
+    val cregWen = uROB.commit(i).regWen && uROB.commit(i).ldst =/= 0.U
+    uFreeList.io.freeValid(i) := cregWen
+    uFreeList.io.freePdst(i)  := uROB.commit(i).stalePdst
+  }
 
-  // ---- BranchCheckpointTable 释放（分支提交时释放最老的 checkpoint）----
-  // 只有实际保存了 checkpoint 的指令（bType || jalr）在提交时释放 BCT 表项
-  // JAL 是无条件跳转，不保存 checkpoint，因此不能释放
-  val commitBranch = uROB.commit.valid && uROB.commit.hasCheckpoint
-  uBCT.io.freeValid := commitBranch
+  // ---- BranchCheckpointTable 释放（分支提交时释放 1~commitWidth 个最老的 checkpoint）----
+  // 多 lane 提交时可能同时提交多个分支，按数量同时推进 BCT head
+  val commitBranchVec = VecInit((0 until CPUConfig.commitWidth).map { i =>
+    uROB.commit(i).valid && uROB.commit(i).hasCheckpoint
+  })
+  val commitBranchCount = PopCount(commitBranchVec)
+  uBCT.io.freeValid := commitBranchVec.asUInt.orR
+  uBCT.io.freeCount := commitBranchCount
 
-  // ---- 告知 BCT 本拍的 Refresh，用于维护每 slot 的 refreshedSinceSnap ----
-  // 避免分支恢复时陈旧 ReadyTable 快照把“已经就绪”的旧 pdst 重新标成 busy，
-  // 这是 ready-based IQ 发射在旁路/wakeup 之外必须补齐的一致性保护。
-  uBCT.io.refreshValid := refreshValid
-  uBCT.io.refreshAddr  := uRefresh.robRefresh.pdst
+  // ---- 告知 BCT 本拍的 Refresh，用于维护每 slot 的 refreshedSinceSnap（多 lane）----
+  for (k <- 0 until CPUConfig.refreshWidth) {
+    uBCT.io.refreshValid(k) := refreshValidVec(k)
+    uBCT.io.refreshAddr(k)  := uRefresh.robRefresh(k).pdst
+  }
 
   // Store 提交路径：
-  //   1. ROB head 是 Store 时，先按 storeSeq 向 SB 索引候选；
-  //   2. 只有 AXIStoreQueue enqueue 成功，同拍才允许 ROB 真正提交；
-  //   3. SB 也只在同一个 enqueue-success 脉冲下释放表项。
-  val headIsStore = uROB.commit.isStore
+  //   当前 AXI 单事务在飞 + ROB.commitMask 保证本拍至多一个 Store 被允许提交，
+  //   且该 Store 必然位于 lane0（ROB 若 lane0 非 Store、lane1 为 Store，commitMask
+  //   同样会允许 lane1 提交 —— 但由于 lane1 永不产 Store（IQ 仲裁规则），这条路径
+  //   在当前配置下不会发生；为保险起见，这里仍只读取 uROB.commit(0)，后续若允许
+  //   lane1 Store 需要把下方连线改为"选首个 Store 的 lane"）
+  val headIsStore = uROB.commit(0).isStore
   val headStoreLookupValid = uROB.headReady && headIsStore
 
   uStoreBuffer.commit.valid := headStoreLookupValid
-  uStoreBuffer.commit.storeSeq := uROB.commit.storeSeq
+  uStoreBuffer.commit.storeSeq := uROB.commit(0).storeSeq
   sqEnq.valid := headStoreLookupValid && uStoreBuffer.commit.entryValid
   sqEnq.bits.addr := uStoreBuffer.commit.addr
   sqEnq.bits.data := uStoreBuffer.commit.data
   sqEnq.bits.mask := uStoreBuffer.commit.mask
   sqEnq.bits.wstrb := uStoreBuffer.commit.wstrb
   sqEnq.bits.wdata := uStoreBuffer.commit.wdata
-  sqEnq.bits.storeSeq := uROB.commit.storeSeq
+  sqEnq.bits.storeSeq := uROB.commit(0).storeSeq
 
   val sqEnqFire = sqEnq.fire
   uStoreBuffer.commit.enqSuccess := sqEnqFire
@@ -390,25 +405,14 @@ class MyCPU extends Module {
   // P0 语义：head store 只有成功进入 AXIStoreQueue 才算提交，否则持续阻塞 ROB head。
   uROB.commitBlocked := uROB.headReady && headIsStore && !sqEnqFire
 
-  // Commit 观测信号（供 difftest 使用）
-  // 现在 store 的 difftest 比对点已经前移到 AXIStoreQueue enqueue 成功同拍，
-  // 因此顶层可以直接使用这里的 commit 输出，不再额外做重排。
-  // Commit 观测信号（供 difftest 使用）
-  // 当前 ROB 仍为单条提交（commitWidth=1），因此只有 lane 0 真正输出信号。
-  // 后续若扩展 ROB 多条提交，只需新增 uROB.commitVec 并逐 lane 连接即可。
-  io.commit_count := Mux(uROB.commit.valid, 1.U, 0.U)
-  io.commit(0).pc        := uROB.commit.pc
-  io.commit(0).is_store  := uROB.commit.valid && uROB.commit.isStore
-  io.commit(0).reg_wen   := uROB.commit.regWen
-  io.commit(0).reg_waddr := uROB.commit.rd        // difftest 使用逻辑寄存器编号
-  io.commit(0).reg_wdata := uROB.commit.regWBData
-  // 如果 commitWidth > 1，多出的高位 lane 默认为无效。
-  for (i <- 1 until CPUConfig.commitWidth) {
-    io.commit(i).pc        := 0.U
-    io.commit(i).is_store  := false.B
-    io.commit(i).reg_wen   := false.B
-    io.commit(i).reg_waddr := 0.U
-    io.commit(i).reg_wdata := 0.U
+  // Commit 观测信号（供 difftest 使用）—— 多 lane 对外输出
+  io.commit_count := uROB.commitCount
+  for (i <- 0 until CPUConfig.commitWidth) {
+    io.commit(i).pc        := uROB.commit(i).pc
+    io.commit(i).is_store  := uROB.commit(i).valid && uROB.commit(i).isStore
+    io.commit(i).reg_wen   := uROB.commit(i).regWen
+    io.commit(i).reg_waddr := uROB.commit(i).rd
+    io.commit(i).reg_wdata := uROB.commit(i).regWBData
   }
 
   // =====================================================
@@ -445,28 +449,35 @@ class MyCPU extends Module {
   // =====================================================
   // ============ 数据旁路转发连接（Forwarding）============
   // =====================================================
-  // 优先级（距离 Execute 越近的越优先）：
-  //   1. Memory 级（Execute 前 1 条指令的结果，Load 除外——数据还没读回来）
-  //   2. Refresh 级（Execute 前 2 条指令的结果，Load 数据已可用）
-  //   3. Commit 级（同周期正在提交的指令结果）
-  //   兜底：ReadReg 阶段读取的寄存器值（经 RRExDff 传入）
+  // 旁路源按 lane Vec 化：
+  //   mem 级（ExMemDff）每拍 memoryWidth 个 pdst/data/wen
+  //   ref 级（MemRefDff）每拍 refreshWidth 个 pdst/data/wen
+  //   commit 级（ROB.commit）每拍 commitWidth 个 pdst/data/wen
+  // Execute 内部按 Vec 索引依次 PriorityMux。
 
-  // 第 1 级旁路：来自 ExMemDff（Memory 级）
-  // 使用物理目的寄存器 pdst 进行旁路匹配
-  val wen_Memory = uExMemDff.out.valid && uExMemDff.out.bits.lanes(0).regWriteEnable &&
-    !uExMemDff.out.bits.lanes(0).type_decode_together(4)  // Load 此时数据不可用
-  uExecute.fwd.mem_pdst := uExMemDff.out.bits.lanes(0).pdst
-  uExecute.fwd.mem_data := uExMemDff.out.bits.lanes(0).data
-  uExecute.fwd.mem_wen  := wen_Memory
+  // 第 1 级旁路：ExMemDff（Memory 级）—— Load 数据此拍尚未读回，wen 清 0
+  for (k <- 0 until CPUConfig.memoryWidth) {
+    val lane = uExMemDff.out.bits.lanes(k)
+    val laneValid = uExMemDff.out.valid && uExMemDff.out.bits.validMask(k)
+    val isLoad = lane.type_decode_together(4)
+    uExecute.fwd.mem_pdst(k) := lane.pdst
+    uExecute.fwd.mem_data(k) := lane.data
+    uExecute.fwd.mem_wen(k)  := laneValid && lane.regWriteEnable && !isLoad
+  }
 
-  // 第 2 级旁路：来自 MemRefDff（Refresh 级，Load 数据已可用）
-  val refWen = uMemRefDff.out.valid && uMemRefDff.out.bits.lanes(0).regWriteEnable
-  uExecute.fwd.ref_pdst := uMemRefDff.out.bits.lanes(0).pdst
-  uExecute.fwd.ref_data := uMemRefDff.out.bits.lanes(0).data
-  uExecute.fwd.ref_wen  := refWen
+  // 第 2 级旁路：MemRefDff（Refresh 级，Load 数据已可用）
+  for (k <- 0 until CPUConfig.refreshWidth) {
+    val lane = uMemRefDff.out.bits.lanes(k)
+    val laneValid = uMemRefDff.out.valid && uMemRefDff.out.bits.validMask(k)
+    uExecute.fwd.ref_pdst(k) := lane.pdst
+    uExecute.fwd.ref_data(k) := lane.data
+    uExecute.fwd.ref_wen(k)  := laneValid && lane.regWriteEnable
+  }
 
-  // 第 3 级旁路：Commit 级（同周期 ROB 正在提交的指令结果）
-  uExecute.fwd.commit_pdst := uROB.commit.pdst
-  uExecute.fwd.commit_data := uROB.commit.regWBData
-  uExecute.fwd.commit_wen  := uROB.commit.regWen
+  // 第 3 级旁路：Commit 级（同拍 ROB 正在提交的指令结果，多 lane）
+  for (k <- 0 until CPUConfig.commitWidth) {
+    uExecute.fwd.commit_pdst(k) := uROB.commit(k).pdst
+    uExecute.fwd.commit_data(k) := uROB.commit(k).regWBData
+    uExecute.fwd.commit_wen(k)  := uROB.commit(k).regWen
+  }
 }

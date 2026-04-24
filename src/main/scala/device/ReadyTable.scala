@@ -33,8 +33,9 @@ class ReadyTable extends Module {
     val busyAddr = Input(Vec(4, UInt(CPUConfig.prfAddrWidth.W))) // 待置 busy 的物理寄存器编号
 
     // ---- Refresh 阶段置 ready（执行结果已写回 PRF）----
-    val readyVen  = Input(Bool())                                // ready 使能
-    val readyAddr = Input(UInt(CPUConfig.prfAddrWidth.W))        // 待置 ready 的物理寄存器编号
+    // 每个 refresh lane 一个独立的 (ven, addr) 端口。乱序下同拍不会出现重复 addr。
+    val readyVen  = Input(Vec(CPUConfig.refreshWidth, Bool()))                                // 每 lane ready 使能
+    val readyAddr = Input(Vec(CPUConfig.refreshWidth, UInt(CPUConfig.prfAddrWidth.W)))        // 每 lane 待置 ready 的物理寄存器编号
 
     // ---- 批量恢复端口（分支预测失败时恢复）----
     val recover     = Input(Bool())                              // 恢复使能
@@ -49,10 +50,13 @@ class ReadyTable extends Module {
 
   // ---- 批量恢复逻辑 ----
   // 注意：恢复与 Refresh 同拍时，Refresh 来自比误预测分支更老的指令（位于 Memory/Refresh 级），
-  // 必须与 recover 合流，否则会丢失“同拍就绪”位，导致 IQ 内依赖该 pdst 的老指令永远等待。
+  // 必须与 recover 合流，否则会丢失"同拍就绪"位，导致 IQ 内依赖该 pdst 的老指令永远等待。
+  // 多 refresh lane 时任一 lane 命中即视为置 ready（OR 合流）。
   when(io.recover) {
     for (i <- 0 until CPUConfig.prfEntries) {
-      val setByRefresh = io.readyVen && (io.readyAddr =/= 0.U) && (io.readyAddr === i.U)
+      val setByRefresh = (0 until CPUConfig.refreshWidth).map { k =>
+        io.readyVen(k) && (io.readyAddr(k) =/= 0.U) && (io.readyAddr(k) === i.U)
+      }.reduce(_ || _)
       table(i) := io.recoverData(i) || setByRefresh
     }
   }.otherwise {
@@ -65,9 +69,12 @@ class ReadyTable extends Module {
     }
 
     // ---- Refresh 阶段：执行结果写回后置 ready ----
-    // Refresh 的写优先级高于 Rename 的 busy（同一物理寄存器同拍 Rename busy + Refresh ready → ready 生效）
-    when(io.readyVen && io.readyAddr =/= 0.U) {
-      table(io.readyAddr) := true.B
+    // 多 lane Refresh：每个 lane 分别置位；Refresh 的写优先级高于 Rename 的 busy
+    // （同一物理寄存器同拍 Rename busy + 任一 lane Refresh ready → ready 生效）。
+    for (k <- 0 until CPUConfig.refreshWidth) {
+      when(io.readyVen(k) && io.readyAddr(k) =/= 0.U) {
+        table(io.readyAddr(k)) := true.B
+      }
     }
   }
 

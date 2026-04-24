@@ -11,109 +11,134 @@ class LoadHazardSource extends Bundle {
 }
 
 // ============================================================================
-// Issue（发射阶段）—— 当前版本：顺序单发射（宽度 1）
+// Issue（发射阶段）—— 双发射版本：lane0 全功能 + lane1 纯 ALU
 // ============================================================================
-// 从 IssueQueue 的发射选择接口接收最老的有效指令，进行 Load-Use 冒险检测后发射。
-// IssueQueue 已改为 Vec + FreeList + instSeq 架构，通过 issue 接口交互：
-//   - IssueQueue 输出最老的有效条目（issue.valid, issue.entry）
-//   - Issue 确认发射后通过 issue.fire 通知 IssueQueue 释放槽位
+// IssueQueue 已实现 oldest-ready + 次老 ready 的双选择器，Issue 仅做 per-lane
+// 合法性检查与冒险检测：
 //
-// 发射阻止条件：
-//   - Load-Use 冒险：当下游正在执行的指令是 Load，且当前指令的源寄存器
-//     依赖该 Load 的目标寄存器时，暂停发射一个周期
+//   lane0：可接收 Load/Store/Branch/JALR/iType/rType/lui/auipc 等全功能指令
+//   lane1：仅当 IQ 送来的是纯 ALU 指令（iType/rType/lui）时有效；否则 lane1 无效
+//          Branch/JALR/Load/Store/auipc 等集中在 lane0，简化 flush 与访存串行化
 //
-// 输出 Issue_ReadReg_Payload 给 IssRRDff → ReadReg 阶段
+// Load-Use 冒险：
+//   - 下游 3 级 Load（ReadReg/Execute/Memory）的 pdst 仅可能来自 lane0（因为
+//     lane1 永远不产 Load），所以 hazard 源向量保持 3 项标量，无需扩 Vec
+//   - lane0/lane1 各自独立检测其 psrc1/psrc2 是否命中任一下游 Load
+//
+// 同拍 lane0→lane1 RAW：
+//   - 若 lane1 的 psrc1/psrc2 = lane0 的 pdst（且 lane0 规定 regWriteEnable），
+//     Execute 阶段的 EX→EX 旁路要从"下一拍"才能覆盖到 lane1，而 lane0/lane1
+//     本拍同在 ReadReg 阶段，无旁路可取；禁 pair 最简单安全：lane1.validMask=0
+//
+// 选择性 flush：
+//   - 对每 lane 独立按 robIdx 与 flushBranchRobIdx 比较，只丢弃年轻条目
+//
 // ============================================================================
 class Issue extends Module {
-  val out = IO(Decoupled(new Issue_ReadReg_Payload))          // 输出：送往 IssRRDff → ReadReg
-  val flush = IO(Input(Bool()))                               // 流水线冲刷信号
-  // OoO 场景下，flush 携带误预测分支的 robIdx，仅比它更年轻的条目才真正被丢弃。
+  val out = IO(Decoupled(new Issue_ReadReg_Payload))
+  val flush = IO(Input(Bool()))
   val flushBranchRobIdx = IO(Input(UInt(CPUConfig.robPtrWidth.W)))
 
-  // ---- IssueQueue 发射选择接口 ----
-  val iqIssue = IO(Flipped(Decoupled(new DispatchEntry)))
+  // ---- IssueQueue 发射选择接口（Vec 化）----
+  val iqIssue = IO(Vec(CPUConfig.issueWidth, Flipped(Decoupled(new DispatchEntry))))
 
-  // ---- Load-Use 冒险检测接口 ----
-  // 为避免 Post-Refresh 这一级旁路带来的复杂度，将全部 Load-Use 冒险检测上提到 Issue 阶段：
-  // 如果下游有任意一级仍在流动的 Load（尚未把数据写回 PRF），且其物理目的寄存器匹配
-  // 当前待发射指令的任一物理源寄存器，则本拍不发射，让该指令继续留在 IssueQueue 中。
-  //
-  // 需要覆盖的下游 Load 位置（以 pdst 唯一标识）：
-  //   (a) IssRRDff → ReadReg 阶段：最紧邻的下一条指令
-  //   (b) RRExDff  → Execute  阶段：下下一条指令
-  //   (c) ExMemDff → Memory   阶段：下下下一条指令（Load 数据此拍才从 DRAM 返回）
-  // 当 Load 到达 MemRefDff（Refresh 阶段）时：Refresh 本拍写 PRF，ReadReg 对 PRF 的读取
-  // 发生在 Issue 之后的下一拍，彼时 PRF 已是新值，不需要继续在 Issue 停顿。
-  // 因此只需覆盖以上 3 级即可消除所有 Load-Use 风险。
+  // ---- Load-Use 冒险检测接口：仍然 3 项标量（lane1 永不产 Load）----
   val NumLoadHazardSrcs: Int = 3
   val hazard = IO(Input(Vec(NumLoadHazardSrcs, new LoadHazardSource)))
 
-  // ---- 从 IssueQueue 获取最老的有效指令 ----
-  val entry = iqIssue.bits
-  val entryValid = iqIssue.valid
-
-  // ---- 指令字段提取 ----
-  val inst = entry.inst
-  val rs1  = inst(19, 15)
-  val rs2  = inst(24, 20)
-
-  // ---- 指令类型提取（从 9 位独热编码）----
-  val td    = entry.type_decode_together
-  val jalr  = td(6)
-  val bType = td(5)
-  val lType = td(4)
-  val iType = td(3)
-  val sType = td(2)
-  val rType = td(1)
-
-  // ---- Load-Use 冒险检测 ----
-  // 使用物理寄存器编号进行匹配，避免逻辑寄存器重名问题。
-  // 只要下游任意一级存在尚未把结果写进 PRF 的 Load，且其 pdst 与当前指令真正使用到的
-  // psrc 匹配，就停顿本拍发射。
-  val use_rs1 = jalr || bType || iType || sType || rType || lType
-  val use_rs2 = bType || sType || rType
-  val loadUseStall = hazard.map { h =>
-    h.isValidLoad && (h.pdst =/= 0.U) &&
-      ((use_rs1 && (entry.psrc1 === h.pdst)) ||
-       (use_rs2 && (entry.psrc2 === h.pdst)))
-  }.reduce(_ || _)
-
-  // ---- 是否可以发射当前指令 ----
-  // OoO 选择性 flush：即便处于 flush 拍，若当前待发射条目的 robIdx ≤ 分支 robIdx（即不比分支年轻），
-  // 仍允许其发射，使老指令继续推进以完成 ROB 提交，避免头阻塞死锁。
   private val robW = CPUConfig.robPtrWidth
-  val entryYoungerThanBranch =
-    ((entry.robIdx - flushBranchRobIdx)(robW - 1) === 0.U) && (entry.robIdx =/= flushBranchRobIdx)
-  val canIssue = entryValid && !loadUseStall && (!flush || !entryYoungerThanBranch)
 
-  // ---- 输出结果打包（最老指令信息）----
-  // 阶段 2 起 payload 改为 Vec(issueWidth, Lane)+validMask 形式；宽度 1 时
-  // 仅写 lanes(0)，其余 lane 置默认值（DontCare）。
+  // ---- 辅助：对单条指令进行解码 & 冒险检测 ----
+  private def useRs1(td: UInt): Bool = {
+    val jalr  = td(6); val bType = td(5); val lType = td(4)
+    val iType = td(3); val sType = td(2); val rType = td(1)
+    jalr || bType || iType || sType || rType || lType
+  }
+  private def useRs2(td: UInt): Bool = {
+    val bType = td(5); val sType = td(2); val rType = td(1)
+    bType || sType || rType
+  }
+  // 判断某条指令是否可放在 lane1 发射（纯 ALU：iType/rType/lui）
+  private def aluOnly(td: UInt): Bool = {
+    val iType = td(3); val rType = td(1); val lui = td(8)
+    iType || rType || lui
+  }
+
+  // ---- 预先算每 lane 的 loadUse / youngerThanBranch / aluOnly ----
+  val laneValid        = Wire(Vec(CPUConfig.issueWidth, Bool()))
+  val laneCanIssue     = Wire(Vec(CPUConfig.issueWidth, Bool()))
+  val laneEntries      = Wire(Vec(CPUConfig.issueWidth, new DispatchEntry))
+
+  for (k <- 0 until CPUConfig.issueWidth) {
+    val entry = iqIssue(k).bits
+    val entryValid = iqIssue(k).valid
+    val td = entry.type_decode_together
+    val u1 = useRs1(td); val u2 = useRs2(td)
+    val loadUseStall = hazard.map { h =>
+      h.isValidLoad && (h.pdst =/= 0.U) &&
+        ((u1 && (entry.psrc1 === h.pdst)) ||
+         (u2 && (entry.psrc2 === h.pdst)))
+    }.reduce(_ || _)
+    val entryYoungerThanBranch =
+      ((entry.robIdx - flushBranchRobIdx)(robW - 1) === 0.U) && (entry.robIdx =/= flushBranchRobIdx)
+    val laneAluOnly = if (k == 0) true.B else aluOnly(td)
+    laneEntries(k) := entry
+    laneValid(k)   := entryValid
+    laneCanIssue(k) := entryValid && !loadUseStall &&
+      (!flush || !entryYoungerThanBranch) && laneAluOnly
+  }
+
+  // ---- lane1 RAW 禁 pair：若 lane0 会发射且会写 pdst，且 lane1 的 psrc 命中 lane0.pdst ----
+  val lane0WritesPdst = if (CPUConfig.issueWidth >= 2) {
+    laneCanIssue(0) && laneEntries(0).regWriteEnable && (laneEntries(0).pdst =/= 0.U)
+  } else false.B
+  val pairRawConflict = if (CPUConfig.issueWidth >= 2) {
+    val td1 = laneEntries(1).type_decode_together
+    val u1_1 = useRs1(td1); val u2_1 = useRs2(td1)
+    lane0WritesPdst && (
+      (u1_1 && (laneEntries(1).psrc1 === laneEntries(0).pdst)) ||
+      (u2_1 && (laneEntries(1).psrc2 === laneEntries(0).pdst))
+    )
+  } else false.B
+
+  val finalIssue = Wire(Vec(CPUConfig.issueWidth, Bool()))
+  finalIssue(0) := laneCanIssue(0)
+  if (CPUConfig.issueWidth >= 2) {
+    finalIssue(1) := laneCanIssue(1) && !pairRawConflict
+  }
+
+  // ---- 输出 payload：按 lane 写入 ----
   out.bits := DontCare
-  val outLane0 = out.bits.lanes(0)
-  outLane0.pc                   := entry.pc
-  outLane0.inst                 := entry.inst
-  outLane0.imm                  := entry.imm
-  outLane0.type_decode_together := td
-  outLane0.predict_taken        := entry.predict_taken
-  outLane0.predict_target       := entry.predict_target
-  outLane0.bht_meta             := entry.bht_meta
-  outLane0.robIdx               := entry.robIdx
-  outLane0.regWriteEnable       := entry.regWriteEnable
-  outLane0.sbIdx                := entry.sbIdx
-  outLane0.isSbAlloc            := entry.isSbAlloc
-  outLane0.storeSeqSnap         := entry.storeSeqSnap
-  // 物理寄存器映射信息透传
-  outLane0.psrc1                := entry.psrc1
-  outLane0.psrc2                := entry.psrc2
-  outLane0.pdst                 := entry.pdst
-  outLane0.checkpointIdx        := entry.checkpointIdx // 分支 checkpoint 索引透传
-  // validMask：Issue 按 lane 标记实际有效位；宽度 1 时即 1.U
-  out.bits.validMask := canIssue.asUInt
+  val validMaskBits = Wire(Vec(CPUConfig.issueWidth, Bool()))
+  for (k <- 0 until CPUConfig.issueWidth) {
+    val e  = laneEntries(k)
+    val ln = out.bits.lanes(k)
+    ln.pc                   := e.pc
+    ln.inst                 := e.inst
+    ln.imm                  := e.imm
+    ln.type_decode_together := e.type_decode_together
+    ln.predict_taken        := e.predict_taken
+    ln.predict_target       := e.predict_target
+    ln.bht_meta             := e.bht_meta
+    ln.robIdx               := e.robIdx
+    ln.regWriteEnable       := e.regWriteEnable
+    ln.sbIdx                := e.sbIdx
+    ln.isSbAlloc            := e.isSbAlloc
+    ln.storeSeqSnap         := e.storeSeqSnap
+    ln.psrc1                := e.psrc1
+    ln.psrc2                := e.psrc2
+    ln.pdst                 := e.pdst
+    ln.checkpointIdx        := e.checkpointIdx
+    validMaskBits(k) := finalIssue(k)
+  }
+  out.bits.validMask := validMaskBits.asUInt
 
-  // ---- 握手信号 ----
-  out.valid := canIssue
+  // out.valid：只要任一 lane 有效就向下游推进
+  out.valid := finalIssue.reduce(_ || _)
 
-  // 通知 IssueQueue 确认发射，释放该槽位
-  iqIssue.ready := canIssue && out.ready
+  // ---- 通知 IQ 各 lane 是否被消费 ----
+  // 下游 out.ready 对本拍所有 lane 一起生效
+  for (k <- 0 until CPUConfig.issueWidth) {
+    iqIssue(k).ready := finalIssue(k) && out.ready
+  }
 }
