@@ -42,8 +42,11 @@ class Issue extends Module {
   // ---- IssueQueue 发射选择接口（Vec 化）----
   val iqIssue = IO(Vec(CPUConfig.issueWidth, Flipped(Decoupled(new DispatchEntry))))
 
-  // ---- Load-Use 冒险检测接口：仍然 3 项标量（lane1 永不产 Load）----
-  val NumLoadHazardSrcs: Int = 3
+  // ---- Load-Use 冒险检测接口：4 项标量 ----
+  //   hazard(0..2) 跟踪下游 RR/Execute/Memory 三级里尚未写 PRF 的 Load（lane0 only）；
+  //   hazard(3) 跟踪 Memory 阶段 MSHR 中的 outstanding Load（η2 引入：Memory 已 fire 但
+  //     DRAM 数据尚未回，PRF 还没写，必须阻塞依赖该 pdst 的消费者）。
+  val NumLoadHazardSrcs: Int = 4
   val hazard = IO(Input(Vec(NumLoadHazardSrcs, new LoadHazardSource)))
 
   private val robW = CPUConfig.robPtrWidth
@@ -88,14 +91,23 @@ class Issue extends Module {
       (!flush || !entryYoungerThanBranch) && laneAluOnly
   }
 
-  // ---- lane1 RAW 禁 pair：若 lane0 会发射且会写 pdst，且 lane1 的 psrc 命中 lane0.pdst ----
+  // ---- lane1 RAW 禁 pair：仅在 lane0 是 Load（lType）时才需要禁 pair ----
+  // 背景（阶段 A1）：
+  //   - 非 Load 指令（ALU / LUI / AUIPC / JAL / JALR）在 Execute 同拍即可产出结果，
+  //     我们已在 Execute.scala 增加 lane0 → lane1 的同拍前递通路，可以无缝解决
+  //     "同拍 lane0 写 pdst、lane1 读同一 pdst" 的 RAW 依赖。
+  //   - Load 指令的结果要等到下一拍 Memory 阶段才能写回，Execute 内的同拍前递
+  //     无法获取其数据，此时仍必须禁 pair，lane1 在下一拍靠 hazard 机制继续等待。
   val lane0WritesPdst = if (CPUConfig.issueWidth >= 2) {
     laneCanIssue(0) && laneEntries(0).regWriteEnable && (laneEntries(0).pdst =/= 0.U)
+  } else false.B
+  val lane0IsLoad = if (CPUConfig.issueWidth >= 2) {
+    laneEntries(0).type_decode_together(4) // lType
   } else false.B
   val pairRawConflict = if (CPUConfig.issueWidth >= 2) {
     val td1 = laneEntries(1).type_decode_together
     val u1_1 = useRs1(td1); val u2_1 = useRs2(td1)
-    lane0WritesPdst && (
+    lane0WritesPdst && lane0IsLoad && (
       (u1_1 && (laneEntries(1).psrc1 === laneEntries(0).pdst)) ||
       (u2_1 && (laneEntries(1).psrc2 === laneEntries(0).pdst))
     )

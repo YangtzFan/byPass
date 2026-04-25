@@ -43,6 +43,13 @@ class Execute extends Module {
     val taken = Output(Bool())
   })}
 
+  // BTB 更新：只有 lane0 可能是 JALR
+  val btb_update = Option.when(CPUConfig.useBTB){IO(new Bundle {
+    val valid  = Output(Bool())
+    val pc     = Output(UInt(32.W))
+    val target = Output(UInt(32.W))
+  })}
+
   out.bits := DontCare
 
   // 旁路匹配辅助函数：给定物理源寄存器编号 psrc，返回旁路后的数据
@@ -59,6 +66,24 @@ class Execute extends Module {
     }
     PriorityMux(memCases ++ refCases ++ commitCases :+ (true.B -> fallback))
   }
+
+  // ============================================================================
+  // 【阶段 A1】同拍 lane0 → lane(>=1) 前递（EX-in-EX forwarding）
+  // ----------------------------------------------------------------------------
+  // 背景：当 lane1 发射的指令同拍消费 lane0 的写回目的物理寄存器时，
+  //      在不加入本前递前，Issue 阶段会触发 pairRawConflict 禁 pair，
+  //      把本来可以双发射的 ALU-依赖对退化为单发射（IPC 上限被压到 1）。
+  // 方案：对于 ALU / LUI / AUIPC / JAL / JALR 这类"在 Execute 本拍即可算出结果"
+  //      的指令，lane0 的 `out.bits.lanes(0).data` 就是本拍的最终值，可直接
+  //      组合旁路给同拍的 lane1+ 源操作数 mux。Load（lType）类指令的结果
+  //      要等到下一拍 Memory 阶段才产出，无法同拍前递，因此 lane0 为 Load
+  //      时仍需在 Issue 阶段禁 pair（由 Issue.scala 的 pairRawConflict 负责）。
+  // 实现：下面的 lane0CanForward/lane0Pdst/lane0Data 由 lane0 迭代赋值（见 for
+  //      循环体尾部），然后 lane>=1 的 actual_rdata1/2 会优先使用它。
+  // ============================================================================
+  val lane0CanForward = WireInit(false.B)
+  val lane0FwdPdst    = WireInit(0.U(CPUConfig.prfAddrWidth.W))
+  val lane0FwdData    = WireInit(0.U(32.W))
 
   // ---- 每 lane 独立算一遍 ALU ----
   for (k <- 0 until CPUConfig.issueWidth) {
@@ -82,8 +107,18 @@ class Execute extends Module {
     val lui   = uType && inL.inst(5)
     val auipc = uType && !inL.inst(5)
 
-    val actual_rdata1 = bypass(psrc1, inL.src1Data)
-    val actual_rdata2 = bypass(psrc2, inL.src2Data)
+    val actual_rdata1_pre = bypass(psrc1, inL.src1Data)
+    val actual_rdata2_pre = bypass(psrc2, inL.src2Data)
+
+    // ---- 【阶段 A1】lane>=1 源操作数再覆盖一层 lane0 同拍前递 ----
+    // 若 lane0 本拍能产出结果，且其 pdst 命中当前 lane 的 psrc，则优先使用 lane0
+    // 同拍结果；否则仍使用多级旁路/PRF 结果。
+    val actual_rdata1 = if (k == 0) actual_rdata1_pre else {
+      Mux(lane0CanForward && (lane0FwdPdst === psrc1) && (psrc1 =/= 0.U), lane0FwdData, actual_rdata1_pre)
+    }
+    val actual_rdata2 = if (k == 0) actual_rdata2_pre else {
+      Mux(lane0CanForward && (lane0FwdPdst === psrc2) && (psrc2 =/= 0.U), lane0FwdData, actual_rdata2_pre)
+    }
 
     val iChoose30OrNot = iType && (funct3 === "b101".U)
     val rChoose30OrNot = rType && ((funct3 === "b101".U) || (funct3 === "b000".U))
@@ -117,15 +152,26 @@ class Execute extends Module {
     val jalr_target_raw = actual_rdata1 + jalr_imm
     val jalr_target = Cat(jalr_target_raw(31, 1), 0.U(1.W))
     val b_mispredict = bType && (branch_taken ^ inL.predict_taken)
+    // ---- 【阶段 δ】JALR 误预测判定：命中 BTB 且目标一致时不视为误预测 ----
+    // Fetch 阶段 BTB 命中会把 predict_taken=true、predict_target=BTB.target；
+    // 只要实际 jalr_target 与 predict_target 一致，就可免除流水线重定向。
+    val jalr_mispredict = jalr && (!inL.predict_taken || inL.predict_target =/= jalr_target)
     val b_correct_addr = Mux(branch_taken, b_target_ex, inL.pc + 4.U(32.W))
     val actual_target_addr = Mux(jalr, jalr_target, b_correct_addr)
     val laneValid = in.valid && in.bits.validMask(k)
-    val isMispredict = laneValid && (b_mispredict || jalr)
+    val isMispredict = laneValid && (b_mispredict || jalr_mispredict)
 
     if (k == 0 && CPUConfig.useBHT) {
       bht_update.get.valid := laneValid && bType
       bht_update.get.idx   := inL.pc(bhtIdxWidth + 1, 2)
       bht_update.get.taken := branch_taken
+    }
+
+    // ---- 【阶段 δ】BTB 更新：每条解析的 JALR 都写回其实际目标 ----
+    if (k == 0 && CPUConfig.useBTB) {
+      btb_update.get.valid  := laneValid && jalr
+      btb_update.get.pc     := inL.pc
+      btb_update.get.target := jalr_target
     }
 
     outL.inst_funct3 := Mux(lType || sType, funct3, 0.U)
@@ -146,6 +192,16 @@ class Execute extends Module {
     outL.sbIdx                := inL.sbIdx
     outL.storeSeqSnap         := inL.storeSeqSnap
     outL.checkpointIdx        := inL.checkpointIdx
+
+    // ---- 【阶段 A1】lane0 迭代结尾：把本拍结果导出为"同拍前递源" ----
+    // 只有 lane0 需要导出；并且仅在 lane0 "能同拍产出结果" 时才允许前递。
+    // 能同拍产出 <=> 非 Load（!lType），且有写回使能，pdst!=0，lane 本身有效。
+    if (k == 0) {
+      val canFwd = laneValid && inL.regWriteEnable && !lType && (outL.pdst =/= 0.U)
+      lane0CanForward := canFwd
+      lane0FwdPdst    := outL.pdst
+      lane0FwdData    := outL.data
+    }
   }
 
   out.bits.validMask := in.bits.validMask

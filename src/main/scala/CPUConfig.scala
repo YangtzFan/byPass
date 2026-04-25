@@ -20,6 +20,10 @@ object CPUConfig {
   val bhtSize: BHTSize = BHT64 // 当前 BHT 表项大小（修改这里切换）
   val bhtEntries: Int = bhtSize.entries
 
+  // ---- BTB 参数（为 JALR 目标预测，默认开启）----
+  val useBTB: Boolean = true
+  val btbEntries: Int = 32 // BTB 表项数量（直接映射，PC 低位索引）
+
   // ---- ROB 参数 ----
   val robEntries: Int = 128 // ROB 表项数
   val robIdxWidth: Int = log2Ceil(robEntries) // ROB 索引位宽（7 位）
@@ -45,7 +49,7 @@ object CPUConfig {
   val prfWritePorts: Int = refreshWidth           // PRF 写口数（= refreshWidth）
 
   // ---- IssueQueue 参数 ----
-  val issueQueueEntries: Int = 16  // IssueQueue 容量
+  val issueQueueEntries: Int = 32  // IssueQueue 容量
   val iqIdxWidth: Int = log2Ceil(issueQueueEntries)  // IssueQueue 物理槽位索引位宽（4 位）
   // instSeq 采用循环序号 + 减法最高位比较（与 StoreBuffer 的 storeSeq 同构）。
   // 只要活跃条目数（≤ issueQueueEntries = 16）远小于半区间 2^(instSeqWidth-1)，
@@ -53,8 +57,8 @@ object CPUConfig {
   val instSeqWidth: Int = 8
 
   // ---- StoreBuffer 参数 ----
-  val sbEntries: Int = 32                   // StoreBuffer 深度
-  val sbIdxWidth: Int = log2Ceil(sbEntries) // StoreBuffer 索引位宽（5 位）
+  val sbEntries: Int = 16                   // StoreBuffer 深度（16 项，避免面积浪费；半区间 128 >> 16 仍安全）
+  val sbIdxWidth: Int = log2Ceil(sbEntries) // StoreBuffer 索引位宽（4 位）
   val storeSeqWidth: Int = 8                // storeSeq 逻辑年龄位宽（8 位，使用循环比较处理回绕，半区间 128 > sbEntries 故安全）
   val axiSqEntries: Int = 16                // AXIStoreQueue 深度：保存已提交但尚未写回 DRAM 的 store
   val axiSqStoreBurstLimit: Int = 8         // 在有 load miss 等待时，最多连续优先处理的 store 数量，避免 load 饥饿

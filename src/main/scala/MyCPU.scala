@@ -88,6 +88,15 @@ class MyCPU extends Module {
       uFetch.bht.get.predict(i) := uBHT.get.io.predict(i)
     }
   }
+  // ---- BTB 顶层实例化并连接到 Fetch（读）----
+  val uBTB = Option.when(CPUConfig.useBTB)(Module(new BTB(CPUConfig.btbEntries)))
+  if (CPUConfig.useBTB) {
+    for (i <- 0 until 4) {
+      uBTB.get.io.read_pc(i)   := uFetch.btb.get.read_pc(i)
+      uFetch.btb.get.hit(i)    := uBTB.get.io.hit(i)
+      uFetch.btb.get.target(i) := uBTB.get.io.target(i)
+    }
+  }
   // Fetch BPU 预测跳转信号（输出到 PC 和 FetchBuffer flush）
   fetchPredictJump   := uFetch.predict.jump
   fetchPredictTarget := uFetch.predict.target
@@ -242,6 +251,13 @@ class MyCPU extends Module {
     uBHT.get.io.update_idx   := uExecute.bht_update.get.idx
     uBHT.get.io.update_taken := uExecute.bht_update.get.taken
   }
+  // ---- BTB 更新：Execute 解析 JALR 得到真实目标后写回 BTB ----
+  if (CPUConfig.useBTB) {
+    // 同理，Memory redirect 时抑制写入，避免错误路径污染 BTB
+    uBTB.get.io.update_valid  := uExecute.btb_update.get.valid && !memRedirectValid
+    uBTB.get.io.update_pc     := uExecute.btb_update.get.pc
+    uBTB.get.io.update_target := uExecute.btb_update.get.target
+  }
 
   // =====================================================
   // ============ Execute → Memory 流水线寄存器（ExMemDff）============
@@ -270,6 +286,10 @@ class MyCPU extends Module {
   uIssue.hazard(2).pdst        := uExMemDff.out.bits.lanes(0).pdst
   uIssue.hazard(2).isValidLoad := uExMemDff.out.valid &&
     uExMemDff.out.bits.lanes(0).type_decode_together(4) && uExMemDff.out.bits.lanes(0).regWriteEnable
+  // η2：第 4 个 hazard 源——Memory 阶段 MSHR 中持有的 outstanding Load。
+  // mshrPending.valid 已经在 MSHR ack 同拍组合清掉，因此 hazard 在写口仲裁成功时立刻释放，
+  // 与传统流水线 Refresh 写 PRF 同拍解除依赖、消费者下一拍就能 Issue 的时序保持一致。
+  // 真正连线在 Memory 实例化之后（向下查找 "uIssue.hazard(3)"）。
 
   // =====================================================
   // ============ Memory（访存 + StoreBuffer 转发 + 分支纠错重定向）============
@@ -294,6 +314,14 @@ class MyCPU extends Module {
   uMemory.sqLoadAddr <> sqLoadAddr
   uMemory.sqLoadData <> sqLoadData
 
+  // η2：MSHR flush 输入——分支误预测时若 MSHR 中 Load 比误预测分支更年轻则清掉。
+  uMemory.flushIn.valid        := memRedirectValid
+  uMemory.flushIn.branchRobIdx := memRedirectRobIdx
+
+  // η2：第 4 个 hazard 源——Memory 阶段 MSHR 中持有的 outstanding Load。
+  uIssue.hazard(3).pdst        := uMemory.mshrPending.pdst
+  uIssue.hazard(3).isValidLoad := uMemory.mshrPending.valid && uMemory.mshrPending.regWriteEnable
+
   // ROB 回滚：Memory redirect 时将 tail 回滚到误预测指令之后
   uROB.rollback.valid  := memRedirectValid
   uROB.rollback.robIdx := memRedirectRobIdx
@@ -314,9 +342,44 @@ class MyCPU extends Module {
   // =====================================================
   val uRefresh = Module(new Refresh)
   uRefresh.in <> uMemRefDff.out
-  // 多 lane Refresh → 多 lane ROB refresh 端口逐 lane 连接
+  // η2：MSHR 写口仲裁。
+  //   - uRefresh.robRefresh(k) 是“正常 Refresh 路径”的写源；
+  //   - uMemory.mshrComplete 是“MSHR 完成路径”的写源；
+  //   - 两者抢同一个 ROB.refresh / PRF.write / ReadyTable / IQ.wakeup / BCT 写端口。
+  // 仲裁策略：扫描 k=0..refreshWidth-1，把 MSHR 接管到“第一个 Refresh 没占用的 lane”。
+  // mshrFreeLaneOH(k)=1 表示本拍 MSHR 通过 lane k 完成写回；同拍清 MSHR.valid。
+  val mshrFreeLaneOH = Wire(Vec(CPUConfig.refreshWidth, Bool()))
+  var mshrClaimedBefore: Bool = false.B
   for (k <- 0 until CPUConfig.refreshWidth) {
-    uROB.refresh(k) <> uRefresh.robRefresh(k)
+    val freeK = !uRefresh.robRefresh(k).valid
+    mshrFreeLaneOH(k) := uMemory.mshrComplete.valid && freeK && !mshrClaimedBefore
+    mshrClaimedBefore = mshrClaimedBefore || mshrFreeLaneOH(k)
+  }
+  uMemory.mshrComplete.ack := mshrFreeLaneOH.asUInt.orR
+
+  // 每 lane 计算"有效 refresh 源"（MSHR 接管 vs 正常 Refresh）。
+  val effRefValid = Wire(Vec(CPUConfig.refreshWidth, Bool()))
+  val effRefIdx   = Wire(Vec(CPUConfig.refreshWidth, UInt(CPUConfig.robPtrWidth.W)))
+  val effRefPdst  = Wire(Vec(CPUConfig.refreshWidth, UInt(CPUConfig.prfAddrWidth.W)))
+  val effRefData  = Wire(Vec(CPUConfig.refreshWidth, UInt(32.W)))
+  val effRefWen   = Wire(Vec(CPUConfig.refreshWidth, Bool()))
+  for (k <- 0 until CPUConfig.refreshWidth) {
+    val rr = uRefresh.robRefresh(k)
+    val sel = mshrFreeLaneOH(k)
+    effRefValid(k) := Mux(sel, true.B, rr.valid)
+    effRefIdx(k)   := Mux(sel, uMemory.mshrComplete.robIdx, rr.idx)
+    effRefPdst(k)  := Mux(sel, uMemory.mshrComplete.pdst, rr.pdst)
+    effRefData(k)  := Mux(sel, uMemory.mshrComplete.data, rr.regWBData)
+    effRefWen(k)   := Mux(sel, uMemory.mshrComplete.regWriteEnable, rr.regWriteEnable)
+  }
+
+  // 多 lane ROB refresh 端口逐 lane 连接（用 effRef* 统一驱动）
+  for (k <- 0 until CPUConfig.refreshWidth) {
+    uROB.refresh(k).valid          := effRefValid(k)
+    uROB.refresh(k).idx            := effRefIdx(k)
+    uROB.refresh(k).regWBData      := effRefData(k)
+    uROB.refresh(k).pdst           := effRefPdst(k)
+    uROB.refresh(k).regWriteEnable := effRefWen(k)
   }
 
   // =====================================================
@@ -334,28 +397,55 @@ class MyCPU extends Module {
     }
   }
 
-  // ---- PRF 写端口（Refresh 阶段写回执行结果）----
-  // 每 lane 独立写一次 PRF，乱序分配保证同拍不会出现 pdst 冲突
-  // refreshValidVec 额外加入"活跃区间"检查：屏蔽选择性 flush 后泄漏到 Refresh 的
-  // 年轻 lane（robIdx 已被 rollback 推出 ROB 活跃窗口），避免其污染 PRF / ReadyTable / BCT。
+  // ---- PRF 写端口（Refresh 阶段写回执行结果，含 η2 MSHR 仲裁后的写回）----
+  // refreshValidVec 现在统一用 effRef*（MSHR 接管时由 effRef 注入 MSHR.complete 数据）。
   val refreshValidVec = Wire(Vec(CPUConfig.refreshWidth, Bool()))
   for (k <- 0 until CPUConfig.refreshWidth) {
-    refreshValidVec(k) := uRefresh.robRefresh(k).valid && uRefresh.robRefresh(k).regWriteEnable
+    refreshValidVec(k) := effRefValid(k) && effRefWen(k)
     uPRF.io.wen(k)   := refreshValidVec(k)
-    uPRF.io.waddr(k) := uRefresh.robRefresh(k).pdst
-    uPRF.io.wdata(k) := uRefresh.robRefresh(k).regWBData
+    uPRF.io.waddr(k) := effRefPdst(k)
+    uPRF.io.wdata(k) := effRefData(k)
   }
 
   // ---- ReadyTable 置 ready（Refresh 阶段标记物理寄存器就绪，多 lane 并行）----
   for (k <- 0 until CPUConfig.refreshWidth) {
     uReadyTable.io.readyVen(k)  := refreshValidVec(k)
-    uReadyTable.io.readyAddr(k) := uRefresh.robRefresh(k).pdst
+    uReadyTable.io.readyAddr(k) := effRefPdst(k)
   }
 
   // ---- Refresh → IssueQueue 的 wakeup 广播（多 lane）----
   for (k <- 0 until CPUConfig.refreshWidth) {
     uIssueQueue.wakeup(k).valid := refreshValidVec(k)
-    uIssueQueue.wakeup(k).pdst  := uRefresh.robRefresh(k).pdst
+    uIssueQueue.wakeup(k).pdst  := effRefPdst(k)
+  }
+  for (k <- 0 until CPUConfig.memoryWidth) {
+    val memLane  = uExMemDff.out.bits.lanes(k)
+    val memAdvance = uExMemDff.out.fire
+    val memValid = memAdvance && uExMemDff.out.bits.validMask(k)
+    // η2-step(b)：lane0 若本拍 Load 进入 MSHR（mshrCaptureFire=1），则其 validMask(0)
+    // 已经被 Memory 置 0，γ-wake 由 Refresh 路径接管时机变成"MSHR 完成那拍"。这里显式
+    // 抑制 γ-wake 是为了让逻辑更清晰：禁止在捕获拍发出"假"的提前唤醒。
+    val k0Suppress = if (k == 0) uMemory.mshrCaptureFire else false.B
+    uIssueQueue.wakeup(CPUConfig.refreshWidth + k).valid :=
+      memValid && memLane.regWriteEnable && (memLane.pdst =/= 0.U) && !k0Suppress
+    uIssueQueue.wakeup(CPUConfig.refreshWidth + k).pdst := memLane.pdst
+  }
+  // 阶段 β：Execute 级 wakeup。提前 1 拍再广播。门控仍是 valid / validMask / !isLoad / wen / pdst≠0。
+  // 关键修复：必须额外门控 uRRExDff.out.fire（= valid && ready），即只有当
+  // 生产者本拍实际从 Execute 推进到 Memory（ExMemDff.in.ready 为真）时才广播 wake。
+  // 原因：若 Memory 反压（例如前一条 Load 正在阻塞），RRExDff 的 valid 会持续为 1，
+  // 生产者被“困”在 Execute 多拍，Refresh 写 PRF 的时点会随之后移；
+  // 若 β wake 每拍都触发，消费者会在生产者尚未写 PRF 之前读到旧值，产生 RAW 错误。
+  // 只在 fire 的那一拍广播，能保证生产者确定在 N+2 拍抵达 Refresh 并写 PRF，
+  // 消费者在 N+2 拍 ReadReg 时恰好命中 PRF 的写优先 bypass。
+  val exAdvance = uRRExDff.out.fire
+  for (k <- 0 until CPUConfig.executeWidth) {
+    val exLane  = uRRExDff.out.bits.lanes(k)
+    val exValid = exAdvance && uRRExDff.out.bits.validMask(k)
+    val exIsLoad = exLane.type_decode_together(4)
+    uIssueQueue.wakeup(CPUConfig.refreshWidth + CPUConfig.memoryWidth + k).valid :=
+      exValid && exLane.regWriteEnable && !exIsLoad && (exLane.pdst =/= 0.U)
+    uIssueQueue.wakeup(CPUConfig.refreshWidth + CPUConfig.memoryWidth + k).pdst := exLane.pdst
   }
 
   // ---- FreeList 释放（多 lane Commit）----
@@ -377,7 +467,7 @@ class MyCPU extends Module {
   // ---- 告知 BCT 本拍的 Refresh，用于维护每 slot 的 refreshedSinceSnap（多 lane）----
   for (k <- 0 until CPUConfig.refreshWidth) {
     uBCT.io.refreshValid(k) := refreshValidVec(k)
-    uBCT.io.refreshAddr(k)  := uRefresh.robRefresh(k).pdst
+    uBCT.io.refreshAddr(k)  := effRefPdst(k)
   }
 
   // Store 提交路径：
