@@ -81,9 +81,33 @@ class Execute extends Module {
   // 实现：下面的 lane0CanForward/lane0Pdst/lane0Data 由 lane0 迭代赋值（见 for
   //      循环体尾部），然后 lane>=1 的 actual_rdata1/2 会优先使用它。
   // ============================================================================
+  // Phase C：N² 同拍前递。每个 lane 都暴露"是否能同拍前递 + pdst + data"，
+  // 更年轻 lane 的源操作数 mux 优先取最年轻可用的 lane(j<k) 同拍结果。
+  val laneFwdValid = WireInit(VecInit(Seq.fill(CPUConfig.issueWidth)(false.B)))
+  val laneFwdPdst  = Wire(Vec(CPUConfig.issueWidth, UInt(CPUConfig.prfAddrWidth.W)))
+  val laneFwdData  = Wire(Vec(CPUConfig.issueWidth, UInt(32.W)))
+  for (k <- 0 until CPUConfig.issueWidth) {
+    laneFwdPdst(k) := 0.U
+    laneFwdData(k) := 0.U
+  }
+  // 兼容旧代码：保留 lane0 的导出别名（部分模块可能仍引用，未来可清理）
   val lane0CanForward = WireInit(false.B)
   val lane0FwdPdst    = WireInit(0.U(CPUConfig.prfAddrWidth.W))
   val lane0FwdData    = WireInit(0.U(32.W))
+
+  // TD-C：BHT/BTB 更新本地 Vec —— 每个 lane 各自计算，循环后再 OR/Mux1H 汇聚到单端口。
+  // 因 Issue.scala 已强制 "no-double-Branch"，每拍最多 1 条 lane 触发更新，OR 安全。
+  val laneBhtValid  = WireInit(VecInit(Seq.fill(CPUConfig.issueWidth)(false.B)))
+  val laneBhtIdx    = Wire(Vec(CPUConfig.issueWidth, UInt(bhtIdxWidth.W)))
+  val laneBhtTaken  = WireInit(VecInit(Seq.fill(CPUConfig.issueWidth)(false.B)))
+  val laneBtbValid  = WireInit(VecInit(Seq.fill(CPUConfig.issueWidth)(false.B)))
+  val laneBtbPc     = Wire(Vec(CPUConfig.issueWidth, UInt(32.W)))
+  val laneBtbTarget = Wire(Vec(CPUConfig.issueWidth, UInt(32.W)))
+  for (k <- 0 until CPUConfig.issueWidth) {
+    laneBhtIdx(k)    := 0.U
+    laneBtbPc(k)     := 0.U
+    laneBtbTarget(k) := 0.U
+  }
 
   // ---- 每 lane 独立算一遍 ALU ----
   for (k <- 0 until CPUConfig.issueWidth) {
@@ -110,14 +134,19 @@ class Execute extends Module {
     val actual_rdata1_pre = bypass(psrc1, inL.src1Data)
     val actual_rdata2_pre = bypass(psrc2, inL.src2Data)
 
-    // ---- 【阶段 A1】lane>=1 源操作数再覆盖一层 lane0 同拍前递 ----
-    // 若 lane0 本拍能产出结果，且其 pdst 命中当前 lane 的 psrc，则优先使用 lane0
-    // 同拍结果；否则仍使用多级旁路/PRF 结果。
+    // ---- 【Phase C】lane k 源操作数：优先用任一更老 lane(j<k) 的同拍前递结果 ----
+    // 选择策略：从最年轻(j=k-1)向最老(j=0)优先匹配，命中即用——保证拿到的是同拍最新值。
     val actual_rdata1 = if (k == 0) actual_rdata1_pre else {
-      Mux(lane0CanForward && (lane0FwdPdst === psrc1) && (psrc1 =/= 0.U), lane0FwdData, actual_rdata1_pre)
+      val cases = (k - 1 to 0 by -1).map { j =>
+        (laneFwdValid(j) && (laneFwdPdst(j) === psrc1) && (psrc1 =/= 0.U)) -> laneFwdData(j)
+      }
+      PriorityMux(cases :+ (true.B -> actual_rdata1_pre))
     }
     val actual_rdata2 = if (k == 0) actual_rdata2_pre else {
-      Mux(lane0CanForward && (lane0FwdPdst === psrc2) && (psrc2 =/= 0.U), lane0FwdData, actual_rdata2_pre)
+      val cases = (k - 1 to 0 by -1).map { j =>
+        (laneFwdValid(j) && (laneFwdPdst(j) === psrc2) && (psrc2 =/= 0.U)) -> laneFwdData(j)
+      }
+      PriorityMux(cases :+ (true.B -> actual_rdata2_pre))
     }
 
     val iChoose30OrNot = iType && (funct3 === "b101".U)
@@ -161,17 +190,16 @@ class Execute extends Module {
     val laneValid = in.valid && in.bits.validMask(k)
     val isMispredict = laneValid && (b_mispredict || jalr_mispredict)
 
-    if (k == 0 && CPUConfig.useBHT) {
-      bht_update.get.valid := laneValid && bType
-      bht_update.get.idx   := inL.pc(bhtIdxWidth + 1, 2)
-      bht_update.get.taken := branch_taken
+    // TD-C：BHT/BTB 更新改为按 lane 写入 Vec（循环外再汇聚），lane1 也可承接。
+    if (CPUConfig.useBHT) {
+      laneBhtValid(k) := laneValid && bType
+      laneBhtIdx(k)   := inL.pc(bhtIdxWidth + 1, 2)
+      laneBhtTaken(k) := branch_taken
     }
-
-    // ---- 【阶段 δ】BTB 更新：每条解析的 JALR 都写回其实际目标 ----
-    if (k == 0 && CPUConfig.useBTB) {
-      btb_update.get.valid  := laneValid && jalr
-      btb_update.get.pc     := inL.pc
-      btb_update.get.target := jalr_target
+    if (CPUConfig.useBTB) {
+      laneBtbValid(k)  := laneValid && jalr
+      laneBtbPc(k)     := inL.pc
+      laneBtbTarget(k) := jalr_target
     }
 
     outL.inst_funct3 := Mux(lType || sType, funct3, 0.U)
@@ -193,15 +221,34 @@ class Execute extends Module {
     outL.storeSeqSnap         := inL.storeSeqSnap
     outL.checkpointIdx        := inL.checkpointIdx
 
-    // ---- 【阶段 A1】lane0 迭代结尾：把本拍结果导出为"同拍前递源" ----
-    // 只有 lane0 需要导出；并且仅在 lane0 "能同拍产出结果" 时才允许前递。
-    // 能同拍产出 <=> 非 Load（!lType），且有写回使能，pdst!=0，lane 本身有效。
+    // ---- 【Phase C】每条 lane 把本拍结果暴露为同拍前递源（供后面 lane 用）----
+    // 能同拍产出 <=> 非 Load（!lType），且有写回使能，pdst!=0，lane 本身 valid。
+    val canFwdK = laneValid && inL.regWriteEnable && !lType && (outL.pdst =/= 0.U)
+    laneFwdValid(k) := canFwdK
+    laneFwdPdst(k)  := outL.pdst
+    laneFwdData(k)  := outL.data
     if (k == 0) {
-      val canFwd = laneValid && inL.regWriteEnable && !lType && (outL.pdst =/= 0.U)
-      lane0CanForward := canFwd
+      lane0CanForward := canFwdK
       lane0FwdPdst    := outL.pdst
       lane0FwdData    := outL.data
     }
+  }
+
+  // TD-C：BHT/BTB 单端口聚合。"no-double-Branch" 已保证每拍至多 1 条 lane 触发更新，
+  // 因此简单 OR + PriorityMux/Mux1H 即可（用 PriorityMux 即使理论同时触发也优先更老 lane）。
+  if (CPUConfig.useBHT) {
+    val bhtAny = laneBhtValid.asUInt.orR
+    val bhtIdx = PriorityEncoder(laneBhtValid.asUInt)
+    bht_update.get.valid := bhtAny
+    bht_update.get.idx   := laneBhtIdx(bhtIdx)
+    bht_update.get.taken := laneBhtTaken(bhtIdx)
+  }
+  if (CPUConfig.useBTB) {
+    val btbAny = laneBtbValid.asUInt.orR
+    val btbIdx = PriorityEncoder(laneBtbValid.asUInt)
+    btb_update.get.valid  := btbAny
+    btb_update.get.pc     := laneBtbPc(btbIdx)
+    btb_update.get.target := laneBtbTarget(btbIdx)
   }
 
   out.bits.validMask := in.bits.validMask

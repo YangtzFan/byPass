@@ -34,7 +34,8 @@ class MyCPU extends Module {
   // myCPU 只暴露“commit enqueue / committed-query / load req&resp”前端协议，
   // 由 SoC_Top 在核外实例化 AXIStoreQueue 并统一连接 DRAM。
   val sqEnq = IO(Decoupled(new SQEnqPayload))
-  val sqQuery = IO(new AXISQQueryIO)
+  // TD-B：sqQuery 升级为 Vec(N) 多查询口（Memory 阶段每个 Load lane 独立查询）。
+  val sqQuery = IO(Vec(LaneCapability.loadLanes.size, new AXISQQueryIO))
   val sqLoadAddr = IO(Decoupled(UInt(32.W)))
   val sqLoadData = IO(Flipped(Decoupled(UInt(32.W))))
 
@@ -147,19 +148,24 @@ class MyCPU extends Module {
   // ---- Rename ↔ ReadyTable 连接（仅置 busy）----
   uReadyTable.io.busyVen  := uRename.readyTable.busyVen
   uReadyTable.io.busyAddr := uRename.readyTable.busyAddr
-  // 阶段 1：ReadyTable 读端口改由 IssueQueue 入队当拍使用，避免 Rename→IQ
+  // ReadyTable 读端口改由 IssueQueue 入队当拍使用，避免 Rename→IQ
   // 两级流水间丢失 wakeup。具体连接在 IssueQueue 实例化之后。
 
   // ---- Rename ↔ BranchCheckpointTable 连接（保存 checkpoint）----
   uBCT.renameRequest <> uRename.ckPointReq
 
-  uBCT.save1.rat     := uRename.ckptRAT.postRename1
-  uBCT.save1.flHead  := uFreeList.io.snapHead1
-  uBCT.save1.readyTb := uReadyTable.io.snapData
+  // Phase A.3：BCT save 接口已 Vec 化（saveDataIn(k)），ckptSaveWidth=2 时与
+  // 原 save1/save2 等价；后续 A.4 提到 4 时此处仅需补两组连线。
+  uBCT.saveDataIn(0).rat     := uRename.ckptRAT.postRename1
+  uBCT.saveDataIn(0).flHead  := uFreeList.io.snapHead1
+  uBCT.saveDataIn(0).readyTb := uRename.ckptReadyTb.postRename1
 
-  uBCT.save2.rat     := uRename.ckptRAT.postRename2
-  uBCT.save2.flHead  := uFreeList.io.snapHead2
-  uBCT.save2.readyTb := uReadyTable.io.snapData
+  uBCT.saveDataIn(1).rat     := uRename.ckptRAT.postRename2
+  uBCT.saveDataIn(1).flHead  := uFreeList.io.snapHead2
+  uBCT.saveDataIn(1).readyTb := uRename.ckptReadyTb.postRename2
+
+  // 提供当前 ReadyTable 全量给 Rename，用于叠加同拍 busyVen 形成正确分支快照
+  uRename.readyTbSnapIn := uReadyTable.io.snapData
 
   // =====================================================
   // ============ Rename → Dispatch 流水寄存器（RenDisDff）============
@@ -191,7 +197,7 @@ class MyCPU extends Module {
   uIssueQueue.write := uDisp.out
   uIssueQueue.flush := memRedirectValid
   uIssueQueue.flushBranchRobIdx := memRedirectRobIdx
-  // 阶段 1：IssueQueue 同拍查询 ReadyTable（8 端口：4 条指令 × 2 源）
+  // IssueQueue 同拍查询 ReadyTable（8 端口：4 条指令 × 2 源）
   uReadyTable.io.raddr          := uIssueQueue.readyQuery.raddr
   uIssueQueue.readyQuery.rdata  := uReadyTable.io.rdata
 
@@ -207,10 +213,57 @@ class MyCPU extends Module {
   // =====================================================
   // ============ Issue → ReadReg 流水线寄存器（IssRRDff）============
   // =====================================================
+  // TD-C：post-IQ DFF 改用 per-lane 选择性 flush。
+  // 背景：IQ 是 OoO 调度，bundle 内 lane0/lane1 的 robIdx 互不相同；旧的"按 lane0
+  // robIdx 整 bundle 决策"在以下场景会漏 flush：
+  //   bundle = [lane0=老于 mispredict, lane1=年轻于 mispredict]，
+  //   lane0 比 mispredict 老 → BaseDff 误判为整 bundle 留下，lane1 跑了错误路径。
+  // 解决：逐 lane 比较 robIdx，把"年轻于分支"的 lane 在 validMask 中清零；
+  //       全部 lane 都被清零再丢弃整 bundle。
+  private def laneFlushIssRR(b: Issue_ReadReg_Payload, branchIdx: UInt): (Issue_ReadReg_Payload, Bool) = {
+    val w = CPUConfig.robPtrWidth
+    val n = CPUConfig.issueWidth
+    val newBits = Wire(Vec(n, Bool()))
+    for (k <- 0 until n) {
+      val rob = b.lanes(k).robIdx
+      val younger = ((rob - branchIdx)(w - 1) === 0.U) && (rob =/= branchIdx)
+      newBits(k) := b.validMask(k) && !younger
+    }
+    val masked = WireDefault(b)
+    masked.validMask := newBits.asUInt
+    (masked, newBits.asUInt.orR)
+  }
+  private def laneFlushRREx(b: ReadReg_Execute_Payload, branchIdx: UInt): (ReadReg_Execute_Payload, Bool) = {
+    val w = CPUConfig.robPtrWidth
+    val n = CPUConfig.issueWidth
+    val newBits = Wire(Vec(n, Bool()))
+    for (k <- 0 until n) {
+      val rob = b.lanes(k).robIdx
+      val younger = ((rob - branchIdx)(w - 1) === 0.U) && (rob =/= branchIdx)
+      newBits(k) := b.validMask(k) && !younger
+    }
+    val masked = WireDefault(b)
+    masked.validMask := newBits.asUInt
+    (masked, newBits.asUInt.orR)
+  }
+  private def laneFlushExMem(b: Execute_Memory_Payload, branchIdx: UInt): (Execute_Memory_Payload, Bool) = {
+    val w = CPUConfig.robPtrWidth
+    val n = CPUConfig.memoryWidth
+    val newBits = Wire(Vec(n, Bool()))
+    for (k <- 0 until n) {
+      val rob = b.lanes(k).robIdx
+      val younger = ((rob - branchIdx)(w - 1) === 0.U) && (rob =/= branchIdx)
+      newBits(k) := b.validMask(k) && !younger
+    }
+    val masked = WireDefault(b)
+    masked.validMask := newBits.asUInt
+    (masked, newBits.asUInt.orR)
+  }
+
   val uIssRRDff = Module(new BaseDff(
     new Issue_ReadReg_Payload,
     supportFlush = true,
-    getRobIdx = Some((b: Issue_ReadReg_Payload) => b.lanes(0).robIdx)
+    laneFlush = Some(laneFlushIssRR _)
   ))
   uIssRRDff.in <> uIssue.out
   uIssRRDff.flush.get := memRedirectValid
@@ -233,7 +286,7 @@ class MyCPU extends Module {
   val uRRExDff = Module(new BaseDff(
     new ReadReg_Execute_Payload,
     supportFlush = true,
-    getRobIdx = Some((b: ReadReg_Execute_Payload) => b.lanes(0).robIdx)
+    laneFlush = Some(laneFlushRREx _)
   ))
   uRRExDff.in <> uReadReg.out
   uRRExDff.flush.get := memRedirectValid
@@ -265,31 +318,40 @@ class MyCPU extends Module {
   val uExMemDff = Module(new BaseDff(
     new Execute_Memory_Payload,
     supportFlush = true,
-    getRobIdx = Some((b: Execute_Memory_Payload) => b.lanes(0).robIdx)
+    laneFlush = Some(laneFlushExMem _)
   ))
   uExMemDff.in <> uExecute.out
   uExMemDff.flush.get := memRedirectValid
   uExMemDff.flushBranchRobIdx.get := memRedirectRobIdx
 
   // ---- Load-Use 冒险检测信号连接 ----
-  // Issue 阶段需要知道下游所有尚未把 Load 数据写回 PRF 的 Load 位置，
-  // 以便在这些 Load 数据对 PRF 可见之前阻止依赖指令进入流水线。
-  // 覆盖 3 级：ReadReg(IssRRDff) / Execute(RRExDff) / Memory(ExMemDff)。
-  // Refresh 级（MemRefDff）本拍写 PRF，Issue 同拍放行的依赖指令在下一拍才 ReadReg 读 PRF，
-  // 已能看到新值，不必加入冒险源。
-  uIssue.hazard(0).pdst        := uIssRRDff.out.bits.lanes(0).pdst
-  uIssue.hazard(0).isValidLoad := uIssRRDff.out.valid &&
-    uIssRRDff.out.bits.lanes(0).type_decode_together(4) && uIssRRDff.out.bits.lanes(0).regWriteEnable
-  uIssue.hazard(1).pdst        := uRRExDff.out.bits.lanes(0).pdst
-  uIssue.hazard(1).isValidLoad := uRRExDff.out.valid &&
-    uRRExDff.out.bits.lanes(0).type_decode_together(4) && uRRExDff.out.bits.lanes(0).regWriteEnable
-  uIssue.hazard(2).pdst        := uExMemDff.out.bits.lanes(0).pdst
-  uIssue.hazard(2).isValidLoad := uExMemDff.out.valid &&
-    uExMemDff.out.bits.lanes(0).type_decode_together(4) && uExMemDff.out.bits.lanes(0).regWriteEnable
-  // η2：第 4 个 hazard 源——Memory 阶段 MSHR 中持有的 outstanding Load。
-  // mshrPending.valid 已经在 MSHR ack 同拍组合清掉，因此 hazard 在写口仲裁成功时立刻释放，
-  // 与传统流水线 Refresh 写 PRF 同拍解除依赖、消费者下一拍就能 Issue 的时序保持一致。
-  // 真正连线在 Memory 实例化之后（向下查找 "uIssue.hazard(3)"）。
+  // TD-B：loadLanes 升到 2，下游 RR/Execute/Memory 三级里**每条 Load lane**都可能持有
+  // 未写回 PRF 的 Load。hazard 槽位扩到 3 * loadLanes.size = 6（再 + MSHR 2 槽 = 8）。
+  // 槽位顺序：(level 0..2) × (loadLane 0..N-1)；与 Issue.scala::NumLoadHazardSrcs 对应。
+  for ((laneIdx, qIdx) <- LaneCapability.loadLanes.zipWithIndex) {
+    // RR 级（uIssRRDff.out）
+    val rrSlot = 0 * LaneCapability.loadLanes.size + qIdx
+    uIssue.hazard(rrSlot).pdst        := uIssRRDff.out.bits.lanes(laneIdx).pdst
+    uIssue.hazard(rrSlot).isValidLoad := uIssRRDff.out.valid &&
+      uIssRRDff.out.bits.validMask(laneIdx) &&
+      uIssRRDff.out.bits.lanes(laneIdx).type_decode_together(4) &&
+      uIssRRDff.out.bits.lanes(laneIdx).regWriteEnable
+    // Execute 级（uRRExDff.out）
+    val exSlot = 1 * LaneCapability.loadLanes.size + qIdx
+    uIssue.hazard(exSlot).pdst        := uRRExDff.out.bits.lanes(laneIdx).pdst
+    uIssue.hazard(exSlot).isValidLoad := uRRExDff.out.valid &&
+      uRRExDff.out.bits.validMask(laneIdx) &&
+      uRRExDff.out.bits.lanes(laneIdx).type_decode_together(4) &&
+      uRRExDff.out.bits.lanes(laneIdx).regWriteEnable
+    // Memory 级（uExMemDff.out）
+    val memSlot = 2 * LaneCapability.loadLanes.size + qIdx
+    uIssue.hazard(memSlot).pdst        := uExMemDff.out.bits.lanes(laneIdx).pdst
+    uIssue.hazard(memSlot).isValidLoad := uExMemDff.out.valid &&
+      uExMemDff.out.bits.validMask(laneIdx) &&
+      uExMemDff.out.bits.lanes(laneIdx).type_decode_together(4) &&
+      uExMemDff.out.bits.lanes(laneIdx).regWriteEnable
+  }
+  // η2：MSHR Vec(2) 的两个槽位填到 hazard 末尾（slot 6/7），真正连线在 Memory 实例化之后。
 
   // =====================================================
   // ============ Memory（访存 + StoreBuffer 转发 + 分支纠错重定向）============
@@ -298,13 +360,21 @@ class MyCPU extends Module {
   uMemory.in <> uExMemDff.out
 
   // ---- Store StoreBuffer 写入连接（Memory 阶段将地址、数据、字节掩码写入 StoreBuffer）----
-  uStoreBuffer.write := uMemory.sbWrite
+  // 阶段 D'：sbWrite 升级为 Vec（lane0 + lane1），按端口逐位连接。
+  for (p <- 0 until LaneCapability.storeLanes.size) {
+    uStoreBuffer.write(p) := uMemory.sbWrite(p)
+  }
 
   // ---- Load StoreBuffer 查询连接（Memory 阶段字节级转发查询）----
   uStoreBuffer.query <> uMemory.sbQuery
 
   // Memory 阶段重定向信号
-  memRedirectValid        := uMemory.redirect.valid
+  // v15 修复（algo_array_ops_ooo4 死锁）：
+  // 用 BCT.recoverIdxInRange 校验 redirect.checkpointIdx 是否落在 BCT 在飞区间。
+  // 越界视为 stale memRedirect（详见 BranchCheckpointTable.scala 中说明），
+  // 整体抑制 memRedirect 的所有副作用（pipeline flush / ROB rollback / RAT/FreeList 恢复
+  // / BCT 状态变更等），避免幻影 checkpoint 占满 BCT 物理槽导致永久死锁。
+  memRedirectValid        := uMemory.redirect.valid && uBCT.io.recoverIdxInRange
   memRedirectAddr         := uMemory.redirect.addr
   memRedirectRobIdx       := uMemory.redirect.robIdx
   memRedirectStoreSeqSnap := uMemory.redirect.storeSeqSnap
@@ -318,9 +388,13 @@ class MyCPU extends Module {
   uMemory.flushIn.valid        := memRedirectValid
   uMemory.flushIn.branchRobIdx := memRedirectRobIdx
 
-  // η2：第 4 个 hazard 源——Memory 阶段 MSHR 中持有的 outstanding Load。
-  uIssue.hazard(3).pdst        := uMemory.mshrPending.pdst
-  uIssue.hazard(3).isValidLoad := uMemory.mshrPending.valid && uMemory.mshrPending.regWriteEnable
+  // η2/TD-B：hazard 末尾 2 个槽位——Memory 阶段 MSHR 两个槽中持有的 outstanding Load。
+  // 槽号 = 3 * loadLanes.size 起，共 2 个（MSHR 两个 entry）。
+  private val mshrHazardBase = 3 * LaneCapability.loadLanes.size
+  uIssue.hazard(mshrHazardBase + 0).pdst        := uMemory.mshrPending(0).pdst
+  uIssue.hazard(mshrHazardBase + 0).isValidLoad := uMemory.mshrPending(0).valid && uMemory.mshrPending(0).regWriteEnable
+  uIssue.hazard(mshrHazardBase + 1).pdst        := uMemory.mshrPending(1).pdst
+  uIssue.hazard(mshrHazardBase + 1).isValidLoad := uMemory.mshrPending(1).valid && uMemory.mshrPending(1).regWriteEnable
 
   // ROB 回滚：Memory redirect 时将 tail 回滚到误预测指令之后
   uROB.rollback.valid  := memRedirectValid
@@ -342,20 +416,33 @@ class MyCPU extends Module {
   // =====================================================
   val uRefresh = Module(new Refresh)
   uRefresh.in <> uMemRefDff.out
-  // η2：MSHR 写口仲裁。
-  //   - uRefresh.robRefresh(k) 是“正常 Refresh 路径”的写源；
-  //   - uMemory.mshrComplete 是“MSHR 完成路径”的写源；
-  //   - 两者抢同一个 ROB.refresh / PRF.write / ReadyTable / IQ.wakeup / BCT 写端口。
-  // 仲裁策略：扫描 k=0..refreshWidth-1，把 MSHR 接管到“第一个 Refresh 没占用的 lane”。
-  // mshrFreeLaneOH(k)=1 表示本拍 MSHR 通过 lane k 完成写回；同拍清 MSHR.valid。
-  val mshrFreeLaneOH = Wire(Vec(CPUConfig.refreshWidth, Bool()))
-  var mshrClaimedBefore: Bool = false.B
-  for (k <- 0 until CPUConfig.refreshWidth) {
-    val freeK = !uRefresh.robRefresh(k).valid
-    mshrFreeLaneOH(k) := uMemory.mshrComplete.valid && freeK && !mshrClaimedBefore
-    mshrClaimedBefore = mshrClaimedBefore || mshrFreeLaneOH(k)
+  // η2 / TD-D：MSHR 写口仲裁（mshrComplete: Vec(2)）。
+  //   - uRefresh.robRefresh(k) 是"正常 Refresh 路径"的写源；
+  //   - uMemory.mshrComplete(j) 是"MSHR 完成路径"的写源（j ∈ 0..1）；
+  //   - 两类写源抢同一个 ROB.refresh / PRF.write / ReadyTable / IQ.wakeup / BCT 写端口。
+  // 仲裁策略（TD-D 升级为 2 路并行）：依次为 j=0,1 找一条"既未被 Refresh 占用、也未被
+  // 前序 j' < j 的 mshrComplete 占用"的最低 lane k 接管。
+  // mshrLaneClaimByJ(j)(k)=1 表示 mshrComplete(j) 通过 lane k 完成本拍写回。
+  val numMshrComp = uMemory.mshrComplete.length // = 2
+  val mshrLaneClaimByJ = Wire(Vec(numMshrComp, Vec(CPUConfig.refreshWidth, Bool())))
+  for (j <- 0 until numMshrComp) {
+    var claimedJ: Bool = false.B
+    for (k <- 0 until CPUConfig.refreshWidth) {
+      val freeFromRefresh = !uRefresh.robRefresh(k).valid
+      // 该 lane 是否已被 j' < j 的 mshrComplete 占走（静态展开 OR）
+      val takenByEarlier: Bool =
+        (0 until j).map(jp => mshrLaneClaimByJ(jp)(k)).foldLeft(false.B)(_ || _)
+      val pick = uMemory.mshrComplete(j).valid && freeFromRefresh && !takenByEarlier && !claimedJ
+      mshrLaneClaimByJ(j)(k) := pick
+      claimedJ = claimedJ || pick
+    }
+    uMemory.mshrComplete(j).ack := mshrLaneClaimByJ(j).asUInt.orR
   }
-  uMemory.mshrComplete.ack := mshrFreeLaneOH.asUInt.orR
+  // 每条 refresh lane 是否被任一 mshrComplete 接管（用于 effRef* 选择）。
+  val mshrFreeLaneOH = Wire(Vec(CPUConfig.refreshWidth, Bool()))
+  for (k <- 0 until CPUConfig.refreshWidth) {
+    mshrFreeLaneOH(k) := (0 until numMshrComp).map(j => mshrLaneClaimByJ(j)(k)).reduce(_ || _)
+  }
 
   // 每 lane 计算"有效 refresh 源"（MSHR 接管 vs 正常 Refresh）。
   val effRefValid = Wire(Vec(CPUConfig.refreshWidth, Bool()))
@@ -364,13 +451,21 @@ class MyCPU extends Module {
   val effRefData  = Wire(Vec(CPUConfig.refreshWidth, UInt(32.W)))
   val effRefWen   = Wire(Vec(CPUConfig.refreshWidth, Bool()))
   for (k <- 0 until CPUConfig.refreshWidth) {
-    val rr = uRefresh.robRefresh(k)
+    val rr  = uRefresh.robRefresh(k)
     val sel = mshrFreeLaneOH(k)
+    // lane k 被哪一路 mshrComplete 占走？同拍至多一路占同一 lane（逐字段 PriorityMux）
+    val claimBitsK = (0 until numMshrComp).map(j => mshrLaneClaimByJ(j)(k))
+    def pickField[T <: chisel3.Data](fn: Int => T, default: T): T =
+      MuxCase(default, (0 until numMshrComp).map { j => claimBitsK(j) -> fn(j) })
+    val mshrRobIdx = pickField(j => uMemory.mshrComplete(j).robIdx, 0.U(CPUConfig.robPtrWidth.W))
+    val mshrPdstK  = pickField(j => uMemory.mshrComplete(j).pdst,   0.U(CPUConfig.prfAddrWidth.W))
+    val mshrDataK  = pickField(j => uMemory.mshrComplete(j).data,   0.U(32.W))
+    val mshrWenK   = pickField(j => uMemory.mshrComplete(j).regWriteEnable, false.B)
     effRefValid(k) := Mux(sel, true.B, rr.valid)
-    effRefIdx(k)   := Mux(sel, uMemory.mshrComplete.robIdx, rr.idx)
-    effRefPdst(k)  := Mux(sel, uMemory.mshrComplete.pdst, rr.pdst)
-    effRefData(k)  := Mux(sel, uMemory.mshrComplete.data, rr.regWBData)
-    effRefWen(k)   := Mux(sel, uMemory.mshrComplete.regWriteEnable, rr.regWriteEnable)
+    effRefIdx(k)   := Mux(sel, mshrRobIdx, rr.idx)
+    effRefPdst(k)  := Mux(sel, mshrPdstK,  rr.pdst)
+    effRefData(k)  := Mux(sel, mshrDataK,  rr.regWBData)
+    effRefWen(k)   := Mux(sel, mshrWenK,   rr.regWriteEnable)
   }
 
   // 多 lane ROB refresh 端口逐 lane 连接（用 effRef* 统一驱动）
@@ -422,29 +517,57 @@ class MyCPU extends Module {
     val memLane  = uExMemDff.out.bits.lanes(k)
     val memAdvance = uExMemDff.out.fire
     val memValid = memAdvance && uExMemDff.out.bits.validMask(k)
-    // η2-step(b)：lane0 若本拍 Load 进入 MSHR（mshrCaptureFire=1），则其 validMask(0)
-    // 已经被 Memory 置 0，γ-wake 由 Refresh 路径接管时机变成"MSHR 完成那拍"。这里显式
-    // 抑制 γ-wake 是为了让逻辑更清晰：禁止在捕获拍发出"假"的提前唤醒。
-    val k0Suppress = if (k == 0) uMemory.mshrCaptureFire else false.B
+    // η2-step(b) / TD-B：若本拍 Load 进入 MSHR（mshrCaptureFire(qIdx)=1），则该 Load
+    // 所在 lane 的 validMask 已经被 Memory 置 0，γ-wake 由 Refresh 路径接管时机变成
+    // "MSHR 完成那拍"。这里需要**逐 lane**抑制 γ-wake：只有当前 lane 在 loadLanes 中
+    // 且对应 mshrCaptureFire 位为 1 时才禁止广播；非 Load lane（k 不在 loadLanes 内）不抑制。
+    val laneSuppress: Bool =
+      if (LaneCapability.loadLanes.contains(k)) {
+        val qIdx = LaneCapability.loadLanes.indexOf(k)
+        uMemory.mshrCaptureFire(qIdx)
+      } else {
+        false.B
+      }
     uIssueQueue.wakeup(CPUConfig.refreshWidth + k).valid :=
-      memValid && memLane.regWriteEnable && (memLane.pdst =/= 0.U) && !k0Suppress
+      memValid && memLane.regWriteEnable && (memLane.pdst =/= 0.U) && !laneSuppress
     uIssueQueue.wakeup(CPUConfig.refreshWidth + k).pdst := memLane.pdst
   }
-  // 阶段 β：Execute 级 wakeup。提前 1 拍再广播。门控仍是 valid / validMask / !isLoad / wen / pdst≠0。
-  // 关键修复：必须额外门控 uRRExDff.out.fire（= valid && ready），即只有当
-  // 生产者本拍实际从 Execute 推进到 Memory（ExMemDff.in.ready 为真）时才广播 wake。
-  // 原因：若 Memory 反压（例如前一条 Load 正在阻塞），RRExDff 的 valid 会持续为 1，
-  // 生产者被“困”在 Execute 多拍，Refresh 写 PRF 的时点会随之后移；
-  // 若 β wake 每拍都触发，消费者会在生产者尚未写 PRF 之前读到旧值，产生 RAW 错误。
-  // 只在 fire 的那一拍广播，能保证生产者确定在 N+2 拍抵达 Refresh 并写 PRF，
-  // 消费者在 N+2 拍 ReadReg 时恰好命中 PRF 的写优先 bypass。
-  val exAdvance = uRRExDff.out.fire
+  // 阶段 β：Execute 级 wakeup（提前 1 拍广播）。
+  // [v19 TD-E 严格门控 v4] 三重门控：
+  //   1) uRRExDff.out.fire   —— 本拍生产者真的从 RR/Ex 推进到 ExMemDff（v18 已有）；
+  //   2) uMemory.in.ready    —— 当前 ExMemDff→Memory 通路无反压（v3 增）；
+  //   3) !anyLoadInExBundle —— 当前 RR/Ex bundle 内任一 lane 不是 Load。
+  //
+  // 不变量论证（重点在第 3 条，针对 dual-Load 模式 Bug A）：
+  //   生产者在 cycle N 进入 ExMemDff（end of N capture），cycle N+1 由 ExMemDff.out 喂入 Memory。
+  //   Memory.memStall 由"本 bundle 是否含需走 MSHR 的 Load"决定 —— Load lane 与 ALU lane
+  //   是同 bundle 流水推进，若 lane1=Load 因 MSHR 容量/older-unknown 触发 memStall，
+  //   则同 bundle 的 lane0=ALU 生产者也被一并卡在 ExMemDff 多拍，PRF 写时点后移
+  //   → 消费者按 N+3 拍读 PRF 命中 stale；
+  //   故"本 Ex bundle 内不含 Load"才能保证 ExMemDff→Memory→MemRefDff→Refresh 直通。
+  //   - 配合 Memory.in.ready=1，再加"我也不是 Load 同 bundle"，就保证 N+1 拍 Memory 不会
+  //     因当前 bundle 自身停滞，进而保证 PRF 在 N+3 拍可见。
+  //   - 唯一遗漏路径：N+1 拍 Memory 内 bundle（=本 bundle）虽非 Load，但 redirect/flush
+  //     之类全局 stall 仍可能导致 MemRefDff 不接受 → 实测 v18 baseline 已稳定，不重复构造。
+  val anyLoadInExBundle = (0 until CPUConfig.executeWidth).map { k =>
+    val ln = uRRExDff.out.bits.lanes(k)
+    uRRExDff.out.bits.validMask(k) && ln.type_decode_together(4)
+  }.reduce(_ || _)
+  val exAdvance = uRRExDff.out.fire && uMemory.in.ready && !anyLoadInExBundle
   for (k <- 0 until CPUConfig.executeWidth) {
     val exLane  = uRRExDff.out.bits.lanes(k)
     val exValid = exAdvance && uRRExDff.out.bits.validMask(k)
     val exIsLoad = exLane.type_decode_together(4)
+    // [v20 P0+P1 安全版] βwake 启用范围：lane0、lane2、lane3 三档放行；lane1 暂保留禁用。
+    //   - lane0：v19 已开（Full lane，但 anyLoadInExBundle 已隔离 Load 场景）；
+    //   - lane2/lane3：ALU-only，本身永不可能是 Load（exIsLoad 永为 false）。
+    //     仍受第 3 重门控 !anyLoadInExBundle 保护：bundle 内任意 lane 是 Load 触发
+    //     memStall 时，整 bundle 原子推进 → lane2/3 ALU 生产者也会被卡在 ExMemDff，
+    //     PRF 写时点后移到 N+4 破坏 N+3 不变量。故必须保留三重门控。
+    //   - lane1：保持禁用 = v19.3 不变量 I-D（lane1 βwake 未独立验证）。
+    val betaEnable = (k.U === 0.U) || (k.U === 2.U) || (k.U === 3.U)
     uIssueQueue.wakeup(CPUConfig.refreshWidth + CPUConfig.memoryWidth + k).valid :=
-      exValid && exLane.regWriteEnable && !exIsLoad && (exLane.pdst =/= 0.U)
+      betaEnable && exValid && exLane.regWriteEnable && !exIsLoad && (exLane.pdst =/= 0.U)
     uIssueQueue.wakeup(CPUConfig.refreshWidth + CPUConfig.memoryWidth + k).pdst := exLane.pdst
   }
 

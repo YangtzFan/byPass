@@ -42,30 +42,21 @@ class Issue extends Module {
   // ---- IssueQueue 发射选择接口（Vec 化）----
   val iqIssue = IO(Vec(CPUConfig.issueWidth, Flipped(Decoupled(new DispatchEntry))))
 
-  // ---- Load-Use 冒险检测接口：4 项标量 ----
-  //   hazard(0..2) 跟踪下游 RR/Execute/Memory 三级里尚未写 PRF 的 Load（lane0 only）；
-  //   hazard(3) 跟踪 Memory 阶段 MSHR 中的 outstanding Load（η2 引入：Memory 已 fire 但
-  //     DRAM 数据尚未回，PRF 还没写，必须阻塞依赖该 pdst 的消费者）。
-  val NumLoadHazardSrcs: Int = 4
+  // ---- Load-Use 冒险检测接口 ----
+  //   TD-B：loadLanes 升到 2 条，每个 Load lane 都可能在下游 RR/Execute/Memory 持有未写
+  //   回 PRF 的 Load，因此 hazard 槽位扩到 3 * loadLanes.size = 6；最后再加上 MSHR
+  //   Vec(2) 两槽，共 8 项。MyCPU 顶层负责按 lane 顺序填充每个槽位的 pdst/isValidLoad。
+  val NumLoadHazardSrcs: Int = 3 * LaneCapability.loadLanes.size + 2
   val hazard = IO(Input(Vec(NumLoadHazardSrcs, new LoadHazardSource)))
 
   private val robW = CPUConfig.robPtrWidth
 
   // ---- 辅助：对单条指令进行解码 & 冒险检测 ----
-  private def useRs1(td: UInt): Bool = {
-    val jalr  = td(6); val bType = td(5); val lType = td(4)
-    val iType = td(3); val sType = td(2); val rType = td(1)
-    jalr || bType || iType || sType || rType || lType
-  }
-  private def useRs2(td: UInt): Bool = {
-    val bType = td(5); val sType = td(2); val rType = td(1)
-    bType || sType || rType
-  }
-  // 判断某条指令是否可放在 lane1 发射（纯 ALU：iType/rType/lui）
-  private def aluOnly(td: UInt): Bool = {
-    val iType = td(3); val rType = td(1); val lui = td(8)
-    iType || rType || lui
-  }
+  // Phase A.2：以下 useRs1 / useRs2 / aluOnly 改为 LaneCapability helper 单点定义。
+  private def useRs1(td: UInt): Bool = LaneCapability.useRs1(td)
+  private def useRs2(td: UInt): Bool = LaneCapability.useRs2(td)
+  // 判断某条指令是否可放在 ALU-only lane 发射（纯 ALU：iType/rType/lui）
+  private def aluOnly(td: UInt): Bool = LaneCapability.isAluOnly(td)
 
   // ---- 预先算每 lane 的 loadUse / youngerThanBranch / aluOnly ----
   val laneValid        = Wire(Vec(CPUConfig.issueWidth, Bool()))
@@ -84,7 +75,7 @@ class Issue extends Module {
     }.reduce(_ || _)
     val entryYoungerThanBranch =
       ((entry.robIdx - flushBranchRobIdx)(robW - 1) === 0.U) && (entry.robIdx =/= flushBranchRobIdx)
-    val laneAluOnly = if (k == 0) true.B else aluOnly(td)
+    val laneAluOnly = LaneCapability.canIssueOn(k, td)
     laneEntries(k) := entry
     laneValid(k)   := entryValid
     laneCanIssue(k) := entryValid && !loadUseStall &&
@@ -98,25 +89,55 @@ class Issue extends Module {
   //     "同拍 lane0 写 pdst、lane1 读同一 pdst" 的 RAW 依赖。
   //   - Load 指令的结果要等到下一拍 Memory 阶段才能写回，Execute 内的同拍前递
   //     无法获取其数据，此时仍必须禁 pair，lane1 在下一拍靠 hazard 机制继续等待。
-  val lane0WritesPdst = if (CPUConfig.issueWidth >= 2) {
-    laneCanIssue(0) && laneEntries(0).regWriteEnable && (laneEntries(0).pdst =/= 0.U)
-  } else false.B
-  val lane0IsLoad = if (CPUConfig.issueWidth >= 2) {
-    laneEntries(0).type_decode_together(4) // lType
-  } else false.B
-  val pairRawConflict = if (CPUConfig.issueWidth >= 2) {
-    val td1 = laneEntries(1).type_decode_together
-    val u1_1 = useRs1(td1); val u2_1 = useRs2(td1)
-    lane0WritesPdst && lane0IsLoad && (
-      (u1_1 && (laneEntries(1).psrc1 === laneEntries(0).pdst)) ||
-      (u2_1 && (laneEntries(1).psrc2 === laneEntries(0).pdst))
-    )
-  } else false.B
+  // ---- 同拍 pair RAW（O(N²)）：lane(j<k) 的 pdst → lane(k) 的 src ----
+  // Phase A.6：把原"仅 lane0 Load → lane1"的硬编码 RAW 检测扩到任意 N 发射。
+  // 决策规则：
+  //   - 仅当 lane j 是 Load 时禁 pair（Load 同拍出不了数据，Execute 内同拍前递
+  //     无法供给 lane k；非 Load 都可以靠 Execute 的 lane(j<k)→lane(k) 同拍前
+  //     递通路覆盖，详见 Phase C 的 Execute 改造）。
+  //   - lane j 必须实际可发射（laneCanIssue(j)）、写回非 0、pdst 与 lane k
+  //     的 psrc1/psrc2 命中。
+  // pairRaw(k) = OR over j < k 是否与某个更老 lane 形成 Load-RAW 冲突。
+  val pairRaw = Wire(Vec(CPUConfig.issueWidth, Bool()))
+  pairRaw(0) := false.B
+  for (k <- 1 until CPUConfig.issueWidth) {
+    val tdK = laneEntries(k).type_decode_together
+    val u1k = useRs1(tdK); val u2k = useRs2(tdK)
+    val conflicts = (0 until k).map { j =>
+      val laneJWritesPdst = laneCanIssue(j) && laneEntries(j).regWriteEnable &&
+        (laneEntries(j).pdst =/= 0.U)
+      val laneJIsLoad = LaneCapability.isLType(laneEntries(j).type_decode_together)
+      laneJWritesPdst && laneJIsLoad && (
+        (u1k && (laneEntries(k).psrc1 === laneEntries(j).pdst)) ||
+        (u2k && (laneEntries(k).psrc2 === laneEntries(j).pdst))
+      )
+    }
+    pairRaw(k) := conflicts.reduce(_ || _)
+  }
 
+  // TD-B/TD-C：禁止"两条 Load / 两条 Branch 同拍发射"——
+  //   - Memory.scala 仍是 single-Load-per-cycle（单 MSHR-grant + 单 AR）；
+  //   - Memory.redirect 仍是单端口，TD-C MVP 用 single-Branch-per-cycle 仲裁。
+  // 检查"任意更老 lane j<k 是 Load/Branch"，若是则 lane k 不许再发同类型。
   val finalIssue = Wire(Vec(CPUConfig.issueWidth, Bool()))
   finalIssue(0) := laneCanIssue(0)
-  if (CPUConfig.issueWidth >= 2) {
-    finalIssue(1) := laneCanIssue(1) && !pairRawConflict
+  for (k <- 1 until CPUConfig.issueWidth) {
+    val tdK = laneEntries(k).type_decode_together
+    val kIsBr   = LaneCapability.isBType(tdK) || LaneCapability.isJalr(tdK)
+    val olderBrActive = (0 until k).map { j =>
+      val tdJ = laneEntries(j).type_decode_together
+      laneCanIssue(j) && (LaneCapability.isBType(tdJ) || LaneCapability.isJalr(tdJ))
+    }.foldLeft(false.B)(_ || _)
+    // TD-E-4（v19 解除 doubleLoadStall）：
+    //   - Memory.scala 已落地双 capture / per-lane mshrCaptureFire / AR 仲裁
+    //     （pending > fresh-oldest）/ all-or-none accept rule；
+    //   - mshrComplete IO=Vec(2)，per-slot 独立 ack（TD-D 沿用）；
+    //   - βwake 用严格门控 `RRExDff.fire && Memory.in.ready`（v19 TD-E）保证
+    //     dual-Load 反压频率上升时也不破坏 N+3 拍 PRF 写时序假设。
+    //   故本拍 lane0/lane1 同时是 Load 时不再 stall lane1。
+    // 仍保留：doubleBrStall（Memory.redirect 单端口）+ pairRaw（lane0 写、lane1 读）。
+    val doubleBrStall   = kIsBr && olderBrActive
+    finalIssue(k) := laneCanIssue(k) && !pairRaw(k) && !doubleBrStall
   }
 
   // ---- 输出 payload：按 lane 写入 ----

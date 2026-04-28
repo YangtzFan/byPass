@@ -18,6 +18,7 @@ object CPUConfig {
   case object BHT128 extends BHTSize { val entries = 128 }  // PC[8:2] 索引
   case object BHT256 extends BHTSize { val entries = 256 }  // PC[9:2] 索引
   val bhtSize: BHTSize = BHT64 // 当前 BHT 表项大小（修改这里切换）
+  // Phase E 实测：bhtSize 64→256 反而降低 IPC（短测试集冷启动失效），故保持 64
   val bhtEntries: Int = bhtSize.entries
 
   // ---- BTB 参数（为 JALR 目标预测，默认开启）----
@@ -30,18 +31,21 @@ object CPUConfig {
   val robPtrWidth: Int = robIdxWidth + 1      // ROB 指针位宽（含回绕位，8 位）
 
   // ---- FetchBuffer 参数 ----
-  val fetchBufferEntries: Int = 16 // FetchBuffer 容量
+  val fetchBufferEntries: Int = 32 // FetchBuffer 容量（Phase E：16→32 缓解 fetch/decode 与后端节奏失配）
 
   // ---- Commit 参数 ----
   // 提交宽度：一拍内 ROB 最多按序提交几条指令。
   // 过渡期暂定 1；后续做完“乱序发射 + 双宽 retire”后会提升到 2。
   // difftest 验证框架已按 Vec 接口接入，此处修改即可自动扩展验证路径。
-  val commitWidth: Int = 2
+  val commitWidth: Int = 4
 
+  // ---- 前端流水宽度参数（Phase A.4 显式分层；当前 fetch/decode/rename 同宽 4）----
+  val fetchWidth:  Int = 4                     // Fetch 一拍最多取 4 条指令
+  val decodeWidth: Int = fetchWidth            // Decode/FetchBuffer 同宽
   // ---- OoO 后端宽度参数（TASK 3.1 草拟；阶段 1-2 全部保持 1，后续阶段再向上翻）----
   // 这些参数从“过渡期默认 1”起步，所有下游模块都按 Vec(width, T) 接口铺管；
   // 扩展到 2 / 4 发射时只需修改这里，并在对应阶段打开 Vec 内部的并行逻辑。
-  val issueWidth:    Int = 2                      // 每拍 Issue 发射数（= Vec 宽度）
+  val issueWidth:    Int = 4                      // 每拍 Issue 发射数（= Vec 宽度）
   val executeWidth:  Int = issueWidth             // 每拍 Execute 执行数（约束：≥ issueWidth）
   val memoryWidth:   Int = issueWidth             // 每拍 Memory 处理数（≥ 发访存指令的 lane 数）
   val refreshWidth:  Int = executeWidth           // 每拍 Refresh 写回数（= executeWidth）
@@ -49,11 +53,11 @@ object CPUConfig {
   val prfWritePorts: Int = refreshWidth           // PRF 写口数（= refreshWidth）
 
   // ---- IssueQueue 参数 ----
-  val issueQueueEntries: Int = 32  // IssueQueue 容量
-  val iqIdxWidth: Int = log2Ceil(issueQueueEntries)  // IssueQueue 物理槽位索引位宽（4 位）
+  val issueQueueEntries: Int = 48  // IssueQueue 容量（实测最优：32 易满阻塞、64 时序退化）
+  val iqIdxWidth: Int = log2Ceil(issueQueueEntries)  // IssueQueue 物理槽位索引位宽（6 位 = log2Ceil(48)）
   // instSeq 采用循环序号 + 减法最高位比较（与 StoreBuffer 的 storeSeq 同构）。
-  // 只要活跃条目数（≤ issueQueueEntries = 16）远小于半区间 2^(instSeqWidth-1)，
-  // 比较即正确；这里取 8 位，半区间 128 >> 16，留足余量且与 storeSeqWidth 保持一致。
+  // 只要活跃条目数（≤ issueQueueEntries = 48）远小于半区间 2^(instSeqWidth-1)，
+  // 比较即正确；这里取 8 位，半区间 128 > 48，留足余量且与 storeSeqWidth 保持一致。
   val instSeqWidth: Int = 8
 
   // ---- StoreBuffer 参数 ----
@@ -74,6 +78,9 @@ object CPUConfig {
   val maxBranchCheckpoints: Int = 8                      // 最大同时在飞分支数（checkpoint 数量）
   val ckptIdxWidth: Int = log2Ceil(maxBranchCheckpoints) // checkpoint 索引位宽（3 位）
   val ckptPtrWidth: Int = ckptIdxWidth + 1               // checkpoint 全指针位宽（含回绕位，4 位）
+  // Phase A.3：BCT 每拍最多保存的 checkpoint 数量。当前 Rename 一拍最多 2 条预测分支，
+  // 所以默认 2；Phase A.4 把 Rename 提升到 4 条/拍后会一并拉到 4。
+  val ckptSaveWidth: Int = 2
 
   // ---- 便捷方法 ----
   def useBHT: Boolean  = branchPredictor == DynamicBHT

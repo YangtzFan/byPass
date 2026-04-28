@@ -24,7 +24,7 @@ import mycpu.CPUConfig
 // ============================================================================
 
 // ---- IssueQueue 内部表项：在 DispatchEntry 基础上增加 instSeq 字段 ----
-// 阶段 1：每个条目额外维护 src1Ready / src2Ready，用于 ready-based 发射选择。
+// 每个条目额外维护 src1Ready / src2Ready，用于 ready-based 发射选择。
 class IssueQueueEntry extends Bundle {
   val data       = new DispatchEntry // 原始 Dispatch 阶段的指令信息
   val instSeq    = UInt(CPUConfig.instSeqWidth.W) // 指令逻辑年龄（循环序号）
@@ -41,7 +41,7 @@ class IQAllocIO extends Bundle {
 }
 
 class IQWriteData extends Bundle {
-  val entries    = Vec(4, new DispatchEntry)
+  val entries    = Vec(CPUConfig.renameWidth, new DispatchEntry)
   val validCount = UInt(3.W)
   val valid      = Bool() // 本周期是否有有效的 Dispatch 输出
 }
@@ -80,14 +80,14 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
   val NumWakeupSrcs: Int = CPUConfig.refreshWidth + CPUConfig.memoryWidth + CPUConfig.executeWidth
   val wakeup = IO(Input(Vec(NumWakeupSrcs, new IQWakeupSource)))
 
-  // ---- 阶段 1：ReadyTable 查询端口 ----
+  // ---- ReadyTable 查询端口 ----
   // IQ 入队当拍按本批各条目的 psrc1/psrc2 去查 ReadyTable，取其结果初始化 src{1,2}Ready。
   // 之所以把查询放在 IQ 入队而非 Rename，是为了避免 Rename→IQ 两级流水之间丢失 wakeup
   // 事件：若中途恰逢某 pdst 被 Refresh 置 ready，Rename 采样已过，而 IQ 还未建表，
   // wakeup 广播落空，将造成该 pdst 的消费者永远 ready=false 的死锁。
   val readyQuery = IO(new Bundle {
-    val raddr = Output(Vec(8, UInt(CPUConfig.prfAddrWidth.W))) // 每拍 4 条指令 × 2 源
-    val rdata = Input(Vec(8, Bool()))                          // 对应 ready 状态
+    val raddr = Output(Vec(2 * CPUConfig.renameWidth, UInt(CPUConfig.prfAddrWidth.W))) // 每拍 4 条指令 × 2 源
+    val rdata = Input(Vec(2 * CPUConfig.renameWidth, Bool()))                          // 对应 ready 状态
   })
 
   // ========================================================================
@@ -109,7 +109,7 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
 
   // ---- FreeList 分配逻辑（级联 PriorityEncoder）----
   // 从 freeVec 中按优先级选择最多 4 个空闲槽位
-  val freeIdxs = Wire(Vec(4, UInt(idxWidth.W)))
+  val freeIdxs = Wire(Vec(CPUConfig.renameWidth, UInt(idxWidth.W)))
   val mask0 = freeVec.asUInt // 第 0 个：从 freeVec 中找第一个空闲槽
   freeIdxs(0) := PriorityEncoder(mask0)
   val mask1 = mask0 & ~(PriorityEncoderOH(mask0)) // 第 1 个：遮蔽前一个已选中的位，找下一个空闲槽
@@ -127,36 +127,29 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
   // nextInstSeq：全局单调递增（但会自然回绕）的指令序号计数器。Dispatch 每实际分配 N 条，就向前推进 N。
   val nextInstSeq = RegInit(0.U(seqWidth.W))
 
-  // ===================== 阶段 α.1（已暂时回滚）：Issue-fire 快速唤醒源 =====================
-  // 尝试过 0-cycle 与 1-cycle 延迟的 Issue.fire 快速唤醒，都无法完全通过 example/test_build 回归，
-  // 根因是 bypass 路径和唤醒时序不严格对齐，留待下一阶段专项解决，当前代码保持与原始 wakeup 一致。
-
   // ===================== 写入逻辑（Dispatch）=====================
-  // 阶段 1：无论 doAlloc 是否成立，都把本批各条目的 psrc1/psrc2 送到 readyQuery.raddr 上，
-  // 以便“同拍读 ReadyTable、同拍入队”并使用最新 ready 状态做初始化。
-  for (i <- 0 until 4) {
+  // 无论 doAlloc 是否成立，都把本批各条目的 psrc1/psrc2 送到 readyQuery.raddr 上，
+  // 以便"同拍读 ReadyTable、同拍入队"并使用最新 ready 状态做初始化。
+  for (i <- 0 until CPUConfig.renameWidth) {
     readyQuery.raddr(i * 2)     := write.entries(i).psrc1
     readyQuery.raddr(i * 2 + 1) := write.entries(i).psrc2
   }
   when(doAlloc) {
-    for (i <- 0 until 4) {
+    for (i <- 0 until CPUConfig.renameWidth) {
       when(i.U < write.validCount) {
         val physIdx = freeIdxs(i)
         buffer(physIdx).data    := write.entries(i)
         buffer(physIdx).instSeq := nextInstSeq + i.U // 分配逻辑年龄
-        // 阶段 1：用 IQ 入队当拍读到的 ReadyTable 值初始化 src{1,2}Ready。
+        // 用 IQ 入队当拍读到的 ReadyTable 值初始化 src{1,2}Ready。
         // ReadyTable 对 raddr=0 恒返回 true，因此 x0 源天然 ready。
         // 此外还要把本拍 wakeup 旁路叠加进来：ReadyTable 内部 table 寄存器的更新需下一拍才能
-        // 被观察到，如果仅靠寄存器化后的 rdata，刚好命中“同拍 Refresh”的消费者就会错过那唯一
+        // 被观察到，如果仅靠寄存器化后的 rdata，刚好命中"同拍 Refresh"的消费者就会错过那唯一
         // 一拍的 wakeup 广播，形成死锁。这里做一条组合旁路：wakeup 源 pdst 等于本 entry 的
         // psrcX 时，视为已就绪。
         val p1 = write.entries(i).psrc1
         val p2 = write.entries(i).psrc2
-        val wk1ext = wakeup.map(w => w.valid && (w.pdst =/= 0.U) && (w.pdst === p1)).reduce(_ || _)
-        val wk2ext = wakeup.map(w => w.valid && (w.pdst =/= 0.U) && (w.pdst === p2)).reduce(_ || _)
-        // 阶段 α.1 已取消：去掉 fastWk Reg 路径。
-        val wk1 = wk1ext
-        val wk2 = wk2ext
+        val wk1 = wakeup.map(w => w.valid && (w.pdst =/= 0.U) && (w.pdst === p1)).reduce(_ || _)
+        val wk2 = wakeup.map(w => w.valid && (w.pdst =/= 0.U) && (w.pdst === p2)).reduce(_ || _)
         buffer(physIdx).src1Ready := readyQuery.rdata(i * 2)     || wk1
         buffer(physIdx).src2Ready := readyQuery.rdata(i * 2 + 1) || wk2
         validVec(physIdx) := true.B
@@ -166,19 +159,16 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
     nextInstSeq := nextInstSeq + write.validCount // 更新全局 instSeq 计数器（允许自然回绕）
   }
 
-  // ===================== 阶段 α.1：wakeup 广播（下一拍生效）=====================
-  // 对每个仍有效的条目，如果其 psrc1 或 psrc2 命中本拍任一 wakeup 源（包括 Refresh 级 wakeup
-  // 以及本拍 Issue fire 的快速唤醒），则下一拍置 ready。
+  // ===================== wakeup 广播（下一拍生效）=====================
+  // 对每个仍有效的条目，如果其 psrc1 或 psrc2 命中本拍任一 wakeup 源（Refresh / Memory / Execute β），
+  // 则下一拍置 ready。
   // 注意：wakeup 与本拍 write 在不同物理槽位时互不干扰；若同拍写入的条目恰好命中
   // wakeup（极少见：被唤醒的 pdst == 该条目的 psrc），Dispatch 送进来的初始 ready
   // 已经反映了 ReadyTable 的最新值，wakeup 是锦上添花，不会错误地把 ready 置回 false。
   for (slot <- 0 until depth) {
     val e = buffer(slot)
-    val hitExt1 = wakeup.map(w => w.valid && (w.pdst =/= 0.U) && (w.pdst === e.data.psrc1)).reduce(_ || _)
-    val hitExt2 = wakeup.map(w => w.valid && (w.pdst =/= 0.U) && (w.pdst === e.data.psrc2)).reduce(_ || _)
-    // 阶段 α.1 已取消：fast wakeup 在 example/test_build 上会造成晚期误匹配，暂时禁用。
-    val hit1 = hitExt1
-    val hit2 = hitExt2
+    val hit1 = wakeup.map(w => w.valid && (w.pdst =/= 0.U) && (w.pdst === e.data.psrc1)).reduce(_ || _)
+    val hit2 = wakeup.map(w => w.valid && (w.pdst =/= 0.U) && (w.pdst === e.data.psrc2)).reduce(_ || _)
     when(validVec(slot)) {
       when(hit1) { buffer(slot).src1Ready := true.B }
       when(hit2) { buffer(slot).src2Ready := true.B }
@@ -193,17 +183,23 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
   //   (b) 分支/JALR 需要精确 flush，集中放在 lane0 简化恢复；
   //   (c) CSR/Trap 同理集中在 lane0。
   // 同拍 lane0→lane1 RAW 由 Issue 级禁 pair（此处不做）。
-  private def lTypeOf(e: DispatchEntry): Bool = e.type_decode_together(4)
-  private def sTypeOf(e: DispatchEntry): Bool = e.type_decode_together(2)
-  // 判断条目是否可放在 lane1 发射（纯 ALU：iType/rType/lui）
-  private def aluOnly(e: DispatchEntry): Bool = {
-    val iType = e.type_decode_together(1)
-    val rType = e.type_decode_together(0)
-    val lui   = e.type_decode_together(8)
-    iType || rType || lui
-  }
+  // ----------------------------------------------------------------------------------
+  // Phase A.2：以下 lTypeOf / sTypeOf / aluOnly 均改为 LaneCapability helper 单点定义，
+  // 避免历史 BUG 重现（td bit 下标错位会让 lane1 非法发射 / 永不发射）。
+  // 编码定义详见 LaneCapability.scala 头注释。
+  // ----------------------------------------------------------------------------------
+  private def lTypeOf(e: DispatchEntry): Bool = LaneCapability.isLType(e.type_decode_together)
+  private def sTypeOf(e: DispatchEntry): Bool = LaneCapability.isSType(e.type_decode_together)
+  // 判断条目是否可放在 ALU-only lane 发射（纯 ALU：iType / rType / uType{LUI,AUIPC}）。
+  private def aluOnly(e: DispatchEntry): Bool =
+    LaneCapability.isAluOnly(e.type_decode_together)
 
   // lane0 memOrder：Load 与更老 Store 冲突（继承 1 发射语义）
+  // 注：曾尝试 TD-009 完全移除该检查（让 Memory.olderUnknown 单点保证），但会导致
+  // sh/sw/test_build/example 死锁——根因是同对内 (Load lane0, Store lane1) 同拍
+  // 进入 Memory 时，Memory.olderUnknown 触发 memStall→out.valid=0→ROB 永远不会
+  // 收到 Store 的 refresh 完成事件→无法 commit→死锁。需要更细粒度的 IQ 放宽方案
+  // （仅当老 Store 已离开 IQ 时才放行 Load），暂保持原检查。
   val olderStoreInIQ = Wire(Vec(depth, Bool()))
   for (i <- 0 until depth) {
     val hits = (0 until depth).map { j =>
@@ -214,8 +210,29 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
     olderStoreInIQ(i) := hits.reduce(_ || _)
   }
 
-  // ---- lane0：oldest-ready ----
-  val (issueIdx0, issueSeq0, issueFound0) = (0 until depth).foldLeft(
+  // ===========================================================================
+  // Phase A.5：N-pick 选择器（参数化 pickOldestReady）
+  // ---------------------------------------------------------------------------
+  // 把原"lane0 oldest-ready + lane1 次老 ready"两套独立 fold 合并成一个
+  // for-loop。后续 4 发射只需要 issueWidth 设到 4，本循环天然产出 4 个 pick。
+  //
+  // 决策规则（每条 lane k）：
+  //   - 必须 valid
+  //   - capability：lane0 = Full（任意类型）；lane k>0 = aluOnly
+  //   - 不能与 j<k 已经选中的 slot 重复
+  //   - lane0 还要满足 memOrder：Load 不得越过同 IQ 内更老的 Store
+  //   - 同拍 spec wakeup（仅 lane0 → lane k>0）：若 lane0 fire 且非 Load 且 pdst ≠ 0，
+  //     候选 lane k 的 psrcX 命中 lane0.pdst 时把对应 src 视为已就绪
+  //   - 在所有满足条件的候选里取 instSeq 最老的一个
+  //
+  // 选择器使用 fold over depth，硬件上是一棵 reduce 比较树，宽度无关。
+  // ---------------------------------------------------------------------------
+  val pickIdx   = Wire(Vec(CPUConfig.issueWidth, UInt(idxWidth.W)))
+  val pickFound = Wire(Vec(CPUConfig.issueWidth, Bool()))
+  val pickUsesSpec = Wire(Vec(CPUConfig.issueWidth, Bool()))
+
+  // ---- lane0：oldest-ready（Full lane，含 memOrder 检查）----
+  val (idx0_, _, found0_) = (0 until depth).foldLeft(
     (0.U(idxWidth.W), 0.U(seqWidth.W), false.B)
   ) { case ((bestIdx, bestSeq, found), i) =>
     val memOrderOK = !(lTypeOf(buffer(i).data) && olderStoreInIQ(i))
@@ -225,72 +242,80 @@ class IssueQueue(val depth: Int = CPUConfig.issueQueueEntries) extends Module {
      Mux(better, buffer(i).instSeq, bestSeq),
      found || entryReady)
   }
+  pickIdx(0)      := idx0_
+  pickFound(0)    := found0_
+  pickUsesSpec(0) := false.B // lane0 永不依赖前递
 
-  // ---- lane1：次老 ready，且 aluOnly ----
-  // 注意 memOrder：lane1 只可能是 ALU，不会是 Load/Store，因此不需要 memOrder 检查
-  //
-  // 【阶段 A1 配套】同拍 lane0 → lane1 投机唤醒：
-  //   官方 wakeup 来自 Refresh（3~4 拍之后），直接等待 wakeup 会让"相邻两条 ALU 带 RAW"
-  //   在 IQ 中被迫串行发射，Execute 侧的 EX-in-EX 前递通路（见 Execute.scala 阶段 A1）
-  //   永远不会被触发，IPC 被压在 ~1。
-  // 解决：在 IQ 选 lane1 时，若 lane1.psrcX === lane0.pdst，且 lane0 是非 Load
-  //   （Load 同拍出不了结果，不能投机唤醒），就把该 src 视为本拍已经就绪。
-  //   lane1 发射后，Execute 会用同拍前递把 lane0 的组合结果送到 lane1 的 ALU 输入端。
-  val lane0Pdst      = buffer(issueIdx0).data.pdst
-  val lane0RegWen    = buffer(issueIdx0).data.regWriteEnable
-  val lane0IsLoadIQ  = lTypeOf(buffer(issueIdx0).data)
-  // lane0 能否在本拍把结果前递给 lane1：必须真的发射、要写回、非 Load、pdst≠0
-  val lane0SpecFwd   = issueFound0 && lane0RegWen && !lane0IsLoadIQ && (lane0Pdst =/= 0.U)
-  val (issueIdx1, _, issueFound1, issue1UsesSpec) =
-    if (CPUConfig.issueWidth >= 2) {
-      (0 until depth).foldLeft(
-        (0.U(idxWidth.W), 0.U(seqWidth.W), false.B, false.B)
-      ) { case ((bestIdx, bestSeq, found, usesSpec), i) =>
-        val notLane0 = !(issueFound0 && (issueIdx0 === i.U))
-        // 同拍 lane0 → lane1 投机唤醒：若本条目的 psrcX 命中 lane0.pdst（且 lane0 可前递），
-        // 则视为该 src 本拍已就绪。
-        val spec1 = lane0SpecFwd && (buffer(i).data.psrc1 === lane0Pdst) && !buffer(i).src1Ready
-        val spec2 = lane0SpecFwd && (buffer(i).data.psrc2 === lane0Pdst) && !buffer(i).src2Ready
-        val src1ReadyEff = buffer(i).src1Ready || spec1
-        val src2ReadyEff = buffer(i).src2Ready || spec2
-        val entryReady = validVec(i) && src1ReadyEff && src2ReadyEff &&
-          aluOnly(buffer(i).data) && notLane0
-        val better = entryReady && (!found || seqOlderThan(buffer(i).instSeq, bestSeq))
-        val entryUsesSpec = spec1 || spec2
-        (Mux(better, i.U(idxWidth.W), bestIdx),
-         Mux(better, buffer(i).instSeq, bestSeq),
-         found || entryReady,
-         Mux(better, entryUsesSpec, usesSpec))
+  // ---- lane k>0：在 lane0..k-1 选定基础上，N-pick 同构循环（链式 spec wake）----
+  // 决策规则：valid + aluOnly + 不与前面 lane 重复 + （src 已就绪 或 任一更老 lane 同拍 spec fwd）
+  // Phase C：把 spec wake 来源从"仅 lane0"扩到"所有 lane(j<k)"，配合 Execute 的 N²
+  // 同拍前递解决 lane(j>0)→lane(k>j) 的 ALU RAW，使 4 发射真正发挥。
+  val laneSpecPdst   = Wire(Vec(CPUConfig.issueWidth, UInt(CPUConfig.prfAddrWidth.W)))
+  val laneSpecValid  = Wire(Vec(CPUConfig.issueWidth, Bool()))
+  laneSpecPdst(0)  := buffer(pickIdx(0)).data.pdst
+  laneSpecValid(0) := pickFound(0) &&
+                      buffer(pickIdx(0)).data.regWriteEnable &&
+                      !lTypeOf(buffer(pickIdx(0)).data) &&
+                      (buffer(pickIdx(0)).data.pdst =/= 0.U)
+
+  for (k <- 1 until CPUConfig.issueWidth) {
+    def notPickedBefore(i: Int): Bool =
+      (0 until k).map(j => !(pickFound(j) && (pickIdx(j) === i.U))).reduce(_ && _)
+    val (idxK, _, foundK, usesSpecK) = (0 until depth).foldLeft(
+      (0.U(idxWidth.W), 0.U(seqWidth.W), false.B, false.B)
+    ) { case ((bestIdx, bestSeq, found, usesSpec), i) =>
+      // 链式 spec wake：检查 lane 0..k-1 中是否有任一更老 lane 能 fwd 到当前候选
+      val specHits1 = (0 until k).map { j =>
+        laneSpecValid(j) && (buffer(i).data.psrc1 === laneSpecPdst(j))
       }
-    } else (0.U(idxWidth.W), 0.U(seqWidth.W), false.B, false.B)
+      val specHits2 = (0 until k).map { j =>
+        laneSpecValid(j) && (buffer(i).data.psrc2 === laneSpecPdst(j))
+      }
+      val spec1 = !buffer(i).src1Ready && specHits1.reduce(_ || _)
+      val spec2 = !buffer(i).src2Ready && specHits2.reduce(_ || _)
+      val src1Eff = buffer(i).src1Ready || spec1
+      val src2Eff = buffer(i).src2Ready || spec2
+      val memOrderOKK = !(lTypeOf(buffer(i).data) && olderStoreInIQ(i))
+      val entryReady = validVec(i) && src1Eff && src2Eff && memOrderOKK &&
+        LaneCapability.canIssueOn(k, buffer(i).data.type_decode_together) && notPickedBefore(i)
+      val better = entryReady && (!found || seqOlderThan(buffer(i).instSeq, bestSeq))
+      val entryUsesSpec = spec1 || spec2
+      (Mux(better, i.U(idxWidth.W), bestIdx),
+       Mux(better, buffer(i).instSeq, bestSeq),
+       found || entryReady,
+       Mux(better, entryUsesSpec, usesSpec))
+    }
+    pickIdx(k)      := idxK
+    pickFound(k)    := foundK
+    pickUsesSpec(k) := usesSpecK
+    // 计算本 lane 自己的 spec wake 输出（供更年轻 lane 链式使用）
+    laneSpecPdst(k)  := buffer(idxK).data.pdst
+    laneSpecValid(k) := foundK &&
+                        buffer(idxK).data.regWriteEnable &&
+                        !lTypeOf(buffer(idxK).data) &&
+                        (buffer(idxK).data.pdst =/= 0.U)
+  }
 
   // 默认发射口：全部不发射
   for (k <- 0 until CPUConfig.issueWidth) {
     issue(k).valid := false.B
     issue(k).bits  := 0.U.asTypeOf(new DispatchEntry)
   }
-  issue(0).valid := issueFound0
-  issue(0).bits  := buffer(issueIdx0).data
-  if (CPUConfig.issueWidth >= 2) {
-    // 若 lane1 的就绪依赖于 lane0 的同拍投机唤醒，则必须等 lane0 也 fire 才允许 lane1 fire，
-    // 否则 lane1 拿到的是"没人喂的伪 ready"，会读到 PRF 中过时的 src 数据，语义错乱。
-    issue(1).valid := issueFound1 && (!issue1UsesSpec || issue(0).fire)
-    issue(1).bits  := buffer(issueIdx1).data
+  // lane0 直接发射；lane k>0 若依赖前面 lane 的 spec wake，则要求所有更老 lane 都 fire。
+  // （保守但正确：spec wake 来源可能是 lane 0..k-1 中任一，统一要求全部 fire 即可。）
+  issue(0).valid := pickFound(0)
+  issue(0).bits  := buffer(pickIdx(0)).data
+  for (k <- 1 until CPUConfig.issueWidth) {
+    val olderAllFire = (0 until k).map(j => issue(j).fire).reduce(_ && _)
+    issue(k).valid := pickFound(k) && (!pickUsesSpec(k) || olderAllFire)
+    issue(k).bits  := buffer(pickIdx(k)).data
   }
-
-  // ---- 阶段 α.1（已回滚）：fast wakeup 导出逻辑已移除，此处不再产生任何 wake 源。----
 
   // ---- 释放已发射槽位 ----
-  // lane0/lane1 各自独立。若同拍两个 lane 选中同一 slot（理论上已被 notLane0 剔除），
-  // 下面 when 链按顺序执行，最终结果仍正确。
-  when(issue(0).fire) {
-    validVec(issueIdx0) := false.B
-    freeVec(issueIdx0)  := true.B
-  }
-  if (CPUConfig.issueWidth >= 2) {
-    when(issue(1).fire) {
-      validVec(issueIdx1) := false.B
-      freeVec(issueIdx1)  := true.B
+  for (k <- 0 until CPUConfig.issueWidth) {
+    when(issue(k).fire) {
+      validVec(pickIdx(k)) := false.B
+      freeVec(pickIdx(k))  := true.B
     }
   }
 

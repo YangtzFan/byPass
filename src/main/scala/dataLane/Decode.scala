@@ -15,12 +15,12 @@ import mycpu.device.SE
 // 内部实例化 4 个 SE（符号扩展/立即数生成）模块，每路独立工作。
 // ============================================================================
 class Decode extends Module {
-  val in  = IO(Flipped(Decoupled(Vec(4, new FetchBufferEntry))))  // 来自 FetchBuffer 的 4 条指令
-  val out = IO(Decoupled(Vec(4, new DecodedInst))) // 输出 4 条译码结果
+  val in  = IO(Flipped(Decoupled(Vec(CPUConfig.decodeWidth, new FetchBufferEntry))))  // 来自 FetchBuffer 的 4 条指令
+  val out = IO(Decoupled(Vec(CPUConfig.decodeWidth, new DecodedInst))) // 输出 4 条译码结果
 
   val ses = Seq.fill(4)(Module(new SE)) // 4 个符号扩展/立即数生成模块
 
-  for (i <- 0 until 4) { // 开始译码
+  for (i <- 0 until CPUConfig.decodeWidth) { // 开始译码
     val entry = in.bits(i)
     val inst = entry.inst
 

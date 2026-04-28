@@ -24,13 +24,13 @@ import chisel3.SpecifiedDirection.Flip
 // ============================================================================
 
 class RATReadWriteIO extends Bundle {
-  val raddr      = Output(Vec(8, UInt(5.W)))                      // 8 个源操作数读端口
-  val rdata      = Input(Vec(8, UInt(CPUConfig.prfAddrWidth.W)))  // 8 个读结果
-  val staleRaddr = Output(Vec(4, UInt(5.W)))                      // 4 个 stalePdst 读端口
-  val staleRdata = Input(Vec(4, UInt(CPUConfig.prfAddrWidth.W)))  // 4 个 stalePdst 读结果
-  val wen        = Output(Vec(4, Bool()))                         // 4 个写端口
-  val waddr      = Output(Vec(4, UInt(5.W)))                      // 4 个写地址
-  val wdata      = Output(Vec(4, UInt(CPUConfig.prfAddrWidth.W))) // 4 个写数据
+  val raddr      = Output(Vec(2 * CPUConfig.renameWidth, UInt(5.W)))                      // 8 个源操作数读端口
+  val rdata      = Input(Vec(2 * CPUConfig.renameWidth, UInt(CPUConfig.prfAddrWidth.W)))  // 8 个读结果
+  val staleRaddr = Output(Vec(CPUConfig.renameWidth, UInt(5.W)))                      // 4 个 stalePdst 读端口
+  val staleRdata = Input(Vec(CPUConfig.renameWidth, UInt(CPUConfig.prfAddrWidth.W)))  // 4 个 stalePdst 读结果
+  val wen        = Output(Vec(CPUConfig.renameWidth, Bool()))                         // 4 个写端口
+  val waddr      = Output(Vec(CPUConfig.renameWidth, UInt(5.W)))                      // 4 个写地址
+  val wdata      = Output(Vec(CPUConfig.renameWidth, UInt(CPUConfig.prfAddrWidth.W))) // 4 个写数据
   val snapData   = Input(Vec(32, UInt(CPUConfig.prfAddrWidth.W))) // 完整快照输出端口（BranchCheckpoint 保存用）
 }
 
@@ -53,7 +53,7 @@ class RAT extends Module {
     // ---- 写入逻辑：Rename 阶段更新映射 ----
     // 按从老到年轻的顺序写入（lane 0 最老，lane 3 最年轻）
     // 如果同一逻辑寄存器被多条指令写入，最年轻的写入生效
-    for (i <- 0 until 4) {
+    for (i <- 0 until CPUConfig.renameWidth) {
       when(rwio.wen(i) && rwio.waddr(i) =/= 0.U) {
         table(rwio.waddr(i)) := rwio.wdata(i)
       }
@@ -62,12 +62,12 @@ class RAT extends Module {
 
   // ---- 组合读端口：读取 RAT[rs1] 和 RAT[rs2] 作为当前映射 ----
   // 注意：这里读到的是 "上一拍末尾" 的值，不包含本拍的写入 Rename 数据旁路由 Rename 模块在外部处理
-  for (i <- 0 until 8) {
+  for (i <- 0 until 2 * CPUConfig.renameWidth) {
     rwio.rdata(i) := Mux(rwio.raddr(i) === 0.U, 0.U, table(rwio.raddr(i)))
   }
 
   // ---- 旧映射读端口：读取 RAT[rd] 作为 stalePdst ----
-  for (i <- 0 until 4) {
+  for (i <- 0 until CPUConfig.renameWidth) {
     rwio.staleRdata(i) := Mux(rwio.staleRaddr(i) === 0.U, 0.U, table(rwio.staleRaddr(i)))
   }
 

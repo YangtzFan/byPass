@@ -61,7 +61,7 @@ class Dispatch extends Module {
   }
 
   // ---- 逐路处理：生成 DispatchEntry + ROBAllocData ----
-  for (i <- 0 until 4) { // FetchBuffer 确保指令优先填满低位
+  for (i <- 0 until CPUConfig.renameWidth) { // FetchBuffer 确保指令优先填满低位
     val entry = in.bits.entries(i)
     val td    = entry.type_decode_together
 
@@ -81,6 +81,12 @@ class Dispatch extends Module {
     robAlloc.data(i).rd            := rd
     robAlloc.data(i).regWen        := entry.regWriteEnable
     robAlloc.data(i).isStore       := sType
+    // ECALL/EBREAK/FENCE 等系统指令归在 td(0)（other）中：
+    // difftest 参考模型在调用 commit_step(N) 时会预先解码本拍 N 条指令，
+    // 若 ECALL 不是本拍最后一条，后续 lane 可能落到程序结束后的全 0 区，
+    // 触发 "Unknown opcode 0" 断言。因此在 RTL 端把 system 指令视为
+    // "提交截断"信号：含此指令的 lane 之后的 lane 本拍不再提交。
+    robAlloc.data(i).isSysStop     := td(0)
     robAlloc.data(i).hasCheckpoint := entry.hasCheckpoint  // 从 Rename 传递：仅该组第一个被预测分支为 true
     // Store 指令的 storeSeq：从 SBAllocIO 返回值中按 sbOffsets 映射获取
     // 非 Store 指令的 storeSeq 字段为 0（ROB Commit 时不会使用）

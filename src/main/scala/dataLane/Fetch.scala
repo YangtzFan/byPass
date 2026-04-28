@@ -24,7 +24,7 @@ class Fetch extends Module {
   private val bhtIdxWidth = log2Ceil(CPUConfig.bhtEntries)
 
   val in = IO(Flipped(Decoupled(UInt(32.W)))) // 输入：PC 值
-  val out = IO(Decoupled(Vec(4, new FetchBufferEntry))) // 输出：4 个取指结果包（含预测信息）
+  val out = IO(Decoupled(Vec(CPUConfig.fetchWidth, new FetchBufferEntry))) // 输出：4 个取指结果包（含预测信息）
 
   // ---- 读 IROM 接口 ----
   val irom = IO(new Bundle {
@@ -34,16 +34,16 @@ class Fetch extends Module {
 
   // ---- BHT 接口（由 myCPU 顶层连接到 BHT 模块）----
   val bht = Option.when(useBHT){IO(new Bundle {
-    val read_idx = Output(Vec(4, UInt(bhtIdxWidth.W)))  // 4 路 BHT 读索引
-    val predict  = Input(Vec(4, UInt(2.W)))             // 4 路 BHT 预测值（2-bit 格雷码）
+    val read_idx = Output(Vec(CPUConfig.fetchWidth, UInt(bhtIdxWidth.W)))  // 4 路 BHT 读索引
+    val predict  = Input(Vec(CPUConfig.fetchWidth, UInt(2.W)))             // 4 路 BHT 预测值（2-bit 格雷码）
   })}
 
   // ---- BTB 接口（仅 useBTB 开启时存在）----
   // 为 JALR 的间接跳转目标提供缓存预测。
   val btb = Option.when(useBTB){IO(new Bundle {
-    val read_pc = Output(Vec(4, UInt(32.W))) // 4 路并行 BTB 查询 PC
-    val hit     = Input(Vec(4, Bool()))
-    val target  = Input(Vec(4, UInt(32.W)))
+    val read_pc = Output(Vec(CPUConfig.fetchWidth, UInt(32.W))) // 4 路并行 BTB 查询 PC
+    val hit     = Input(Vec(CPUConfig.fetchWidth, Bool()))
+    val target  = Input(Vec(CPUConfig.fetchWidth, UInt(32.W)))
   })}
 
   // ---- 预测结果输出 ----
@@ -58,19 +58,19 @@ class Fetch extends Module {
 
   // ---- 解包 4 条指令并求对应 PC 值 ----
   irom.inst_addr_o := pc(17, 4) // 输出到 IROM 地址
-  val pcs = Wire(Vec(4, UInt(32.W)))
-  val insts = Wire(Vec(4, UInt(32.W)))
-  for (i <- 0 until 4) {      
+  val pcs = Wire(Vec(CPUConfig.fetchWidth, UInt(32.W)))
+  val insts = Wire(Vec(CPUConfig.fetchWidth, UInt(32.W)))
+  for (i <- 0 until CPUConfig.fetchWidth) {      
     pcs(i) := (basePC(31, 2) + i.U) ## 0.U(2.W) // 求每条指令的 PC 值（即使非对齐，也会取相应对齐地址向后 4 条指令）
     insts(i) := irom.inst_i(32 * i + 31, 32 * i) // 将 128 位数据解包为 4 × 32 位指令
   }
 
   // ---- 轻量预译码 + BPU 预测 ----
-  val slotTaken   = Wire(Vec(4, Bool()))     // 每个槽位是否预测跳转
-  val slotTarget  = Wire(Vec(4, UInt(32.W))) // 每个槽位的预测目标
-  val slotBHTMeta = Wire(Vec(4, UInt(2.W)))  // 每个槽位的 BHT 元数据
-  val validTaken  = Wire(Vec(4, Bool()))
-  for (i <- 0 until 4) { // 开始遍历每一条指令
+  val slotTaken   = Wire(Vec(CPUConfig.fetchWidth, Bool()))     // 每个槽位是否预测跳转
+  val slotTarget  = Wire(Vec(CPUConfig.fetchWidth, UInt(32.W))) // 每个槽位的预测目标
+  val slotBHTMeta = Wire(Vec(CPUConfig.fetchWidth, UInt(2.W)))  // 每个槽位的 BHT 元数据
+  val validTaken  = Wire(Vec(CPUConfig.fetchWidth, Bool()))
+  for (i <- 0 until CPUConfig.fetchWidth) { // 开始遍历每一条指令
     val inst   = insts(i)
     val opcode = inst(6, 0)
 
@@ -112,7 +112,7 @@ class Fetch extends Module {
   predict.target := slotTarget(firstTakenSlot)
   
   // ---- 输出 FetchPacket ----
-  for (i <- 0 until 4) {
+  for (i <- 0 until CPUConfig.fetchWidth) {
     out.bits(i).pc   := pcs(i)
     out.bits(i).inst := insts(i)
     out.bits(i).predict_taken  := slotTaken(i)
