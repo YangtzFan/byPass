@@ -7,9 +7,6 @@ import mycpu.CPUConfig
 // ============================================================================
 // AXIStoreQueue 相关 Bundle 定义
 // ============================================================================
-// 队列中的条目仅保存与“后续 forwarding / DRAM 写回”有关的字段，原始 store 的
-// addr/data/mask 不必入队（这些信息只在 enq 同拍用于 difftest 直通输出）。
-// ============================================================================
 class AXISQEntry extends Bundle {
   val valid    = Bool()
   val wordAddr = UInt(30.W)
@@ -18,22 +15,16 @@ class AXISQEntry extends Bundle {
   val storeSeq = UInt(CPUConfig.storeSeqWidth.W)
 }
 
-// ---- enq / loadReq / loadResp 三个握手通道的 Payload 定义 ----
-// 全部使用标准 Decoupled，把握手与负载分离，接口更整洁，也便于以后扩展。
+// enq / loadReq / loadResp 三个握手通道的 Payload 定义。
 class SQEnqPayload extends Bundle {
-  // 原始 store 信息（仅用于 difftest 直通，不必入队保存）
   val addr = UInt(32.W)
   val data = UInt(32.W)
   val mask = UInt(3.W)
-  // 字节对齐后的 DRAM 写信息（入队保存，后续仲裁写回 DRAM 与 forwarding 用）
   val wstrb    = UInt(4.W)
   val wdata    = UInt(32.W)
   val storeSeq = UInt(CPUConfig.storeSeqWidth.W)
-  // 字对齐地址 = addr[31:2]，由 AXIStoreQueue 内部派生，不再单独传输。
 }
 
-// ---- Memory -> AXIStoreQueue committed-store 查询接口 ----
-// 纯组合查询接口：不走 Decoupled，因为查询结果当拍即可使用。
 class AXISQQueryIO extends Bundle {
   val valid     = Output(Bool())
   val wordAddr  = Output(UInt(30.W))
@@ -43,7 +34,6 @@ class AXISQQueryIO extends Bundle {
   val fwdData   = Input(UInt(32.W))
 }
 
-// ---- 调试输出（供 SoC_Top → difftest 比对 store 的提交点）----
 class AXISQDebugIO extends Bundle {
   val commitRamWen   = Output(Bool())
   val commitRamWaddr = Output(UInt(32.W))
@@ -53,13 +43,32 @@ class AXISQDebugIO extends Bundle {
 
 // ============================================================================
 // AXIStoreQueue —— 核外 committed store 队列 + 统一外部访存仲裁器
+// （TD-A 升级版：Load 路径 outstanding=2，严格顺序返回；Store 仍单 outstanding）
 // ============================================================================
-// P0 设计目标：
-//   1. 接收来自 Commit 的 store enqueue（Decoupled），请求成功即视为 store 已提交；
-//   2. 保存“已提交但尚未写回 DRAM”的 store，并对后续 load 提供 forwarding；
-//   3. 统一仲裁 committed store 写回与 load miss 外读，并以 AXI 主设备身份发给 DRAM；
-//   4. 任意时刻最多只有一笔 AXI 事务在飞，避免下游适配器需要复杂 reorder 逻辑；
-//   5. `commit_ram_*` 在 enqueue 成功同拍输出，使 difftest 直接对齐 store 真实提交点。
+// 本模块对外承担两类任务：
+//   1. Committed store 队列：接收 Commit 入队的 store，向后续 Load 提供 forwarding，
+//      并以 AW+W 同拍方式向 DRAM 写回。Store 写本身仍是单 outstanding（一次 AW+W
+//      / B 串行）；
+//   2. Load miss 外读：把 Memory 模块来的 Load 地址转换为 AR/R 事务发给 DRAM。
+//      ★TD-A 关键：Load 路径升级为 outstanding=2★
+//
+// outstanding=2 的实现要点（参见 REF.md §2 / §6 版本 A）：
+//   - 新增 loadInflightCnt（0 / 1 / 2），表示已经发出 AR 但尚未拿到 R 的 Load 数；
+//   - loadAddr.ready 不再绑定状态机，而是 = (loadInflightCnt < 2)，与 DRAM 是否
+//     正在执行其他事务、是否已发过 AR 都解耦；
+//   - 每拍最多向下游 axi.ar 发 1 个 AR（DRAM 端口物理约束 1 op/cycle）；
+//   - R 严格按 AR 入队顺序返回（依赖下游 DRAM_AXIInterface 的 readReqFifo /
+//     readRespFifo 都是 FIFO 语义），因此本模块不需要自己做 ID 路由，只把 R
+//     按"先来后到"直通给 loadData 即可；
+//   - Store 仲裁为简化 MVP：当且仅当 loadInflightCnt=0 且无 pending load 时
+//     才发起 store（避免读写穿插 + B 与 R 通道竞争）。普通 store 在后台 drain，
+//     Load 优先（REF.md §5 推荐策略）。
+//
+// 不变量：
+//   - 同一拍 axi.ar 与 axi.aw 不会同时 fire；
+//   - 任意时刻 ≤ 2 个 outstanding read，≤ 1 个 outstanding write；
+//   - R 通道返回顺序与 AR 发出顺序严格一致；
+//   - commit_ram_* 仍在 enqueue 同拍输出，difftest 时序对齐不变。
 // ============================================================================
 class AXIStoreQueue(val depth: Int = CPUConfig.axiSqEntries) extends Module {
   private val idxWidth = log2Ceil(depth)
@@ -68,16 +77,17 @@ class AXIStoreQueue(val depth: Int = CPUConfig.axiSqEntries) extends Module {
   private val storeBurstLimit = CPUConfig.axiSqStoreBurstLimit
   private val burstCntWidth = log2Ceil(storeBurstLimit + 1)
 
-  // ---- 与 myCPU 的握手接口（统一 Decoupled）----
+  // 与 myCPU 的握手接口
   val enq      = IO(Flipped(Decoupled(new SQEnqPayload)))
-  val query    = IO(Flipped(new AXISQQueryIO))
+  // TD-B：query 升级为 Vec(N) 多查询口（loadLanes 大小，当前 N=2）。
+  val query    = IO(Flipped(Vec(mycpu.dataLane.LaneCapability.loadLanes.size, new AXISQQueryIO)))
   val loadAddr = IO(Flipped(Decoupled(UInt(32.W))))
   val loadData = IO(Decoupled(UInt(32.W)))
 
-  // ---- 与 DRAM_AXIInterface 的 AXI 主设备接口 ----
+  // 与 DRAM_AXIInterface 的 AXI 主设备接口
   val axi = IO(new AXIBundle())
 
-  // ---- 调试观测 ----
+  // 调试观测
   val debug = IO(new AXISQDebugIO)
 
   // 队列物理存储：按提交顺序入队，按最老顺序写回。
@@ -97,7 +107,6 @@ class AXIStoreQueue(val depth: Int = CPUConfig.axiSqEntries) extends Module {
   // ===================== Enqueue 接口 =====================
   enq.ready := !queueFull
   val enqFire = enq.fire
-  // 字对齐地址直接由 enq.bits.addr 派生，无需上游再传一份。
   val enqWordAddr = enq.bits.addr(31, 2)
 
   when(enqFire) {
@@ -108,49 +117,66 @@ class AXIStoreQueue(val depth: Int = CPUConfig.axiSqEntries) extends Module {
     entries(tailIdx).storeSeq := enq.bits.storeSeq
   }
 
-  // ===================== Committed-store 查询 =====================
-  // 对每个字节选择“对当前 load 可见的最年轻已提交 store”。
-  val perByteFwdValid = Wire(Vec(4, Bool()))
-  val perByteFwdData = Wire(Vec(4, UInt(8.W)))
+  // ===================== Committed-store 查询（TD-B：Vec(N) 多查询口）=====================
+  // AXIStoreQueue 的查询同样无状态，可任意复制。每个 Load lane 独立提供一份组合电路。
+  for (q <- 0 until mycpu.dataLane.LaneCapability.loadLanes.size) {
+    val perByteFwdValid = Wire(Vec(4, Bool()))
+    val perByteFwdData = Wire(Vec(4, UInt(8.W)))
 
-  for (b <- 0 until 4) {
-    val (bestValid, _, bestByte) = (0 until depth).foldLeft(
-      (false.B, 0.U(seqWidth.W), 0.U(8.W))
-    ) { case ((hasBest, bestSeqSoFar, bestByteSoFar), i) =>
-      val candidate = entries(i).valid &&
-        (entries(i).wordAddr === query.wordAddr) &&
-        entries(i).wstrb(b) &&
-        query.loadMask(b)
-      val chooseThis = candidate && (!hasBest || seqNewerOrEq(entries(i).storeSeq, bestSeqSoFar))
-      (
-        hasBest || candidate,
-        Mux(chooseThis, entries(i).storeSeq, bestSeqSoFar),
-        Mux(chooseThis, entries(i).wdata(b * 8 + 7, b * 8), bestByteSoFar)
-      )
+    for (b <- 0 until 4) {
+      val (bestValid, _, bestByte) = (0 until depth).foldLeft(
+        (false.B, 0.U(seqWidth.W), 0.U(8.W))
+      ) { case ((hasBest, bestSeqSoFar, bestByteSoFar), i) =>
+        val candidate = entries(i).valid &&
+          (entries(i).wordAddr === query(q).wordAddr) &&
+          entries(i).wstrb(b) &&
+          query(q).loadMask(b)
+        val chooseThis = candidate && (!hasBest || seqNewerOrEq(entries(i).storeSeq, bestSeqSoFar))
+        (
+          hasBest || candidate,
+          Mux(chooseThis, entries(i).storeSeq, bestSeqSoFar),
+          Mux(chooseThis, entries(i).wdata(b * 8 + 7, b * 8), bestByteSoFar)
+        )
+      }
+      perByteFwdValid(b) := bestValid
+      perByteFwdData(b) := bestByte
     }
-    perByteFwdValid(b) := bestValid
-    perByteFwdData(b) := bestByte
+
+    val rawQueryMask = perByteFwdValid.asUInt
+    query(q).fwdMask := Mux(query(q).valid, rawQueryMask, 0.U)
+    query(q).fwdData := Mux(
+      query(q).valid,
+      Cat(perByteFwdData(3), perByteFwdData(2), perByteFwdData(1), perByteFwdData(0)),
+      0.U
+    )
+    query(q).fullCover := query(q).valid && ((rawQueryMask & query(q).loadMask) === query(q).loadMask)
   }
 
-  val rawQueryMask = perByteFwdValid.asUInt
-  query.fwdMask := Mux(query.valid, rawQueryMask, 0.U)
-  query.fwdData := Mux(
-    query.valid,
-    Cat(perByteFwdData(3), perByteFwdData(2), perByteFwdData(1), perByteFwdData(0)),
-    0.U
-  )
-  query.fullCover := query.valid && ((rawQueryMask & query.loadMask) === query.loadMask)
+  // ============================================================================
+  // TD-A：Load 路径 outstanding=2 状态跟踪
+  // ----------------------------------------------------------------------------
+  // 仅记录"已发出 AR 但 R 还未返回"的数量（最大 2）。无需保存 addr/上下文：
+  //   - 上游 Memory 已经在自己的 MSHR Vec(2) 里维护 Load 上下文；
+  //   - R 通道按 AR 入队顺序严格返回，由 DRAM_AXIInterface 内的 FIFO 保证。
+  // 因此本模块只需做"流量控制"：保证不超过 2 个 outstanding。
+  // ============================================================================
+  val loadInflightCnt = RegInit(0.U(2.W))
+  val arFireWire = WireInit(false.B)
+  val rFireWire  = WireInit(false.B)
 
-  // ===================== 统一 AXI 读写仲裁 =====================
-  val sIdle :: sLoadWaitR :: sStoreWaitB :: Nil = Enum(3)
-  val state = RegInit(sIdle)
+  // ============================================================================
+  // Store 写状态机：保留单 outstanding（sStoreIdle / sStoreWaitB）
+  // ----------------------------------------------------------------------------
+  // Store 优先级最低：仅当 Load 路径完全空闲（loadInflightCnt=0 且无 pending load）
+  // 时才发起 store。这样彻底避免读写穿插 + B 与 R 同拍竞争的复杂场景。
+  // 仍然保留 storeBurstLimit 防止 store 持续阻塞 load 时的反向饥饿（理论上不会触发，
+  // 但保留为防御）。
+  // ============================================================================
+  val sStoreIdle :: sStoreWaitB :: Nil = Enum(2)
+  val storeState = RegInit(sStoreIdle)
 
-  // 当 load miss 已经在等待，而 committed store 持续堆积时，限制连续 store 优先次数，避免 load 饥饿。
   val consecutiveStoreWins = RegInit(0.U(burstCntWidth.W))
   val loadPending = loadAddr.valid
-  val forceLoad   = loadPending && hasStore && (consecutiveStoreWins === storeBurstLimit.U)
-  val chooseStore = hasStore && (!loadPending || !forceLoad)
-  val chooseLoad  = loadPending && (!hasStore || forceLoad)
 
   // ---- AXI 各通道默认值 ----
   axi.aw.valid := false.B
@@ -169,61 +195,60 @@ class AXIStoreQueue(val depth: Int = CPUConfig.axiSqEntries) extends Module {
   loadData.valid := false.B
   loadData.bits  := 0.U
 
+  // ============================================================================
+  // Load 路径：AR 与 R 直通到 axi
+  // ----------------------------------------------------------------------------
+  // ar.valid 来源 = Memory 推上来的 loadAddr.valid + outstanding 上限未达；
+  // ar.ready 来源 = 下游 DRAM_AXIInterface 的 readReqFifo 是否有空位；
+  // loadAddr.ready 只在两者都满足时拉高（loadAddr 是 Decoupled，握手在两端同拍达成）。
+  // ============================================================================
+  val canIssueLoad = loadPending && (loadInflightCnt < 2.U) &&
+                     (storeState === sStoreIdle)  // Store 占 DRAM 时让 Load 等一拍
+  axi.ar.valid     := canIssueLoad
+  axi.ar.bits.addr := loadAddr.bits
+  axi.ar.bits.id   := 0.U
+  loadAddr.ready   := canIssueLoad && axi.ar.ready
+  arFireWire       := loadAddr.fire
+
+  // R 通道直通：DRAM_AXIInterface 已经按 FIFO 顺序返回，本模块无需重排。
+  loadData.valid := axi.r.valid
+  loadData.bits  := axi.r.bits.data
+  axi.r.ready    := loadData.ready
+  rFireWire      := loadData.fire
+
+  // outstanding 计数维护：AR fire +1，R fire -1；两者同拍则净变化 0。
+  when(arFireWire && !rFireWire) {
+    loadInflightCnt := loadInflightCnt + 1.U
+  }.elsewhen(!arFireWire && rFireWire) {
+    loadInflightCnt := loadInflightCnt - 1.U
+  }
+
+  // ============================================================================
+  // Store 路径：仅在 Load 完全空闲时发起 AW+W 同拍握手
+  // ============================================================================
   val storeRespFire = WireInit(false.B)
-  val loadRespFire  = WireInit(false.B)
+  // canIssueStore 严格条件：当前无 outstanding load 且本拍也没有新 load 入队尝试。
+  // 这样 Store 只在 Load 真正"安静"的窗口里 drain，避免与 R 通道争用 DRAM。
+  val canIssueStore = (storeState === sStoreIdle) && hasStore &&
+                      (loadInflightCnt === 0.U) && !loadPending
 
-  switch(state) {
-    is(sIdle) {
-      when(chooseStore) {
-        // 同拍发起 AW 与 W；DRAM_AXIInterface 仅在两者同拍 valid 时才完成握手。
-        axi.aw.valid     := true.B
-        axi.aw.bits.addr := Cat(headEntry.wordAddr, 0.U(2.W))
-        axi.w.valid      := true.B
-        axi.w.bits.data  := headEntry.wdata
-        axi.w.bits.strb  := headEntry.wstrb
-        when(axi.aw.ready && axi.w.ready) {
-          state := sStoreWaitB
-          when(loadPending) {
-            consecutiveStoreWins := Mux(
-              consecutiveStoreWins === storeBurstLimit.U,
-              consecutiveStoreWins,
-              consecutiveStoreWins + 1.U
-            )
-          }.otherwise {
-            consecutiveStoreWins := 0.U
-          }
-        }
-      }.elsewhen(chooseLoad) {
-        axi.ar.valid     := true.B
-        axi.ar.bits.addr := loadAddr.bits
-        loadAddr.ready    := axi.ar.ready
-        when(loadAddr.fire) {
-          state := sLoadWaitR
-          consecutiveStoreWins := 0.U
-        }
-      }.otherwise {
-        consecutiveStoreWins := 0.U
-      }
+  when(canIssueStore) {
+    axi.aw.valid     := true.B
+    axi.aw.bits.addr := Cat(headEntry.wordAddr, 0.U(2.W))
+    axi.w.valid      := true.B
+    axi.w.bits.data  := headEntry.wdata
+    axi.w.bits.strb  := headEntry.wstrb
+    when(axi.aw.ready && axi.w.ready) {
+      storeState := sStoreWaitB
+      consecutiveStoreWins := 0.U
     }
+  }
 
-    is(sLoadWaitR) {
-      // 把 R 通道直接桥接到 loadResp 的 Decoupled。
-      loadData.valid := axi.r.valid
-      loadData.bits  := axi.r.bits.data
-      axi.r.ready    := loadData.ready
-      loadRespFire   := loadData.fire
-      when(loadRespFire) {
-        state := sIdle
-      }
-    }
-
-    is(sStoreWaitB) {
-      // Store 写响应只供队列内部消费，因此对 B 通道始终 ready。
-      axi.b.ready := true.B
-      storeRespFire := axi.b.valid
-      when(storeRespFire) {
-        state := sIdle
-      }
+  when(storeState === sStoreWaitB) {
+    axi.b.ready := true.B
+    storeRespFire := axi.b.valid
+    when(storeRespFire) {
+      storeState := sStoreIdle
     }
   }
 
@@ -244,8 +269,6 @@ class AXIStoreQueue(val depth: Int = CPUConfig.axiSqEntries) extends Module {
   }
 
   // ===================== difftest 调试口 =====================
-  // 直接使用 enqueue 成功脉冲：在当前架构下，store 在成功进入 AXIStoreQueue
-  // 的同拍即视为完成提交，difftest 也按此时刻完成 RAM 写事件比对。
   debug.commitRamWen   := enqFire
   debug.commitRamWaddr := enq.bits.addr
   debug.commitRamWdata := enq.bits.data

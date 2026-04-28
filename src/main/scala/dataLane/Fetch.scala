@@ -13,17 +13,18 @@ import mycpu.CPUConfig
 // BPU 预测规则：
 //   - JAL：始终预测跳转，目标 = PC + J-type 立即数
 //   - B-type：使用 BHT 预测结果，目标 = PC + B-type 立即数
-//   - JALR：预测不跳转（目标依赖 rs1，Fetch 无法确定）
+//   - JALR：若 useBTB 开启并命中，预测跳转到 BTB 缓存的目标；否则预测不跳转。
 //   - 在 4 条指令中找到第一条预测跳转的分支，截断后续槽位的 valid
 //
 // 地址对齐处理：PC[3:2] 决定起始槽位，只有 >= start_slot 的槽位有效
 // ============================================================================
 class Fetch extends Module {
   private val useBHT = CPUConfig.useBHT
+  private val useBTB = CPUConfig.useBTB
   private val bhtIdxWidth = log2Ceil(CPUConfig.bhtEntries)
 
   val in = IO(Flipped(Decoupled(UInt(32.W)))) // 输入：PC 值
-  val out = IO(Decoupled(Vec(4, new FetchBufferEntry))) // 输出：4 个取指结果包（含预测信息）
+  val out = IO(Decoupled(Vec(CPUConfig.fetchWidth, new FetchBufferEntry))) // 输出：4 个取指结果包（含预测信息）
 
   // ---- 读 IROM 接口 ----
   val irom = IO(new Bundle {
@@ -33,8 +34,16 @@ class Fetch extends Module {
 
   // ---- BHT 接口（由 myCPU 顶层连接到 BHT 模块）----
   val bht = Option.when(useBHT){IO(new Bundle {
-    val read_idx = Output(Vec(4, UInt(bhtIdxWidth.W)))  // 4 路 BHT 读索引
-    val predict  = Input(Vec(4, UInt(2.W)))             // 4 路 BHT 预测值（2-bit 格雷码）
+    val read_idx = Output(Vec(CPUConfig.fetchWidth, UInt(bhtIdxWidth.W)))  // 4 路 BHT 读索引
+    val predict  = Input(Vec(CPUConfig.fetchWidth, UInt(2.W)))             // 4 路 BHT 预测值（2-bit 格雷码）
+  })}
+
+  // ---- BTB 接口（仅 useBTB 开启时存在）----
+  // 为 JALR 的间接跳转目标提供缓存预测。
+  val btb = Option.when(useBTB){IO(new Bundle {
+    val read_pc = Output(Vec(CPUConfig.fetchWidth, UInt(32.W))) // 4 路并行 BTB 查询 PC
+    val hit     = Input(Vec(CPUConfig.fetchWidth, Bool()))
+    val target  = Input(Vec(CPUConfig.fetchWidth, UInt(32.W)))
   })}
 
   // ---- 预测结果输出 ----
@@ -49,25 +58,26 @@ class Fetch extends Module {
 
   // ---- 解包 4 条指令并求对应 PC 值 ----
   irom.inst_addr_o := pc(17, 4) // 输出到 IROM 地址
-  val pcs = Wire(Vec(4, UInt(32.W)))
-  val insts = Wire(Vec(4, UInt(32.W)))
-  for (i <- 0 until 4) {      
+  val pcs = Wire(Vec(CPUConfig.fetchWidth, UInt(32.W)))
+  val insts = Wire(Vec(CPUConfig.fetchWidth, UInt(32.W)))
+  for (i <- 0 until CPUConfig.fetchWidth) {      
     pcs(i) := (basePC(31, 2) + i.U) ## 0.U(2.W) // 求每条指令的 PC 值（即使非对齐，也会取相应对齐地址向后 4 条指令）
     insts(i) := irom.inst_i(32 * i + 31, 32 * i) // 将 128 位数据解包为 4 × 32 位指令
   }
 
   // ---- 轻量预译码 + BPU 预测 ----
-  val slotTaken   = Wire(Vec(4, Bool()))     // 每个槽位是否预测跳转
-  val slotTarget  = Wire(Vec(4, UInt(32.W))) // 每个槽位的预测目标
-  val slotBHTMeta = Wire(Vec(4, UInt(2.W)))  // 每个槽位的 BHT 元数据
-  val validTaken  = Wire(Vec(4, Bool()))
-  for (i <- 0 until 4) { // 开始遍历每一条指令
+  val slotTaken   = Wire(Vec(CPUConfig.fetchWidth, Bool()))     // 每个槽位是否预测跳转
+  val slotTarget  = Wire(Vec(CPUConfig.fetchWidth, UInt(32.W))) // 每个槽位的预测目标
+  val slotBHTMeta = Wire(Vec(CPUConfig.fetchWidth, UInt(2.W)))  // 每个槽位的 BHT 元数据
+  val validTaken  = Wire(Vec(CPUConfig.fetchWidth, Bool()))
+  for (i <- 0 until CPUConfig.fetchWidth) { // 开始遍历每一条指令
     val inst   = insts(i)
     val opcode = inst(6, 0)
 
-    // 指令类型识别（仅关注条件分支和JAL指令，JALR 预测为不跳转，无需专门处理）
+    // 指令类型识别（仅关注条件分支和JAL指令，JALR 预测由 BTB 提供）
     val isJal   = opcode === "b1101111".U
     val isBtype = opcode === "b1100011".U
+    val isJalr  = opcode === "b1100111".U
     val jalTarget = pcs(i) + Cat(Fill(12, inst(31)), inst(19, 12), inst(20), inst(30, 21), 0.U(1.W)) // JAL 目标
     val bTarget = pcs(i) + Cat(Fill(20, inst(31)), inst(7), inst(30, 25), inst(11, 8), 0.U(1.W)) // B-type 目标
     // 分支跳转预测结果
@@ -78,9 +88,19 @@ class Fetch extends Module {
       isBtype && inst(31)
     }
 
+    // ---- BTB 查询：给 JALR 一个预测目标 ----
+    // 命中 && 是 JALR 时，把该槽预测为 taken，目标取 BTB 缓存；
+    // 未命中或非 JALR 时 btb 查询结果忽略（不影响 B/JAL/普通指令）。
+    val btbHit    = if (useBTB) { btb.get.read_pc(i) := pcs(i); btb.get.hit(i) } else { false.B }
+    val btbTarget = if (useBTB) { btb.get.target(i) } else { 0.U(32.W) }
+    val jalrPredictTaken = isJalr && btbHit
+
     // 输出每个槽位的结果
-    slotTaken(i)   := isJal || predictTaken // JAL 指令一定跳转
-    slotTarget(i)  := Mux(slotTaken(i), Mux(isJal, jalTarget, bTarget), 0.U(32.W))
+    slotTaken(i)   := isJal || predictTaken || jalrPredictTaken // JAL 一定跳转；B 按 BHT；JALR 按 BTB
+    slotTarget(i)  := Mux(slotTaken(i),
+                        Mux(isJal, jalTarget,
+                          Mux(jalrPredictTaken, btbTarget, bTarget)),
+                        0.U(32.W))
     slotBHTMeta(i) := { if (useBHT){bht.get.predict(i)} else {0.U(2.W)} }  // BHT 计数器原始值
     validTaken(i)  := (i.U >= startSlot) && slotTaken(i) // 每个槽位是否为"有效且预测跳转"
   }
@@ -92,7 +112,7 @@ class Fetch extends Module {
   predict.target := slotTarget(firstTakenSlot)
   
   // ---- 输出 FetchPacket ----
-  for (i <- 0 until 4) {
+  for (i <- 0 until CPUConfig.fetchWidth) {
     out.bits(i).pc   := pcs(i)
     out.bits(i).inst := insts(i)
     out.bits(i).predict_taken  := slotTaken(i)

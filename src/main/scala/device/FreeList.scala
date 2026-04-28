@@ -27,7 +27,7 @@ class RenameIO extends Bundle {
   val canAlloc        = Input(Bool())     // 是否有足够空闲寄存器（>= allocReq 预览值）
   val doAlloc         = Output(Bool())    // 实际提交分配（Rename 确认后拉高）
   val allocReq        = Output(UInt(3.W)) // 请求分配数量（0~4），为 0 时相当于不分配
-  val allocPdst       = Input(Vec(4, UInt(CPUConfig.prfAddrWidth.W))) // 分配的物理寄存器编号
+  val allocPdst       = Input(Vec(CPUConfig.renameWidth, UInt(CPUConfig.prfAddrWidth.W))) // 分配的物理寄存器编号
   val snapAllocReq1   = Output(UInt(3.W)) // 第一个 checkpoint 中需要计入的 FreeList 分配数量
   val snapAllocReq2   = Output(UInt(3.W)) // 第二个 checkpoint 中需要计入的 FreeList 分配数量
 }
@@ -85,7 +85,7 @@ class FreeList extends Module {
       head := head + renameIO.allocReq
     }
   }
-  for (i <- 0 until 4) { // 组合逻辑输出连续 4 个空闲物理寄存器编号（不管是否实际分配）
+  for (i <- 0 until CPUConfig.renameWidth) { // 组合逻辑输出连续 4 个空闲物理寄存器编号（不管是否实际分配）
     renameIO.allocPdst(i) := fifo(idx(head + i.U))
   }
 

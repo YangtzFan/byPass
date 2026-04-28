@@ -71,8 +71,13 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
     val storeMustBeLane0Only = if (i == 0) false.B else headEntries(i).isStore
     val storeConflict = storeMustBeLane0Only
 
+    // SYSTEM/ECALL 截断：若更老的某 lane 是 sysStop（ECALL/EBREAK/FENCE/other），
+    // 则本拍其后的 lane 一律不提交，避免 difftest 参考模型预解码越界。
+    val sysStopBefore = if (i == 0) false.B else
+      VecInit((0 until i).map(j => headEntries(j).isSysStop)).asUInt.orR
+
     val prevOk = if (i == 0) (!commitBlocked) else canCommitVec(i - 1)
-    canCommitVec(i) := prevOk && notEmpty_i && done_i && !storeConflict
+    canCommitVec(i) := prevOk && notEmpty_i && done_i && !storeConflict && !sysStopBefore
   }
 
   val canCommitHead = canCommitVec(0)
@@ -114,6 +119,7 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
           entry.regWen        := alloc.data(i).regWen
           entry.regWBData     := 0.U
           entry.isStore       := alloc.data(i).isStore
+          entry.isSysStop     := alloc.data(i).isSysStop  // ECALL/EBREAK/FENCE：commit 时截断后续 lane
           entry.storeSeq      := alloc.data(i).storeSeq  // 写入 Store 的逻辑年龄（Commit 时传给 StoreBuffer 用于定位表项）
           entry.hasCheckpoint := alloc.data(i).hasCheckpoint  // 标记该指令是否保存了 BCT checkpoint
           // 物理寄存器映射信息存入 ROB 表项

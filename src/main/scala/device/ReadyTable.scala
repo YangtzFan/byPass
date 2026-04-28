@@ -25,12 +25,12 @@ import mycpu.CPUConfig
 class ReadyTable extends Module {
   val io = IO(new Bundle {
     // ---- 读端口（8 个，Rename 阶段查询源操作数就绪状态）----
-    val raddr = Input(Vec(8, UInt(CPUConfig.prfAddrWidth.W)))    // 查询的物理寄存器编号
-    val rdata = Output(Vec(8, Bool()))                           // 就绪状态（true = ready）
+    val raddr = Input(Vec(2 * CPUConfig.renameWidth, UInt(CPUConfig.prfAddrWidth.W)))    // 查询的物理寄存器编号
+    val rdata = Output(Vec(2 * CPUConfig.renameWidth, Bool()))                           // 就绪状态（true = ready）
 
     // ---- Rename 阶段置 busy（新分配的 pdst 还没有执行结果）----
-    val busyVen  = Input(Vec(4, Bool()))                         // busy 使能
-    val busyAddr = Input(Vec(4, UInt(CPUConfig.prfAddrWidth.W))) // 待置 busy 的物理寄存器编号
+    val busyVen  = Input(Vec(CPUConfig.renameWidth, Bool()))                         // busy 使能
+    val busyAddr = Input(Vec(CPUConfig.renameWidth, UInt(CPUConfig.prfAddrWidth.W))) // 待置 busy 的物理寄存器编号
 
     // ---- Refresh 阶段置 ready（执行结果已写回 PRF）----
     // 每个 refresh lane 一个独立的 (ven, addr) 端口。乱序下同拍不会出现重复 addr。
@@ -62,7 +62,7 @@ class ReadyTable extends Module {
   }.otherwise {
     // ---- Rename 阶段：新分配的 pdst 置 busy ----
     // p0 永远 ready，不能被置 busy
-    for (i <- 0 until 4) {
+    for (i <- 0 until CPUConfig.renameWidth) {
       when(io.busyVen(i) && io.busyAddr(i) =/= 0.U) {
         table(io.busyAddr(i)) := false.B
       }
@@ -80,7 +80,7 @@ class ReadyTable extends Module {
 
   // ---- 组合读端口 ----
   // p0 始终返回 ready
-  for (i <- 0 until 8) {
+  for (i <- 0 until 2 * CPUConfig.renameWidth) {
     io.rdata(i) := Mux(io.raddr(i) === 0.U, true.B, table(io.raddr(i)))
   }
 

@@ -22,7 +22,7 @@ import mycpu.device.saveRequestRename
 // 处理顺序：lane 0 最老 → lane 3 最年轻
 // ============================================================================
 class Rename extends Module {
-  val in  = IO(Flipped(Decoupled(Vec(4, new DecodedInst)))) // 来自 DecRenDff 的 4 条译码结果
+  val in  = IO(Flipped(Decoupled(Vec(CPUConfig.renameWidth, new DecodedInst)))) // 来自 DecRenDff 的 4 条译码结果
   val out = IO(Decoupled(new Rename_Dispatch_Payload))      // 输出到 RenDisDff
   val flush = IO(Input(Bool()))                             // 流水线冲刷信号
 
@@ -32,8 +32,8 @@ class Rename extends Module {
   val freeList = IO(new RenameIO)
   // ---- ReadyTable 接口 ----
   val readyTable = IO(new Bundle {
-    val busyVen  = Output(Vec(4, Bool()))                         // 置 busy 使能
-    val busyAddr = Output(Vec(4, UInt(CPUConfig.prfAddrWidth.W))) // 置 busy 地址
+    val busyVen  = Output(Vec(CPUConfig.renameWidth, Bool()))                         // 置 busy 使能
+    val busyAddr = Output(Vec(CPUConfig.renameWidth, UInt(CPUConfig.prfAddrWidth.W))) // 置 busy 地址
   })
 
   // ---- BranchCheckpoint 接口 ----
@@ -41,6 +41,15 @@ class Rename extends Module {
   val ckptRAT = IO(new Bundle {
     val postRename1 = Output(Vec(32, UInt(CPUConfig.prfAddrWidth.W))) // RAT 快照 1
     val postRename2 = Output(Vec(32, UInt(CPUConfig.prfAddrWidth.W))) // RAT 快照 2
+  })
+  // ---- ReadyTable 当前快照输入（来自 MyCPU 顶层）----
+  // 用于在 Rename 同拍叠加更老 lane 的 busyVen 后产出真正的"分支快照态"。
+  // 直接接 uReadyTable.io.snapData 即可。
+  val readyTbSnapIn = IO(Input(Vec(CPUConfig.prfEntries, Bool())))
+  // ---- ReadyTable Checkpoint 输出（叠加同拍 busyVen 后）----
+  val ckptReadyTb = IO(new Bundle {
+    val postRename1 = Output(Vec(CPUConfig.prfEntries, Bool())) // ReadyTable 快照 1
+    val postRename2 = Output(Vec(CPUConfig.prfEntries, Bool())) // ReadyTable 快照 2
   })
 
   // ---- 逐路处理：提取指令字段 ----
@@ -50,8 +59,8 @@ class Rename extends Module {
   val regWriteEnables = in.bits.map(_.regWriteEnable) // 是否写回寄存器
   val memWriteEnables = in.bits.map(_.type_decode_together(2)) // sType
 
-  val predictedBranchVec = Wire(Vec(4, Bool())) // 标记每个槽位是否是快照型分支
-  for (i <- 0 until 4) {
+  val predictedBranchVec = Wire(Vec(CPUConfig.renameWidth, Bool())) // 标记每个槽位是否是快照型分支
+  for (i <- 0 until CPUConfig.renameWidth) {
     val td    = in.bits(i).type_decode_together
     val jalr  = td(6)
     val bType = td(5)
@@ -67,15 +76,15 @@ class Rename extends Module {
 
   // ---- 判断是否能进行 Rename ----
   val ckptReady = MuxCase(true.B, Seq( // 没有分支则不需要 BCT 空位，直接为 ready
-    hasSecondPredictedBranch -> ckPointReq.canSave2, // 如果本拍有 2 个被预测分支，需要 BCT 有 2 个空位（canSave2）
-    hasFirstPredictedBranch -> ckPointReq.canSave1 // 如果只有 1 个被预测分支，只需要 1 个空位（canSave1）
+    hasSecondPredictedBranch -> ckPointReq.canSave(1), // 本拍有 2 个被预测分支：需要 ≥2 个空位
+    hasFirstPredictedBranch  -> ckPointReq.canSave(0)  // 本拍有 1 个被预测分支：需要 ≥1 个空位
   ))
   val canRename = freeList.canAlloc && ckptReady && out.ready
   val doRename  = in.valid && canRename && !flush
 
   // 计算每路实际需要分配的槽位使能 needAlloc 和映射偏移量 allocOffsets
-  val needAlloc = Wire(Vec(4, Bool())) // 每条指令是否需要从 FreeList 分配 pdst
-  for (i <- 0 until 4) {
+  val needAlloc = Wire(Vec(CPUConfig.renameWidth, Bool())) // 每条指令是否需要从 FreeList 分配 pdst
+  for (i <- 0 until CPUConfig.renameWidth) {
     needAlloc(i) := in.bits(i).valid && regWriteEnables(i) && rds(i) =/= 0.U
   }
   val allocOffsets = WireInit(VecInit(Seq.fill(4)(0.U(2.W)))) // 在 FreeList 分配结果中的偏移
@@ -89,8 +98,8 @@ class Rename extends Module {
   freeList.allocReq := Mux(doRename, totalAllocCount, 0.U) // 请求分配的个数
 
   // 按照偏移提取出每路分配的 pdst
-  val pdsts = Wire(Vec(4, UInt(CPUConfig.prfAddrWidth.W)))
-  for (i <- 0 until 4) {
+  val pdsts = Wire(Vec(CPUConfig.renameWidth, UInt(CPUConfig.prfAddrWidth.W)))
+  for (i <- 0 until CPUConfig.renameWidth) {
     pdsts(i) := Mux(needAlloc(i), freeList.allocPdst(allocOffsets(i)), 0.U)
   }
 
@@ -99,7 +108,7 @@ class Rename extends Module {
   //   1. 同拍更老 lane 的 pdst（rename bypass），因为此时还没写入 RAT 会读出旧值
   //   2. RAT 读取的映射（上一拍末尾值）
   // stalePdst = 当前 RAT[rd] 在分配 pdst 之前的值 也需要考虑同拍更老 lane 是否已经更新了 RAT[rd]
-  for (i <- 0 until 4) {
+  for (i <- 0 until CPUConfig.renameWidth) {
     rat.raddr(i * 2)     := rs1s(i)
     rat.raddr(i * 2 + 1) := rs2s(i)
     rat.staleRaddr(i)    := rds(i)
@@ -107,10 +116,10 @@ class Rename extends Module {
     rat.waddr(i) := rds(i)
     rat.wdata(i) := pdsts(i)
   }
-  val psrc1s     = Wire(Vec(4, UInt(CPUConfig.prfAddrWidth.W)))
-  val psrc2s     = Wire(Vec(4, UInt(CPUConfig.prfAddrWidth.W)))
-  val stalePdsts = Wire(Vec(4, UInt(CPUConfig.prfAddrWidth.W)))
-  for (i <- 0 until 4) {
+  val psrc1s     = Wire(Vec(CPUConfig.renameWidth, UInt(CPUConfig.prfAddrWidth.W)))
+  val psrc2s     = Wire(Vec(CPUConfig.renameWidth, UInt(CPUConfig.prfAddrWidth.W)))
+  val stalePdsts = Wire(Vec(CPUConfig.renameWidth, UInt(CPUConfig.prfAddrWidth.W)))
+  for (i <- 0 until CPUConfig.renameWidth) {
     psrc1s(i) := rat.rdata(i * 2)
     psrc2s(i) := rat.rdata(i * 2 + 1)
     stalePdsts(i) := rat.staleRdata(i)
@@ -133,7 +142,7 @@ class Rename extends Module {
   // 此时读出 false，天然满足“等待唤醒”的语义，无需额外 bypassed 标记。
 
   // ---- ReadyTable 置 busy（新分配的 pdst 还没有执行结果）----
-  for (i <- 0 until 4) {
+  for (i <- 0 until CPUConfig.renameWidth) {
     readyTable.busyVen(i)  := doRename && needAlloc(i)
     readyTable.busyAddr(i) := pdsts(i)
   }
@@ -143,8 +152,8 @@ class Rename extends Module {
   // 注意：checkpoint 保存的是本拍 Rename 写入之前还是之后的状态？
   // 应保存 Rename 写入之后的 RAT 状态（因为被预测分支本身可能也写 rd）
   // 但 FreeList 和 ReadyTable 的 checkpoint 由 myCPU 顶层在 Rename 完成后保存
-  ckPointReq.saveValid1  := doRename && hasFirstPredictedBranch
-  ckPointReq.saveValid2 := doRename && hasSecondPredictedBranch
+  ckPointReq.saveValid(0) := doRename && hasFirstPredictedBranch
+  ckPointReq.saveValid(1) := doRename && hasSecondPredictedBranch
 
   private def ohToInclusiveLaneMask(oh: UInt, width: Int): UInt = {
     // 例子（width = 4）:
@@ -174,7 +183,7 @@ class Rename extends Module {
   // ---- 第一个 Checkpoint RAT 快照构建 ----
   // 只叠加 ckptLaneMask1 为 true 的 lane 的写入（到第一个被预测分支为止）
   val postRenameRAT1 = WireInit(rat.snapData)
-  for (i <- 0 until 4) {
+  for (i <- 0 until CPUConfig.renameWidth) {
     when(ckptLaneMask1Vec(i) && rat.wen(i) && rat.waddr(i) =/= 0.U) {
       postRenameRAT1(rat.waddr(i)) := rat.wdata(i)
     }
@@ -184,15 +193,38 @@ class Rename extends Module {
   // ---- 第二个 Checkpoint RAT 快照构建 ----
   // 叠加 ckptLaneMask2 为 true 的 lane 的写入（到第二个被预测分支为止）
   val postRenameRAT2 = WireInit(rat.snapData)
-  for (i <- 0 until 4) {
+  for (i <- 0 until CPUConfig.renameWidth) {
     when(ckptLaneMask2Vec(i) && rat.wen(i) && rat.waddr(i) =/= 0.U) {
       postRenameRAT2(rat.waddr(i)) := rat.wdata(i)
     }
   }
   ckptRAT.postRename2 := postRenameRAT2
 
+  // ---- 第一/第二个 Checkpoint ReadyTable 快照构建 ----
+  // BUG 修复（kbr_x10 调试）：原先 BCT 直接吃 ReadyTable.snapData（Reg 当前值），
+  // 未叠加同拍 Rename 自己生成的 busyVen。当分支与更老 lane 的产生者（其 pdst=P）
+  // 在同一拍重命名时，P 在快照里仍是 "ready=1"（陈旧），分支后来误预测恢复时
+  // ReadyTable[P] 被错误地恢复为 1，消费者会读 PRF 拿到陈旧值。
+  // 修复策略：与 RAT 快照 (postRenameRAT1/2) 完全对齐 —— 用 ckptLaneMask{1,2}
+  // 选择同拍内"分支及更老"的 lane，把它们的 busyVen 叠加到快照位向量。
+  val postRenameReady1 = WireInit(readyTbSnapIn)
+  for (i <- 0 until CPUConfig.renameWidth) {
+    when(ckptLaneMask1Vec(i) && rat.wen(i) && pdsts(i) =/= 0.U) {
+      postRenameReady1(pdsts(i)) := false.B
+    }
+  }
+  ckptReadyTb.postRename1 := postRenameReady1
+
+  val postRenameReady2 = WireInit(readyTbSnapIn)
+  for (i <- 0 until CPUConfig.renameWidth) {
+    when(ckptLaneMask2Vec(i) && rat.wen(i) && pdsts(i) =/= 0.U) {
+      postRenameReady2(pdsts(i)) := false.B
+    }
+  }
+  ckptReadyTb.postRename2 := postRenameReady2
+
   // ---- 向下游输出 RenameEntry ----
-  for (i <- 0 until 4) {
+  for (i <- 0 until CPUConfig.renameWidth) {
     out.bits.entries(i).pc                   := in.bits(i).pc
     out.bits.entries(i).inst                 := in.bits(i).inst
     out.bits.entries(i).imm                  := in.bits(i).imm
@@ -207,12 +239,12 @@ class Rename extends Module {
     out.bits.entries(i).pdst                 := pdsts(i)
     out.bits.entries(i).stalePdst            := stalePdsts(i)
     out.bits.entries(i).ldst                 := rds(i)
-    // 分支 checkpoint 索引：第一个被预测分支使用 saveIdx，第二个使用 saveIdx2
-    out.bits.entries(i).checkpointIdx        := Mux(firstPredictedBranch(i), ckPointReq.saveIdx1,
-                                                  Mux(secondPredictedBranch(i), ckPointReq.saveIdx2, 0.U))
+    // 分支 checkpoint 索引：第一个被预测分支使用 saveIdx(0)，第二个使用 saveIdx(1)
+    out.bits.entries(i).checkpointIdx        := Mux(firstPredictedBranch(i), ckPointReq.saveIdx(0),
+                                                  Mux(secondPredictedBranch(i), ckPointReq.saveIdx(1), 0.U))
     // hasCheckpoint：第一个和第二个被预测分支都为 true（各自对应不同的 BCT 表项）
     out.bits.entries(i).hasCheckpoint        := firstPredictedBranch(i) || secondPredictedBranch(i)
-    // 阶段 1：IQ 入队当拍读取 ReadyTable 获得 src{1,2}Ready 初值（见 IssueQueue.scala）。
+    // IQ 入队当拍读取 ReadyTable 获得 src{1,2}Ready 初值（见 IssueQueue.scala）。
   }
   out.bits.validCount := PopCount(in.bits.map(_.valid))
   out.bits.storeCount := PopCount((in.bits.map(_.valid) zip memWriteEnables).map {

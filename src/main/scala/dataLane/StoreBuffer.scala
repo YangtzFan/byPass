@@ -21,11 +21,11 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   // ---- 分配接口（Dispatch 阶段）----
   val alloc = IO(Flipped(new SBAllocIO))
 
-  // ---- Store 写入接口（Memory 阶段）----
-  val write = IO(Input(new SBWriteIO))
+  // ---- Store 写入接口（Memory 阶段；阶段 D' 升级为 Vec：lane0 + lane1 同拍各写一条）----
+  val write = IO(Input(Vec(LaneCapability.storeLanes.size, new SBWriteIO)))
 
-  // ---- Load 查询接口（Memory 阶段）----
-  val query = IO(Flipped(new SBQueryIO))
+  // ---- Load 查询接口（Memory 阶段；TD-B 升级为 Vec：lane0 / lane1 同拍各发起一次查询）----
+  val query = IO(Flipped(Vec(LaneCapability.loadLanes.size, new SBQueryIO)))
 
   // ---- 回滚接口（Memory redirect）----
   val rollback = IO(Flipped(new SBRollbackIO))
@@ -41,7 +41,7 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   val freeCount = PopCount(freeVec)
 
   // ---- FreeList 式的“前四个空槽”选择逻辑 ----
-  val freeIdxs = Wire(Vec(4, UInt(idxWidth.W)))
+  val freeIdxs = Wire(Vec(CPUConfig.renameWidth, UInt(idxWidth.W)))
   val mask0 = freeVec.asUInt
   freeIdxs(0) := PriorityEncoder(mask0)
   val mask1 = mask0 & ~PriorityEncoderOH(mask0)
@@ -63,12 +63,12 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   alloc.availCount   := freeCount
   alloc.nextStoreSeq := nextStoreSeq
   alloc.idxs         := freeIdxs // 直接将 4 个空闲的槽位透传，由 Dispatch 自行选择取几个
-  for (i <- 0 until 4) { alloc.storeSeqs(i) := nextStoreSeq + i.U }
+  for (i <- 0 until CPUConfig.renameWidth) { alloc.storeSeqs(i) := nextStoreSeq + i.U }
 
   // Dispatch 已保证仅在真正派发成功时才把 alloc.request 抬起来，所以这里无需再二次判断 canAlloc。
   val doAlloc = alloc.request > 0.U && !rollback.valid
   when(doAlloc) {
-    for (i <- 0 until 4) {
+    for (i <- 0 until CPUConfig.renameWidth) {
       when(i.U < alloc.request) {
         val physIdx = freeIdxs(i)
         buffer(physIdx).valid := true.B
@@ -84,56 +84,65 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     nextStoreSeq := nextStoreSeq + alloc.request
   }
 
-  // ===================== Store 写入逻辑 =====================
+  // ===================== Store 写入逻辑（阶段 D'：双口） =====================
   // Store 到达 Memory 阶段后，地址/数据/字节掩码在这里落入 SB。
-  when(write.valid) {
-    buffer(write.idx).addrValid := true.B
-    buffer(write.idx).addr := write.addr
-    buffer(write.idx).data := write.data
-    buffer(write.idx).mask := write.mask
-    buffer(write.idx).byteMask := write.byteMask
-    buffer(write.idx).byteData := write.byteData
-  }
-
-  // ===================== Load 查询逻辑 =====================
-  // 这里只看“更老且仍在 SB 中”的 speculative store。
-  // 一旦 store 成功进入 AXIStoreQueue，它就不再属于 SB 的可见范围。
-  val olderVec = Wire(Vec(depth, Bool()))
-  val wordAddrHit = Wire(Vec(depth, Bool()))
-  val pendingVec = Wire(Vec(depth, Bool()))
-  for (i <- 0 until depth) {
-    val entry = buffer(i)
-    val isOlder = entry.valid && seqOlderThan(entry.storeSeq, query.storeSeqSnap)
-    olderVec(i) := isOlder
-    wordAddrHit(i) := isOlder && entry.addrValid && (entry.addr(31, 2) === query.wordAddr)
-    pendingVec(i) := isOlder && !entry.addrValid
-  }
-
-  // 只要存在更老但地址未知的 store，就必须先停顿，不能跳过 SB 去看后面的 committed queue/DRAM。
-  query.olderUnknown := query.valid && pendingVec.asUInt.orR
-
-  val perByteFwdValid = Wire(Vec(4, Bool()))
-  val perByteFwdData = Wire(Vec(4, UInt(8.W)))
-
-  for (b <- 0 until 4) {
-    val (bestValid, bestSeq, bestByte) = (0 until depth).foldLeft(
-      (false.B, 0.U(seqWidth.W), 0.U(8.W))
-    ) { case ((hasBest, bestSeqSoFar, bestByteSoFar), i) =>
-      val candidate = wordAddrHit(i) && buffer(i).byteMask(b)
-      val chooseThis = candidate && (!hasBest || seqNewerOrEq(buffer(i).storeSeq, bestSeqSoFar))
-      (
-        hasBest || candidate,
-        Mux(chooseThis, buffer(i).storeSeq, bestSeqSoFar),
-        Mux(chooseThis, buffer(i).byteData(b * 8 + 7, b * 8), bestByteSoFar)
-      )
+  // 多端口语义：Dispatch 已为每条 Store 分配独立的 sbIdx（FreeList 逐项），因此 lane0
+  // 与 lane1 在同拍 sbWrite 永远写不同槽位，互不干扰；这里直接顺序遍历端口即可。
+  for (p <- 0 until LaneCapability.storeLanes.size) {
+    when(write(p).valid) {
+      buffer(write(p).idx).addrValid := true.B
+      buffer(write(p).idx).addr := write(p).addr
+      buffer(write(p).idx).data := write(p).data
+      buffer(write(p).idx).mask := write(p).mask
+      buffer(write(p).idx).byteMask := write(p).byteMask
+      buffer(write(p).idx).byteData := write(p).byteData
     }
-    perByteFwdValid(b) := bestValid
-    perByteFwdData(b) := bestByte
   }
 
-  query.fwdMask := perByteFwdValid.asUInt
-  query.fwdData := Cat(perByteFwdData(3), perByteFwdData(2), perByteFwdData(1), perByteFwdData(0))
-  query.fullCover := query.valid && ((query.fwdMask & query.loadMask) === query.loadMask)
+  // ===================== Load 查询逻辑（TD-B 升级：Vec(N) 多查询口）=====================
+  // 这里只看"更老且仍在 SB 中"的 speculative store。
+  // 一旦 store 成功进入 AXIStoreQueue，它就不再属于 SB 的可见范围。
+  //
+  // TD-B：每个 Load lane 独立提供一份组合查询逻辑（StoreBuffer 是无状态查表，可任意复制）。
+  // 不同 lane 的查询彼此完全独立——每个 lane 有自己的 storeSeqSnap / wordAddr / loadMask。
+  for (q <- 0 until LaneCapability.loadLanes.size) {
+    val olderVec = Wire(Vec(depth, Bool()))
+    val wordAddrHit = Wire(Vec(depth, Bool()))
+    val pendingVec = Wire(Vec(depth, Bool()))
+    for (i <- 0 until depth) {
+      val entry = buffer(i)
+      val isOlder = entry.valid && seqOlderThan(entry.storeSeq, query(q).storeSeqSnap)
+      olderVec(i) := isOlder
+      wordAddrHit(i) := isOlder && entry.addrValid && (entry.addr(31, 2) === query(q).wordAddr)
+      pendingVec(i) := isOlder && !entry.addrValid
+    }
+
+    // 只要存在更老但地址未知的 store，就必须先停顿，不能跳过 SB 去看后面的 committed queue/DRAM。
+    query(q).olderUnknown := query(q).valid && pendingVec.asUInt.orR
+
+    val perByteFwdValid = Wire(Vec(4, Bool()))
+    val perByteFwdData = Wire(Vec(4, UInt(8.W)))
+
+    for (b <- 0 until 4) {
+      val (bestValid, _, bestByte) = (0 until depth).foldLeft(
+        (false.B, 0.U(seqWidth.W), 0.U(8.W))
+      ) { case ((hasBest, bestSeqSoFar, bestByteSoFar), i) =>
+        val candidate = wordAddrHit(i) && buffer(i).byteMask(b)
+        val chooseThis = candidate && (!hasBest || seqNewerOrEq(buffer(i).storeSeq, bestSeqSoFar))
+        (
+          hasBest || candidate,
+          Mux(chooseThis, buffer(i).storeSeq, bestSeqSoFar),
+          Mux(chooseThis, buffer(i).byteData(b * 8 + 7, b * 8), bestByteSoFar)
+        )
+      }
+      perByteFwdValid(b) := bestValid
+      perByteFwdData(b) := bestByte
+    }
+
+    query(q).fwdMask := perByteFwdValid.asUInt
+    query(q).fwdData := Cat(perByteFwdData(3), perByteFwdData(2), perByteFwdData(1), perByteFwdData(0))
+    query(q).fullCover := query(q).valid && ((query(q).fwdMask & query(q).loadMask) === query(q).loadMask)
+  }
 
   // ===================== Commit 候选查询 =====================
   // ROB head 是 Store 时，通过 storeSeq 在 SB 中精确找到唯一候选。

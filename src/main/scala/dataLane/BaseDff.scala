@@ -15,21 +15,28 @@ import chisel3.util._
 // 参数：
 //   gen          : 数据类型（如 FetchBufferEntry、DecodeOut 等 Bundle）
 //   supportFlush : 是否需要 flush 端口（flush 时 valid 清零，丢弃数据）
-//   getRobIdx    : 可选。若提供，即开启“精确选择性 flush”：
+//   getRobIdx    : 可选。若提供，即开启“整 bundle 选择性 flush”（单 robIdx 比较）：
 //                  flush 时仅丢弃 payload 中 robIdx 比 flushBranchRobIdx 更年轻的条目，
-//                  保留或放行比其更老或等于该分支的条目。用于 OoO 单发射场景下，
-//                  防止老于误预测分支但因 OoO 在其后进入流水级的指令被误清除。
+//                  保留或放行比其更老或等于该分支的条目。
+//   laneFlush    : 可选。若提供，则启用"per-lane validMask 选择性 flush"——
+//                  适用于 post-IQ 多 lane payload（IssRR/RREx/ExMem）：bundle 内
+//                  各 lane 的 robIdx 互不相同，需逐 lane 与 flushBranchRobIdx 比较，
+//                  把"年轻于分支"的 lane validMask 清零；若全部 lane 被清零，则
+//                  整 bundle 视为废 bundle 丢弃。函数签名 (payload, branchRobIdx)
+//                  ⇒ (maskedPayload, anyLaneAlive)。当 laneFlush 提供时优先生效，
+//                  忽略 getRobIdx；getRobIdx/laneFlush 二者择一即可。
 // ============================================================================
 class BaseDff[T <: Data](
     gen: T,
     supportFlush: Boolean = false,
-    getRobIdx: Option[T => UInt] = None
+    getRobIdx: Option[T => UInt] = None,
+    laneFlush: Option[(T, UInt) => (T, Bool)] = None
 ) extends Module {
   val in  = IO(Flipped(Decoupled(gen))) // 输入端（Flipped 使 valid/bits 为 Input，ready 为 Output）
   val out = IO(Decoupled(gen))          // 输出端（valid/bits 为 Output，ready 为 Input）
   val flush = Option.when(supportFlush)(IO(Input(Bool())))  // 可选的 flush 信号
-  // 选择性 flush 的“基准分支 robIdx”。仅在 supportFlush && getRobIdx 同时提供时生效。
-  val flushBranchRobIdx = Option.when(supportFlush && getRobIdx.nonEmpty)(
+  // 选择性 flush 的“基准分支 robIdx”。仅在 supportFlush && (getRobIdx 或 laneFlush) 提供时生效。
+  val flushBranchRobIdx = Option.when(supportFlush && (getRobIdx.nonEmpty || laneFlush.nonEmpty))(
     IO(Input(UInt(mycpu.CPUConfig.robPtrWidth.W)))
   )
 
@@ -47,17 +54,41 @@ class BaseDff[T <: Data](
     ((a - b)(w - 1) === 0.U) && (a =/= b)
   }
 
-  (flush, getRobIdx, flushBranchRobIdx) match {
-    case (Some(flushSig), Some(extract), Some(branchIdx)) =>
-      // ---- 精确选择性 flush 分支 ----
-      // killCur：当前缓存的指令比误预测分支更年轻，本拍应丢弃
-      // killIn ：上游传入的指令比误预测分支更年轻，本拍不应接收
+  (flush, getRobIdx, flushBranchRobIdx, laneFlush) match {
+    case (Some(flushSig), _, Some(branchIdx), Some(laneFn)) =>
+      // ---- TD-C：post-IQ 多 lane payload 的 per-lane 选择性 flush ----
+      // 由用户提供的 laneFn 把 "年轻于 branchIdx 的 lane" 在 validMask 中清零，
+      // 同时返回 anyLaneAlive。当所有 lane 都被清零时，整个 bundle 当作废 bundle 丢弃。
+      val (curMasked, curAnyAlive) = laneFn(bitsReg, branchIdx)
+      val (inMasked,  inAnyAlive)  = laneFn(in.bits, branchIdx)
+
+      // killCur：当前 bundle 在 flush 后已无任何存活 lane → 整 bundle 丢弃
+      // killIn ：上游传入的 bundle 在 flush 后已无任何存活 lane → 不予接收
+      val killCur = flushSig && !curAnyAlive
+      val killIn  = flushSig && !inAnyAlive
+
+      val canReceive = !validReg || out.ready || killCur
+      in.ready := canReceive
+
+      val acceptNew = in.valid && canReceive && !killIn
+      val keepCur   = validReg && !killCur && !out.ready
+      when(acceptNew) {
+        validReg := true.B
+        // 接收新 bundle 时，若同拍 flush，则使用 mask 后版本（年轻 lane 已清零）
+        bitsReg  := Mux(flushSig, inMasked, in.bits)
+      }.otherwise {
+        validReg := keepCur
+        // 保留当前 bundle 时，若同拍 flush，则把 bitsReg 替换为 mask 后版本
+        when(flushSig && keepCur) {
+          bitsReg := curMasked
+        }
+      }
+
+    case (Some(flushSig), Some(extract), Some(branchIdx), None) =>
+      // ---- 单 robIdx 选择性 flush 分支（保留原行为，用于 pre-IQ DFF）----
       val killCur = flushSig && isYoungerRob(extract(bitsReg), branchIdx)
       val killIn  = flushSig && isYoungerRob(extract(in.bits), branchIdx)
 
-      // 若当前指令将被 flush 丢弃，则本拍等效腾出空位，可直接接收上游数据。
-      // 注：out.valid 不做掩码（保留 validReg 驱动），避免与 flushSig 形成组合环；
-      //     下游自身的选择性 flush 会在同拍按 robIdx 精确丢弃“年轻于分支”的数据。
       val canReceive = !validReg || out.ready || killCur
       in.ready  := canReceive
 
@@ -70,7 +101,7 @@ class BaseDff[T <: Data](
         validReg := keepCur
       }
 
-    case (Some(flushSig), _, _) =>
+    case (Some(flushSig), _, _, _) =>
       // ---- 粗粒度 flush（保留原行为：整 flush 清空）----
       when(flushSig) {
         validReg := false.B
