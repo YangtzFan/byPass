@@ -1,6 +1,4 @@
-# byPass —— 4 发射乱序 RISC-V 处理器
-
-> 本科毕业设计：《一种乱序超标量处理器芯片全流程设计与应用》最终交付版本。
+# An Out-of-Order RISC-V CPU (Real OoO 2-issue, Lane-ified Backend)
 
 ## 1. 项目概述
 
@@ -10,17 +8,7 @@
 - **回归状态**：sim-basic 39/39 PASS、sim-regressive 70/70 PASS；
 - **IPC 峰值**：`kernels_dep_chain_ooo4_unroll = 2.063`。
 
-## 2. 流水线全景
-
-```
-Fetch(4W) → [FetchBuffer(32)] → Decode(4W) → [DecRenDff]
-  → Rename(4W) → [RenDisDff] → Dispatch(4W) → [IssueQueue(48)]
-  → Issue(1)   → [IssRRDff]  → ReadReg(1)   → [RRExDff]
-  → Execute(1) → [ExMemDff]  → Memory(1)    → [MemRefDff]
-  → Refresh(1) → Commit[ROB head]
-```
-
-## 3. 关键参数（`src/main/scala/CPUConfig.scala`）
+## 2. 关键参数（`src/main/scala/CPUConfig.scala`）
 
 | 参数 | 值 | 备注 |
 |---|---|---|
@@ -36,7 +24,7 @@ Fetch(4W) → [FetchBuffer(32)] → Decode(4W) → [DecRenDff]
 | `btbEntries` | 32 | |
 | `maxBranchCheckpoints` | 8 | |
 
-## 4. 环境依赖
+## 3. 环境依赖
 
 - Java 11+
 - Mill
@@ -44,7 +32,7 @@ Fetch(4W) → [FetchBuffer(32)] → Decode(4W) → [DecRenDff]
 - Verilator
 - [Verilua]()
 
-## 5. 快速开始
+## 6. 快速开始
 
 ```bash
 # 1. 初始化子模块
@@ -57,23 +45,15 @@ xmake run comp
 xmake run rtl
 ```
 
-## 6. 验证框架
+## 7. 验证框架
 
+详见仓库[difftest](https://github.com/YangtzFan/difftest)
 ```bash
 cd ../difftest
 xmake b rtl            # 生成并后处理 SV
 xmake b Core           # verilator 编译
 xmake r sim-basic      # 39 例
 xmake r sim-regressive # 70 例
-```
-
-
-## 7. 单测 + 波形
-
-```bash
-cd ../difftest
-SIM=verilator TC=<name> DUMP=1 xmake r Core
-# 波形输出：build/verilator/Core/<name>.vcd
 ```
 
 ## 8. 目录结构
