@@ -1,4 +1,4 @@
-# An Out-of-Order RISC-V CPU (Real OoO 2-issue, Lane-ified Backend)
+# An Out-of-Order RISC-V CPU (OoO 4-issue, 2 full lanes)
 
 ## 1. 项目概述
 
