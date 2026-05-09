@@ -10,3 +10,8 @@ tmp
 AGENTS.md
 TASK.md
 scripts
+
+# yosys-sta 后端运行时产物（iEDA 二进制 / PDK / 综合结果均通过 sta-init 下载）
+tools/yosys-sta/bin/
+tools/yosys-sta/pdk/
+tools/yosys-sta/result/

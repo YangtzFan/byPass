@@ -32,7 +32,7 @@
 - Verilator
 - [Verilua]()
 
-## 6. 快速开始
+## 4. 快速开始
 
 ```bash
 # 1. 初始化子模块
@@ -45,7 +45,7 @@ xmake run comp
 xmake run rtl
 ```
 
-## 7. 验证框架
+## 5. 验证框架
 
 详见仓库[difftest](https://github.com/YangtzFan/difftest)
 ```bash
@@ -56,7 +56,7 @@ xmake r sim-basic      # 39 例
 xmake r sim-regressive # 70 例
 ```
 
-## 8. 目录结构
+## 6. 目录结构
 
 ```
 byPass/
@@ -70,7 +70,7 @@ byPass/
 └── build.sc / xmake.lua           构建脚本
 ```
 
-## 9. 阅读建议
+## 7. 阅读建议
 
 - **微架构原理**：从 `study/SYSTEM_TOP.md` 起步，按 14 个模块文档逐项读，每个文档都对应 Chisel 源码锚点；
 - **关键不变量**：`study/14_invariants_and_hazards.md`（改 RTL 前必读）；
