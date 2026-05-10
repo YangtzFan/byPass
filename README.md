@@ -45,6 +45,45 @@ xmake run comp
 xmake run rtl
 ```
 
+后端流程基于 `tools-backend/`（内置 yosys-sta 脚本）+ `iEDA` + `sv2v` + `icsprout55` PDK，
+顶层入口在根目录 `xmake.lua`，提供 4 个 target：
+
+```bash
+# 一次性环境准备：下载预编译 iEDA + sv2v + 克隆 icsprout55 PDK
+xmake run sta-init
+
+# 仅跑 yosys 综合（sv2v + yosys → 门级网表 + 面积报告）
+xmake run sta-syn
+
+# 完整后端：sv2v + yosys 综合 + iSTA 时序 + iPA 功耗
+xmake run sta
+
+# 清理 build/sta 与 tools-backend/result
+xmake run sta-clean
+```
+
+可选环境变量（均有默认值）：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `DESIGN` | `MyCPU` | 顶层模块名 |
+| `PDK` | `icsprout55` | 工艺库 |
+| `CLK_PORT_NAME` | `clock` | 时钟端口（byPass 顶层为 `clock`） |
+| `CLK_FREQ_MHZ` | `500` | 目标频率，用于 SDC `create_clock` |
+| `SDC_FILE` | `tools-backend/scripts/mycpu.sdc` | 约束文件 |
+| `RTL_FILES` | `build/rtl/*.sv` | 综合输入 RTL 列表 |
+| `O` | `build/sta` | 结果输出根目录 |
+
+报告位于 `build/sta/<DESIGN>-<CLK_FREQ_MHZ>MHz/`，关键产物：
+
+- `MyCPU.netlist.v` / `synth_stat.txt` / `synth_check.txt`：综合网表 + 面积 + DRC
+- `MyCPU.rpt`：iSTA 时序总报告（WNS / TNS / 关键路径）
+- `MyCPU.cap` / `.fanout` / `.trans`：电容 / 扇出 / 转换违例
+- `MyCPU_setup.skew` / `MyCPU_hold.skew`：时钟偏斜
+- `MyCPU.pwr`：iPA 功耗（dynamic / leakage / 总功耗）
+
+详细解读见 `study/15_yosys_sta_backend.md` 与 `study/16_backend_analysis_basics.md`。
+
 ## 5. 验证框架
 
 详见仓库[difftest](https://github.com/YangtzFan/difftest)

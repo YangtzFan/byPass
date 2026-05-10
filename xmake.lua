@@ -187,14 +187,15 @@ target("sta-syn", function()
         --    这类逐 cell 噪声过滤掉，避免 yosys.log 膨胀到 GB 级。
         local yosys_tcl = path.join(p.tools, "scripts", "yosys.tcl")
         local yosys_log = path.join(p.result_dir, "yosys.log")
-        local envs = { CLK_FREQ_MHZ = p.clk_freq, CLK_PORT_NAME = p.clk_port }
         -- 过滤 yosys 大量逐 cell 噪声日志（OPT_EXPR / OPT_CLEAN / AUTONAME / ABC mapping 等）
         local filter = [==[grep -vE -e '^[[:space:]]*(removing unused|Removing [`\$]|Cell `\$|Optimizing away|Root of a mux tree|Redirecting output|Replacing [`\$]|Replacing \$_|created `?\$|creating `?\$|eval [`\$]|Found cells that share|Constant input on bit|Considering [`\$]|Creating register for signal|Adding SRST signal|Rename (cell|wire) \$|Removing wire |Removed [0-9]+|Optimizing module |rejecting switch:|[0-9]+/[0-9]+:)' -e '^Mapping (MyCPU\.|cell )' -e '^[[:space:]]*$' -e '^[[:space:]]+\\']==]
         local cmd = string.format(
+            'export CLK_FREQ_MHZ=%s CLK_PORT_NAME=%s; ' ..
             'set -o pipefail; echo tcl %s %s %s "%s" %s | yosys -g -s - 2>&1 | %s | tee %s >/dev/null',
+            p.clk_freq, p.clk_port,
             yosys_tcl, p.design, p.pdk, conv_v, p.netlist, filter, yosys_log)
         cprint("${green underline}[SYN]${clear} (log -> %s)", yosys_log)
-        os.execv("bash", {"-c", cmd}, {envs = envs})
+        os.execv("bash", {"-c", cmd})
     end)
 end)
 
@@ -209,10 +210,10 @@ target("sta", function()
         local sv2v    = path.join(p.tools, "bin", "sv2v")
 
         if not os.isfile(ieda) then
-            raise("未找到 iEDA：" .. ieda .. "，请先执行 `xmake run sta-init`")
+            raise("未找到 iEDA: " .. ieda .. "，请先执行 `xmake run sta-init`")
         end
         if not os.isfile(sv2v) then
-            raise("未找到 sv2v：" .. sv2v ..
+            raise("未找到 sv2v: " .. sv2v ..
                   "，请先执行 `xmake run sta-init`")
         end
         if not os.isfile(p.sdc_file) then
@@ -223,7 +224,8 @@ target("sta", function()
         end
 
         os.mkdir(p.result_dir)
-        local envs = { CLK_FREQ_MHZ = p.clk_freq, CLK_PORT_NAME = p.clk_port }
+        local env_prefix = string.format("export CLK_FREQ_MHZ=%s CLK_PORT_NAME=%s; ",
+                                         p.clk_freq, p.clk_port)
 
         -- 1) sv2v 预处理 + 死代码剔除
         local conv_v = path.join(p.result_dir, p.design .. ".sv2v.v")
@@ -236,19 +238,19 @@ target("sta", function()
         local yosys_tcl = path.join(p.tools, "scripts", "yosys.tcl")
         local yosys_log = path.join(p.result_dir, "yosys.log")
         local filter = [==[grep -vE -e '^[[:space:]]*(removing unused|Removing [`\$]|Cell `\$|Optimizing away|Root of a mux tree|Redirecting output|Replacing [`\$]|Replacing \$_|created `?\$|creating `?\$|eval [`\$]|Found cells that share|Constant input on bit|Considering [`\$]|Creating register for signal|Adding SRST signal|Rename (cell|wire) \$|Removing wire |Removed [0-9]+|Optimizing module |rejecting switch:|[0-9]+/[0-9]+:)' -e '^Mapping (MyCPU\.|cell )' -e '^[[:space:]]*$' -e '^[[:space:]]+\\']==]
-        local syn_cmd = string.format(
+        local syn_cmd = env_prefix .. string.format(
             'set -o pipefail; echo tcl %s %s %s "%s" %s | yosys -g -s - 2>&1 | %s | tee %s >/dev/null',
             yosys_tcl, p.design, p.pdk, conv_v, p.netlist, filter, yosys_log)
         cprint("${green underline}[SYN]${clear} (log -> %s)", yosys_log)
-        os.execv("bash", {"-c", syn_cmd}, {envs = envs})
+        os.execv("bash", {"-c", syn_cmd})
 
         -- 3) 再跑 iSTA + iPA
         local sta_log = path.join(p.result_dir, "sta.log")
-        local sta_cmd = string.format(
+        local sta_cmd = env_prefix .. string.format(
             'set -o pipefail && %s -script %s %s %s %s %s 2>&1 | tee %s',
             ieda, sta_tcl, p.sdc_file, p.netlist, p.design, p.pdk, sta_log)
         cprint("${green underline}[STA]${clear} %s", sta_cmd)
-        os.execv("bash", {"-c", sta_cmd}, {envs = envs})
+        os.execv("bash", {"-c", sta_cmd})
 
         cprint("${green underline}[DONE]${clear} 报告位于 %s", p.result_dir)
     end)

@@ -229,7 +229,7 @@ class MyCPU extends Module {
       val younger = ((rob - branchIdx)(w - 1) === 0.U) && (rob =/= branchIdx)
       newBits(k) := b.validMask(k) && !younger
     }
-    val masked = WireDefault(b)
+    val masked = WireInit(b)
     masked.validMask := newBits.asUInt
     (masked, newBits.asUInt.orR)
   }
@@ -242,7 +242,7 @@ class MyCPU extends Module {
       val younger = ((rob - branchIdx)(w - 1) === 0.U) && (rob =/= branchIdx)
       newBits(k) := b.validMask(k) && !younger
     }
-    val masked = WireDefault(b)
+    val masked = WireInit(b)
     masked.validMask := newBits.asUInt
     (masked, newBits.asUInt.orR)
   }
@@ -255,7 +255,7 @@ class MyCPU extends Module {
       val younger = ((rob - branchIdx)(w - 1) === 0.U) && (rob =/= branchIdx)
       newBits(k) := b.validMask(k) && !younger
     }
-    val masked = WireDefault(b)
+    val masked = WireInit(b)
     masked.validMask := newBits.asUInt
     (masked, newBits.asUInt.orR)
   }
