@@ -8,7 +8,7 @@
 // dump-vcd: False
 // verilator-xinit: zeros
 //module GcdUnit
-module gcd
+module gcd_example
 (
   input  wire clk,
   input  wire [  31:0] req_msg,
