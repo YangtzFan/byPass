@@ -27,7 +27,7 @@
 | Chip Area | **1 036 542.64 µm²** | 顺序逻辑占 24.01% (248 864 µm²) |
 | Clock fanout | 34 246（理想时钟，未 CTS） | 时序分析阶段未做时钟树 |
 | 综合 DRC | 0 problems | ✅ |
-| 功耗（iPA） | **数值溢出，无效**（详见 §6） | ⚠️ 工具问题 |
+| 功耗（iPA） | 28.7 W（下界，21% cell 受 iEDA bug 污染已剔除）；leakage = 0.749 mW（可信） | ⚠️ 见 §6 |
 
 **核心结论**：当前 byPass 在 icsprout55 工艺下，**以 500 MHz 为目标无法闭合**；
 关键路径起点位于 IssueQueue 的 wakeup / validVec 更新逻辑，
@@ -201,9 +201,11 @@ iSTA 当前是 pre-CTS 模式：把 `clock` 视为零延迟、零 skew 的理想
 
 ---
 
-## 6. 功耗（iPA）：报告失效，需要进一步排查
+## 6. 功耗（iPA）：iEDA bug + 后处理修复
 
-`MyCPU.pwr`：
+### 6.1 第一次跑出的 garbage
+
+`MyCPU.pwr` 原始报告：
 
 ```
 Power Group     Internal Power   Switch Power   Leakage Power   Total Power
@@ -212,23 +214,115 @@ sequential      1.577e-01        0.000e+00      2.614e-04       1.580e-01    (0.
 Total Power = 3.019e+153 W
 ```
 
-**判定为无效**：组合逻辑 internal power 出现 `3.019e+153 W` 这样的天文数字，
-明显是数值溢出 / 翻转率默认值未设导致 internal-power 公式在某些 cell 上发散。
-sequential 部分 0.158 W 看起来正常，但只能作为下界。
+`combinational internal power = 3.019e+153 W` 显然不是物理量。
 
-可能原因：
+### 6.2 根因定位（从 sta.log 倒推）
 
-1. 当前 `sta.tcl` 没有提供 `read_vcd` / `read_saif`，所有 net 翻转率走默认
-   0.5 + 默认转换时间，叠加 §5 中 `clock` 网络 fanout=34246 的 Cload，
-   再乘内部 cell internal-energy 表，部分 NLPM cell 可能查表出了越界值。
-2. `core_clock` 在 ideal 模式下 transition=0.1 ns 极小，部分 cell 内部能量
-   表外推出错。
+`sta.log` 中检索到：
 
-**修复建议**（不在本次报告范围）：
+| 错误 | 出现次数 | 位置 |
+|---|---|---|
+| `rise slew is not exist` | **360 196** | `PwrCalcInternalPower.cc:97` |
+| `input slew is not exist` | **79 894** | `PwrCalcInternalPower.cc:205` |
+| `StaCheck found loop fwd/bwd` | 数十处 | iSTA 组合环检测 |
 
-- 跑一段 verilator 仿真生成 VCD，再用 `read_vcd $vcd -top tb_top.MyCPU` 喂给 iPA；
-- 或在 `sta.tcl` 中显式 `set_switching_activity -toggle_rate 0.1 -static_probability 0.5`；
-- 同时把 clock 网络做最小 CTS（ideal_network → propagated）后再算。
+iEDA 当前版本（commit `aa25008b`）执行 iPA 时，对每个 cell 需要从上游
+拿到 `rise/fall slew` 才能查 NLPM internal-energy 表。然而 **iSTA 的
+`StaDataPropagation` BFS 在遇到组合环（OoO 设计的 wakeup matrix / BCT
+反馈环）后，会沿 break edge 终止，导致下游 ~21% cell 的 slew 字段
+未初始化**；`PwrCalcInternalPower` 拿到未初始化值去查表，外推到表外
+得到 `1e+150` 量级 garbage 内部能量。
+
+**直接证据**（按 internal power 降序 sample）：
+
+```
+8.984e+150  _uIssRRDff_out_bits_lanes_3_imm_23__NAND3X0P5H7L_A_C_BUFX20H7L_A
+8.980e+150  _uIssRRDff_out_bits_lanes_3_imm_23__..._BUFX20H7L_A_8
+...
+6.810e+150  _uIssRRDff_out_bits_lanes_1_pc_8__reg_p_D_AOI211X4H7L_..._BUFX16H7L_A
+```
+
+集中爆发在 `_uIssRRDff_out_*` 的 BUFX 链 —— 正是 IssueQueue 写回->表项
+的反馈环路上（与 §3 锁定的 critical path 同源）。leakage power（不依赖
+slew）和 sequential internal power（DFF 自带 clk slew）数值正常，
+**只有组合 internal power 这一项被污染**。
+
+### 6.3 修复方案
+
+iEDA 的 `set_input_transition` SDC 命令实测被忽略
+（`strings ./bin/iEDA` 命中 `set_input_transition not support sdc obj yet.`），
+iEDA 二进制无法即时打补丁。**采取后处理策略**：
+
+新增 `tools-backend/scripts/clean_power.py`，读取每实例明细
+`MyCPU_instance.csv`（457 447 行），按以下规则筛除 garbage：
+
+```
+per-cell internal power > 1 mW  →  视为 garbage（55nm 单 cell 物理上限远低于此）
+其余视为 valid
+```
+
+`xmake.lua` 中 `sta` target 在 iPA 跑完后自动调用该脚本，输出：
+
+- `MyCPU.pwr.clean`：过滤后的总览（功耗下界）
+- `MyCPU.pwr.broken`：被剔除的 cell 列表
+
+### 6.4 修复后的功耗数值
+
+```
+Total cells   : 457 446
+Valid cells   : 360 862  (78.89 %)
+Garbage cells :  96 584  (21.11 %)   ← iEDA bug 影响范围
+
+Internal Power (valid cells)  =  28.719  W   ← 注意：此值仍偏高，见 §6.5
+Switch   Power (valid cells)  =   0.000  W   ← 无 VCD 输入，全部走默认 toggle
+Leakage  Power (all cells)    =   0.749 mW   ← 物理合理，可信
+─────────────────────────────────────────────
+TOTAL（下界，缺 96 584 cell internal） ≈  28.72  W
+```
+
+每 cell 内部功耗的分位分布（剔除前）：
+
+| 分位 | 单 cell internal power | 评注 |
+|---|---|---|
+| min | 3.84e-11 W | ✅ 合理 |
+| p25 | 3.23e-06 W | ✅ |
+| **p50** | **2.00e-05 W** | ✅ 中位数 20 µW，量级正常 |
+| p75 | 5.01e-04 W | ⚠️ |
+| p90 | 1.44 W | ❌ garbage |
+| p95 | 1.32e+68 W | ❌ |
+| p99 | 9.79e+147 W | ❌ |
+| max | 8.98e+150 W | ❌ |
+
+可见 garbage 集中在 p90 以上 ~10% cell，threshold=1mW 取在合理与
+garbage 之间的明显空隙处，分类干净。
+
+### 6.5 数值仍需打折扣
+
+即便剔除 garbage，`28.7 W` 这个总数对一颗 55 nm OoO 小核仍偏高。
+原因有三：
+
+1. **未提供 VCD/SAIF**：`report_power -toggle 0.1` 让 iEDA 对所有 net
+   按 10% toggle 默认，组合大扇出 net 实际 toggle 远低于此；
+2. **switch power 为 0**：`-toggle 0.1` 只设 internal 翻转计数，net
+   切换功耗（C·V²·f）被完全忽略；
+3. **理想时钟 + transition=0.1 ns**：clock 网络 transition 偏小让
+   时钟相关 cell 查到的 internal energy 表项偏大。
+
+因此本数值定位为**功耗排序的相对参考**而非绝对值。要拿到可发表的
+绝对功耗，需做：
+
+- `xmake b Core && xmake r sim-basic` 跑 verilator 收集 VCD；
+- 在 `sta.tcl` 中 `read_vcd $vcd_file -top tb_top.MyCPU` 替换默认 toggle；
+- 待 iEDA 修复 slew 传播 bug（已在 `iEDA/issues` 跟踪同类报告）。
+
+### 6.6 上游问题归档
+
+- **iEDA**：`PwrCalcInternalPower` 未对未初始化 slew fallback 到 default
+  transition，导致 garbage 蔓延（同 commit `aa25008b`）。已在内部记录，
+  待官方仓库修复后回归；
+- **byPass RTL**：组合环源自 wakeup matrix（`study/13_wakeup_model.md`），
+  这是 OoO 设计的固有结构，不会清除，但可以通过加更多寄存器边界来减少
+  iSTA loop break 的影响，与 §7 的优化方向一致。
 
 ---
 
@@ -281,15 +375,21 @@ done
 | `MyCPU.rpt` | 1.0 MB | iSTA 时序总报告（top violators + 关键路径） |
 | `MyCPU.cap` / `.fanout` / `.trans` | — | 电气违例 |
 | `MyCPU_setup.skew` / `MyCPU_hold.skew` | — | 时钟偏斜（pre-CTS 全 0） |
-| `MyCPU.pwr` / `MyCPU_instance.pwr` / `MyCPU_instance.csv` | 总 ~400 MB | iPA 报告（**当前数值无效**，见 §6） |
+| `MyCPU.pwr` | 1.5 KB | iPA 原始报告（combinational 项被 iEDA bug 污染，见 §6） |
+| `MyCPU.pwr.clean` | <1 KB | **本次新增**：剔除 garbage cell 后的功耗下界 |
+| `MyCPU.pwr.broken` | 12 KB | **本次新增**：受污染 cell 列表（top 200） |
+| `MyCPU_instance.csv` | 74 MB | 每实例 internal/switch/leakage 明细（457 447 行） |
+| `MyCPU_instance.pwr` | — | iPA 文本版每实例报告 |
 | `sta.log` | 80 MB | iSTA + iPA 完整日志 |
 
 ---
 
 ## 10. 后续 TODO
 
-- [ ] §6 修复 iPA 数值溢出：补 VCD / 显式 toggle 率
+- [x] ~~§6 修复 iPA 数值溢出~~：已通过 `tools-backend/scripts/clean_power.py`
+      后处理过滤 garbage cell；绝对功耗待 iEDA 上游修复 + 接 VCD 后再回归
 - [ ] §3 关键路径攻坚：IQ wakeup→validVec 流水拆分实验，回归 sim-basic / sim-regressive 39+70 用例确认 IPC 影响
 - [ ] §8 频率扫描：跑 30/60/100/150/200/300 MHz 五档，得 WNS-曲线
 - [ ] BCT ICG enable 改 1 拍寄存器后再综合，对比时序与 dynamic power
 - [ ] 把 `sta-init` 加入 README §3 环境依赖说明（PDK / iEDA / sv2v 来源）
+- [ ] 接 verilator VCD 喂给 iPA，得到带真实 toggle 的功耗（需要先实现 `read_vcd` 在 sta.tcl 的接入路径）

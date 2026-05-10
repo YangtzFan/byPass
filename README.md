@@ -80,7 +80,14 @@ xmake run sta-clean
 - `MyCPU.rpt`：iSTA 时序总报告（WNS / TNS / 关键路径）
 - `MyCPU.cap` / `.fanout` / `.trans`：电容 / 扇出 / 转换违例
 - `MyCPU_setup.skew` / `MyCPU_hold.skew`：时钟偏斜
-- `MyCPU.pwr`：iPA 功耗（dynamic / leakage / 总功耗）
+- `MyCPU.pwr`：iPA 功耗原始报告（**注意**：当前 iEDA 版本对约 ~10% 组合
+  cell 的 internal slew 未正确传播，导致 `combinational total` 出现
+  1e+150 数量级 garbage，使全芯片总功耗失真，参见 `study/17` §6）
+- `MyCPU.pwr.clean` / `MyCPU.pwr.broken`：`xmake run sta` 自动调用
+  `tools-backend/scripts/clean_power.py` 后处理生成；前者过滤 garbage
+  cell 后给出可信下界，后者列出受影响 cell
+- `MyCPU_instance.csv`：每个 cell 的 internal/switch/leakage 明细，可
+  自行做更复杂的统计
 
 详细解读见 `study/15_yosys_sta_backend.md` 与 `study/16_backend_analysis_basics.md`。
 

@@ -252,6 +252,15 @@ target("sta", function()
         cprint("${green underline}[STA]${clear} %s", sta_cmd)
         os.execv("bash", {"-c", sta_cmd})
 
+        -- 4) 后处理：iEDA iPA 在大型设计上对约 ~10% 组合 cell 的内部功耗会
+        -- 因 slew 未传播给出 1e+150 数量级 garbage，导致 MyCPU.pwr 的总功耗
+        -- 失真。clean_power.py 过滤 garbage cell，输出 MyCPU.pwr.clean。
+        local cleaner = path.join(p.tools, "scripts", "clean_power.py")
+        if os.isfile(cleaner) then
+            cprint("${green underline}[PWR-CLEAN]${clear} %s %s", cleaner, p.result_dir)
+            os.execv("bash", {"-c", string.format('python3 "%s" "%s"', cleaner, p.result_dir)})
+        end
+
         cprint("${green underline}[DONE]${clear} 报告位于 %s", p.result_dir)
     end)
 end)
