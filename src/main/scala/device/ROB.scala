@@ -103,47 +103,57 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
   headPtr  := head
   countOut := count
 
-  // ===================== Memory 阶段回滚逻辑 =====================
-  // 当 Memory 检测到分支预测错误时，tail 回滚到误预测指令的下一位，丢弃所有年轻表项，误预测指令本身保留
+  // ===================== Memory 阶段回滚逻辑 + Refresh 完成标记 =====================
+  // 先做 rollback / Refresh，再做 alloc（最后赋值优先）。这样可保证当同一 ROB 表项
+  // 在同一拍既被 Refresh（来自 wrong-path / 选择性 flush 泄漏 / squash 同帧到达的
+  // MSHR 完成）打 done=1 又被新指令 dispatch 占用时，alloc 的 done:=false 一定胜出，
+  // 避免 stale done 持续到 commit 错误数据（参见 lw 双 capture bug 根因）。
   when(rollback.valid) {
     tail := rollback.robIdx + 1.U
-  }.otherwise {
-    // ===================== 4-wide 分配逻辑 =====================
-    when(doAlloc) {
-      for (i <- 0 until 4) {
-        when(i.U < alloc.request) { // FetchBuffer 确保有效指令优先占有低位
-          val entry = rob(idx(tail + i.U)) // 分配下一表项
-          entry.done          := false.B
-          entry.pc            := alloc.data(i).pc
-          entry.rd            := alloc.data(i).rd
-          entry.regWen        := alloc.data(i).regWen
-          entry.regWBData     := 0.U
-          entry.isStore       := alloc.data(i).isStore
-          entry.isSysStop     := alloc.data(i).isSysStop  // ECALL/EBREAK/FENCE：commit 时截断后续 lane
-          entry.storeSeq      := alloc.data(i).storeSeq  // 写入 Store 的逻辑年龄（Commit 时传给 StoreBuffer 用于定位表项）
-          entry.hasCheckpoint := alloc.data(i).hasCheckpoint  // 标记该指令是否保存了 BCT checkpoint
-          // 物理寄存器映射信息存入 ROB 表项
-          entry.pdst          := alloc.data(i).pdst
-          entry.stalePdst     := alloc.data(i).stalePdst
-          entry.ldst          := alloc.data(i).ldst
-        }
-      }
-      tail := tail + alloc.request
-    }
   }
-  // ===================== Refresh 阶段完成标记 =====================
   // 多 lane Refresh：每 lane 独立更新自己的 ROB 表项。
-  // 关键：选择性 flush 在上游 Dff 中使用 lane0.robIdx 判定，某对若 lane0 早于误预测分支
-  // 但 lane1 晚于分支，则 lane1 可能"泄漏"到 Refresh；此时 rollback 已把 tail 回滚到
-  // branch+1，泄漏的 lane1.robIdx 位于 [tail, tail+rollback区间) 外——仍可能 == tail+某偏移
-  // 并误写回属于回滚后新指令的 ROB 表项。因此此处再加"ROB 活跃区间"保护：
-  //   要求 (robIdx - head) < count 才允许写入（等价 idx 位于 [head, tail)）。
+  // 活跃区间保护：仅当 robIdx 落在 [head, tail)（即 (idx - head) < count）时才允许
+  // 写入 done/regWBData。否则该 refresh 来自被 rollback 释放的旧条目，可能已被新指令
+  // 重占；若不加保护会把 stale done=1 + 旧数据写入新 entry。
   for (r <- 0 until CPUConfig.refreshWidth) {
     when(refresh(r).valid) {
+      val inRange  = (refresh(r).idx - head) < count
       val refEntry = rob(idx(refresh(r).idx))
-      refEntry.done         := true.B
-      refEntry.regWBData    := refresh(r).regWBData
+      // 双重保护：
+      //   1. inRange  — 屏蔽 rollback 之后已被释放的旧条目（stale robIdx）
+      //   2. !refEntry.done — 屏蔽对同一 ROB 条目的"二次 Refresh"覆盖
+      //      典型场景：load 被 IQ 错误地二次 issue（携带错误地址/数据），其 MSHR 结果
+      //      晚于第一次正确完成到达（此时 done=1），若不加保护会用错误数据覆盖正确结果。
+      when(inRange && !refEntry.done) {
+        refEntry.done         := true.B
+        refEntry.regWBData    := refresh(r).regWBData
+      }
     }
+  }
+  // ===================== 4-wide 分配逻辑 =====================
+  // 放在 Refresh 之后：若同拍 Refresh 与 alloc 落到同一 idx（典型场景：上一轮 wrong-path
+  // 的 mshrComplete 刚 ack，紧接着 rollback+re-dispatch 把该 idx 重新分配给新指令），
+  // alloc 的 done:=false 必须胜出。Chisel 末赋值优先，故此处放在 Refresh 之后。
+  when(!rollback.valid && doAlloc) {
+    for (i <- 0 until 4) {
+      when(i.U < alloc.request) { // FetchBuffer 确保有效指令优先占有低位
+        val entry = rob(idx(tail + i.U)) // 分配下一表项
+        entry.done          := false.B
+        entry.pc            := alloc.data(i).pc
+        entry.rd            := alloc.data(i).rd
+        entry.regWen        := alloc.data(i).regWen
+        entry.regWBData     := 0.U
+        entry.isStore       := alloc.data(i).isStore
+        entry.isSysStop     := alloc.data(i).isSysStop  // ECALL/EBREAK/FENCE：commit 时截断后续 lane
+        entry.storeSeq      := alloc.data(i).storeSeq  // 写入 Store 的逻辑年龄（Commit 时传给 StoreBuffer 用于定位表项）
+        entry.hasCheckpoint := alloc.data(i).hasCheckpoint  // 标记该指令是否保存了 BCT checkpoint
+        // 物理寄存器映射信息存入 ROB 表项
+        entry.pdst          := alloc.data(i).pdst
+        entry.stalePdst     := alloc.data(i).stalePdst
+        entry.ldst          := alloc.data(i).ldst
+      }
+    }
+    tail := tail + alloc.request
   }
   // ===================== Commit 指针更新 =====================
   when(commitNum =/= 0.U) {

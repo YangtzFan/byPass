@@ -24,6 +24,13 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   // ---- Store 写入接口（Memory 阶段；阶段 D' 升级为 Vec：lane0 + lane1 同拍各写一条）----
   val write = IO(Input(Vec(LaneCapability.storeLanes.size, new SBWriteIO)))
 
+  // ---- Execute 阶段提前通知地址写入接口（解决 anyOlderUnk 死锁）----
+  // 当 store 卡在 Execute.out（ExMemDff.in.ready=0）时，通过此端口提前把 addrValid 设为 true，
+  // 使年轻 load 不再看到 olderUnknown=1，从而打破 memStall → ExMemDff 满 → store 进不去的死锁。
+  // 优先级：write（Memory 阶段）比 earlyAddrWrite（Execute 阶段）优先级更高——
+  // 因为 write 代码块位于 earlyAddrWrite 之后，Chisel 寄存器赋值以最后赋值为准。
+  val earlyAddrWrite = IO(Input(Vec(LaneCapability.storeLanes.size, new SBEarlyAddrWriteIO)))
+
   // ---- Load 查询接口（Memory 阶段；TD-B 升级为 Vec：lane0 / lane1 同拍各发起一次查询）----
   val query = IO(Flipped(Vec(LaneCapability.loadLanes.size, new SBQueryIO)))
 
@@ -82,6 +89,18 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
       }
     }
     nextStoreSeq := nextStoreSeq + alloc.request
+  }
+
+  // ===================== Execute 阶段提前写入地址（解决 anyOlderUnk 死锁）=====================
+  // 当 store 卡在 Execute.out 无法进入 ExMemDff 时，提前将 addrValid 设为 true 并写入地址，
+  // 使年轻 load 不再看到 olderUnknown=1，从而解除 memStall 死锁。
+  // 仅写 addrValid 和 addr，data/mask/byteMask/byteData 将在 store 正常通过 Memory 阶段后由 write 写入。
+  // 优先级：write（下方代码块）在 Chisel 中排序在后，因此 write 覆盖 earlyAddrWrite（同拍写同槽时 write 胜出）。
+  for (p <- 0 until LaneCapability.storeLanes.size) {
+    when(earlyAddrWrite(p).valid) {
+      buffer(earlyAddrWrite(p).idx).addrValid := true.B
+      buffer(earlyAddrWrite(p).idx).addr      := earlyAddrWrite(p).addr
+    }
   }
 
   // ===================== Store 写入逻辑（阶段 D'：双口） =====================

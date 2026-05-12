@@ -365,6 +365,15 @@ class MyCPU extends Module {
     uStoreBuffer.write(p) := uMemory.sbWrite(p)
   }
 
+  // ---- Execute 阶段早期地址写入（解决 anyOlderUnk 死锁）----
+  // 将 Execute.out（= uExMemDff.in）快照传给 Memory，由 Memory 生成 sbWriteEarly 信号，
+  // 再连到 StoreBuffer 的 earlyAddrWrite 端口，提前把 store 的 addrValid 设为 true。
+  uMemory.inExecOut.valid := uExecute.out.valid
+  uMemory.inExecOut.bits  := uExecute.out.bits
+  for (p <- 0 until LaneCapability.storeLanes.size) {
+    uStoreBuffer.earlyAddrWrite(p) := uMemory.sbWriteEarly(p)
+  }
+
   // ---- Load StoreBuffer 查询连接（Memory 阶段字节级转发查询）----
   uStoreBuffer.query <> uMemory.sbQuery
 
@@ -494,9 +503,15 @@ class MyCPU extends Module {
 
   // ---- PRF 写端口（Refresh 阶段写回执行结果，含 η2 MSHR 仲裁后的写回）----
   // refreshValidVec 现在统一用 effRef*（MSHR 接管时由 effRef 注入 MSHR.complete 数据）。
+  // 活跃区间保护：仅当 robIdx 落在 [head, tail)（即 (idx - head) < count）时才允许
+  // 写 PRF / ReadyTable / 广播 IQ wakeup。否则来自被 rollback 释放的旧 MSHR 或乱序
+  // 完成的旧执行结果会以 stale 数据污染 PRF，并通过 wakeup 让依赖指令提前发射读取
+  // 脏数据（参见 sh 地址错误 bug：cycle 3131 MSHR 以 robIdx=0xf7 写回 PRF[x75]=0x20000，
+  // 此时 ROB 已空 head=tail=0xf5，sh 于 cycle 3133 读得错误地址基址）。
   val refreshValidVec = Wire(Vec(CPUConfig.refreshWidth, Bool()))
   for (k <- 0 until CPUConfig.refreshWidth) {
-    refreshValidVec(k) := effRefValid(k) && effRefWen(k)
+    val inRange = (effRefIdx(k) - uROB.headPtr) < uROB.countOut
+    refreshValidVec(k) := effRefValid(k) && effRefWen(k) && inRange
     uPRF.io.wen(k)   := refreshValidVec(k)
     uPRF.io.waddr(k) := effRefPdst(k)
     uPRF.io.wdata(k) := effRefData(k)
@@ -553,19 +568,33 @@ class MyCPU extends Module {
     val ln = uRRExDff.out.bits.lanes(k)
     uRRExDff.out.bits.validMask(k) && ln.type_decode_together(4)
   }.reduce(_ || _)
+  // [stale-base-register 修复] 仅检查当前 RR/Ex bundle 是否含 Load 不足以保证 N+3 不变量：
+  // 若 ExMemDff 或 Memory 阶段 bundle 中存在 Load，且其因 MSHR 容量/older-unknown 触发
+  // memStall，则下游反压会让"本拍 lui 等 ALU 生产者"虽完成 Ex→ExMemDff 推进，但下一拍
+  // 在 ExMemDff→Memory 通路被卡住，PRF 写时点从 N+2 后移到 N+3 甚至更晚，导致同拍 β-wake
+  // 唤醒的消费者在 N+2 拍 ReadReg 读 PRF 时既读不到新值（PRF 尚未写）也吃不到同拍 bypass
+  // （write 还没来），结果读到 stale 旧值（典型表现：lui x15,0x10 → lw … 1372(x15) 把 x15
+  // 读成 0，导致访存地址错配）。
+  // 解决：将 β-wake 的"downstream 无 Load"门控扩展到 ExMemDff 与 Memory 两级 bundle。
+  val anyLoadInMemDff = (0 until CPUConfig.memoryWidth).map { k =>
+    val ln = uExMemDff.out.bits.lanes(k)
+    uExMemDff.out.valid && uExMemDff.out.bits.validMask(k) && ln.type_decode_together(4)
+  }.reduce(_ || _)
+  val downstreamLoadStall = anyLoadInMemDff
   val exAdvance = uRRExDff.out.fire && uMemory.in.ready && !anyLoadInExBundle
   for (k <- 0 until CPUConfig.executeWidth) {
     val exLane  = uRRExDff.out.bits.lanes(k)
     val exValid = exAdvance && uRRExDff.out.bits.validMask(k)
     val exIsLoad = exLane.type_decode_together(4)
     // [v20 P0+P1 安全版] βwake 启用范围：lane0、lane2、lane3 三档放行；lane1 暂保留禁用。
-    //   - lane0：v19 已开（Full lane，但 anyLoadInExBundle 已隔离 Load 场景）；
-    //   - lane2/lane3：ALU-only，本身永不可能是 Load（exIsLoad 永为 false）。
-    //     仍受第 3 重门控 !anyLoadInExBundle 保护：bundle 内任意 lane 是 Load 触发
-    //     memStall 时，整 bundle 原子推进 → lane2/3 ALU 生产者也会被卡在 ExMemDff，
-    //     PRF 写时点后移到 N+4 破坏 N+3 不变量。故必须保留三重门控。
+    //   - lane0：Full lane，但 anyLoadInExBundle 已隔离同拍 Load 场景；
+    //   - lane2/lane3：ALU-only，本身永不可能是 Load。
     //   - lane1：保持禁用 = v19.3 不变量 I-D（lane1 βwake 未独立验证）。
-    val betaEnable = (k.U === 0.U) || (k.U === 2.U) || (k.U === 3.U)
+    // [stale-base 修复] 在原"当前 bundle 无 Load"基础上，再加 downstreamLoadStall 门控：
+    //   下游（ExMemDff / Memory）只要存在 Load，就可能因 MSHR/older-unknown 反压上游，
+    //   破坏 N+3 PRF-write 不变量。这一拍直接禁 β-wake，让 γ-wake / refresh-wake 接管，
+    //   保守但正确（仅在极少数 Load 在飞行的拍次失去 1 拍前递收益）。
+    val betaEnable = (k == 2 || k == 3).B && !downstreamLoadStall
     uIssueQueue.wakeup(CPUConfig.refreshWidth + CPUConfig.memoryWidth + k).valid :=
       betaEnable && exValid && exLane.regWriteEnable && !exIsLoad && (exLane.pdst =/= 0.U)
     uIssueQueue.wakeup(CPUConfig.refreshWidth + CPUConfig.memoryWidth + k).pdst := exLane.pdst
