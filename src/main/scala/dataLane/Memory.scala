@@ -391,7 +391,6 @@ class Memory extends Module {
 
   // ---- TD-D：每个 MSHR slot 独立驱动 mshrComplete(i) ----
   // 完成条件：slot i 已分配（mshrValid）、未被 flush、且 R 已回（mshrResultValid）。
-  // ackSlot/ackAny 改为 per-slot 的 ackVec/ackAny（沿用其它逻辑的复用变量名以最小化改动）。
   val ackVec = VecInit((0 until numMshr).map(i =>
     mshrValid(i) && !mshrFlushed(i) && mshrResultValid(i)
   ))
@@ -404,10 +403,6 @@ class Memory extends Module {
   }
   // per-slot 是否本拍被 ack（由 MyCPU 顶层拉低）
   val ackFireVec = VecInit((0 until numMshr).map(i => mshrComplete(i).ack))
-  val ackAny     = ackFireVec.asUInt.orR
-  // 兼容旧名（用于 alloc 路径选择 isAckSlot 的判定）：保留 ackSlot 作 PriorityEncoder（仅
-  // 在"alloc 重用 ack 槽位"时使用，且新分配走"任意先 ack 的 slot"，故这里只取最低位）。
-  val ackSlot    = PriorityEncoder(ackFireVec.asUInt)
 
   val freeMask    = VecInit((0 until numMshr).map(i =>
     !mshrValid(i) || ackFireVec(i)

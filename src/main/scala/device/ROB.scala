@@ -30,9 +30,16 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
   val headPtr = IO(Output(UInt((idxW + 1).W)))
   val countOut = IO(Output(UInt((idxW + 1).W)))
 
-  // ---- Store drain 阻塞接口 ----
-  val commitBlocked = IO(Input(Bool()))     // 外部通知：Store drain 未完成，阻塞 commit
-  val headReady     = IO(Output(Bool()))    // 输出：ROB head 是否可提交（done && !empty）
+  // ---- Store drain 阻塞接口（Phase A.2：升级为 Vec(K)，K = storeLanes.size = 2）----
+  // commitBlocked(m) = 本拍第 m 个 store 候选无法 enqueue（AXISQ 反压或 SB 候选未就绪）。
+  // 当 m 路被阻塞时：该 store 所在 ROB lane 及其后所有 lane 在本拍均不允许 commit。
+  val commitBlocked = IO(Input(Vec(LaneCapability.storeLanes.size, Bool())))
+  // 本拍每个 ROB commit lane 的"store 序号"输出。当该 lane 是 store 且本拍提交时，
+  // commitStoreOrdinal(i) ∈ [0, K) 表明该 store 应去找 sqEnq(ordinal) 入队；非 store 时为 0。
+  val commitStoreOrdinal = IO(Output(Vec(CPUConfig.commitWidth, UInt(log2Ceil(LaneCapability.storeLanes.size + 1).W))))
+  // 暴露 head 每个 lane 的 store 标志与 storeSeq，供 MyCPU 选择本拍的多个 store 候选。
+  val headIsStoreVec = IO(Output(Vec(CPUConfig.commitWidth, Bool())))
+  val headStoreSeqVec = IO(Output(Vec(CPUConfig.commitWidth, UInt(CPUConfig.storeSeqWidth.W))))
 
   // 存储阵列和指针
   val rob = RegInit(VecInit(Seq.fill(entries)(0.U.asTypeOf(new ROBEntry))))
@@ -52,36 +59,58 @@ class ROB(val entries: Int = CPUConfig.robEntries) extends Module {
   val doAlloc = alloc.request > 0.U && !rollback.valid // 判断是否真正进行分配（request > 0 且无回滚）
 
   // ===================== 提交输出（组合逻辑，始终驱动）=====================
-  // commitMask 链：
-  //   commitMask(0) = !empty && head.done && !commitBlocked
-  //   commitMask(i) = commitMask(i-1) && entry(head+i).done && !empty_at_i && !extraStoreInPair
-  // 其中 "extraStoreInPair" 规则：AXI 写侧每拍仅允许 1 个 store 提交（单事务在飞），
-  //   因此若 lane0 本身是 Store，则 lane1..W-1 不再允许 Store 提交；
-  //   若 lane0 非 Store，lane1 也可以是 Store（但 commitBlocked 通常已由 AXI 回应决定）。
-  //   实现上采用"本拍已提交 Store 计数 <= 1"的保守约束：lane_i 如果是 Store 且前面 lanes 已有 Store，则截断 mask。
+  // commitMask 链（Phase A.2 升级版）：
+  //   1. headLaneReadyHere(i) = 与 commitBlocked 解耦的提交候选条件（不含 AXISQ 反压）
+  //      = notEmpty && done && !sysStopBefore && !tooManyStores && prevOk
+  //      其中 tooManyStores 限制"本拍前 i lane 中已成为 commit 候选的 store 总数 ≤ K"。
+  //   2. canCommitVec(i) = headLaneReadyHere(i) && !axisqBlocked_for_this_lane(i)
+  //      axisqBlocked_for_this_lane(i) = headEntries(i).isStore && commitBlocked(ordinal_i)
+  //      ordinal_i 是该 lane 在"前 i lane 中已通过 headLaneReady 的 store 数"——
+  //      即"本拍第 ordinal_i 个 store 候选"，用以匹配 sqEnq(ordinal_i)。
+  //   3. commitStoreOrdinal(i) 输出该 lane 对应的 store 序号；非 store 时输出 0。
   val commitW = CPUConfig.commitWidth
+  val K = LaneCapability.storeLanes.size
   val headEntries = VecInit((0 until commitW).map { i => rob(idx(head + i.U)) })
   val canCommitVec = Wire(Vec(commitW, Bool()))
+  val headLaneReadyHere = Wire(Vec(commitW, Bool()))
+  val storeOrdinalVec = Wire(Vec(commitW, UInt(log2Ceil(K + 1).W)))
 
   for (i <- 0 until commitW) {
     val notEmpty_i  = count > i.U
     val done_i      = headEntries(i).done
-    // Store 提交必须位于 lane0（简化版 AXI 单事务 + SoC_Top Store debug 接线约束）：
-    //   若 i>0 且该位是 Store，则截断本拍 commitMask（Store 在下一拍变为 head 再提交）。
-    val storeMustBeLane0Only = if (i == 0) false.B else headEntries(i).isStore
-    val storeConflict = storeMustBeLane0Only
 
-    // SYSTEM/ECALL 截断：若更老的某 lane 是 sysStop（ECALL/EBREAK/FENCE/other），
-    // 则本拍其后的 lane 一律不提交，避免 difftest 参考模型预解码越界。
+    // SYSTEM/ECALL 截断：若更老的某 lane 是 sysStop，则本拍其后的 lane 一律不提交。
     val sysStopBefore = if (i == 0) false.B else
       VecInit((0 until i).map(j => headEntries(j).isSysStop)).asUInt.orR
 
-    val prevOk = if (i == 0) (!commitBlocked) else canCommitVec(i - 1)
-    canCommitVec(i) := prevOk && notEmpty_i && done_i && !storeConflict && !sysStopBefore
+    // 本拍前 i lane 中已成为候选（headLaneReadyHere(j)==true）的 store 数。
+    // 用于：a) tooManyStores 截断；b) ordinal 编号。
+    val storeOrdinalHere: UInt = if (i == 0) 0.U else
+      PopCount(VecInit((0 until i).map(j => headEntries(j).isStore && headLaneReadyHere(j))))
+    val tooManyStores = headEntries(i).isStore && storeOrdinalHere >= K.U
+
+    val prevOk = if (i == 0) true.B else headLaneReadyHere(i - 1)
+    headLaneReadyHere(i) := prevOk && notEmpty_i && done_i && !sysStopBefore && !tooManyStores
+
+    // 该 lane 对应"本拍第 storeOrdinalHere 个 store"；非 store lane 输出 0。
+    storeOrdinalVec(i) := Mux(headEntries(i).isStore, storeOrdinalHere, 0.U)
+
+    // AXISQ 反压：若该 lane 是 store 且对应序号的 commitBlocked 拉起，则本 lane 不能 commit。
+    // storeOrdinalHere 取值范围 [0, K]；当达到 K 时 tooManyStores=true 已使 headLaneReadyHere=false，
+    // 此处用 Mux 兜底防止 Vec 越界（虽然 Chisel 越界会折叠到最高位、但显式更安全）。
+    val safeOrd = Mux(storeOrdinalHere < K.U, storeOrdinalHere, 0.U)
+    // 顺序提交链：lane i 的 canCommit 必须串联前一 lane 的 canCommit。
+    // 若 lane i-1 因 AXISQ 反压未提交，younger lane i 也必须停下，避免乱序提交。
+    val prevCommitOk = if (i == 0) true.B else canCommitVec(i - 1)
+    canCommitVec(i) := prevCommitOk && headLaneReadyHere(i) &&
+      !(headEntries(i).isStore && commitBlocked(safeOrd))
   }
 
-  val canCommitHead = canCommitVec(0)
-  headReady := !empty && headEntries(0).done  // 不受 commitBlocked/storeConflict 影响（用于触发 drain）
+  commitStoreOrdinal := storeOrdinalVec
+  for (i <- 0 until commitW) {
+    headIsStoreVec(i)  := headLaneReadyHere(i) && headEntries(i).isStore
+    headStoreSeqVec(i) := headEntries(i).storeSeq
+  }
 
   for (i <- 0 until commitW) {
     val e = headEntries(i)

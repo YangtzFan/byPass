@@ -38,7 +38,9 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   val rollback = IO(Flipped(new SBRollbackIO))
 
   // ---- Commit 候选接口（ROB head store -> AXIStoreQueue）----
-  val commit = IO(Flipped(new SBCommitIO))
+  // Phase A.2：升级为 Vec(K) 多端口，K = storeLanes.size = 2。
+  // 不同端口对应同拍提交的"第 m 个 store"（按 ROB lane 顺序由 MyCPU 选出），彼此独立查表。
+  val commit = IO(Flipped(Vec(LaneCapability.storeLanes.size, new SBCommitIO)))
 
   // 存储阵列：所有仍处于 speculative 状态的 store 都保存在这里。
   val buffer = RegInit(VecInit(Seq.fill(depth)(0.U.asTypeOf(new StoreBufferEntry))))
@@ -163,33 +165,35 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     query(q).fullCover := query(q).valid && ((query(q).fwdMask & query(q).loadMask) === query(q).loadMask)
   }
 
-  // ===================== Commit 候选查询 =====================
-  // ROB head 是 Store 时，通过 storeSeq 在 SB 中精确找到唯一候选。
-  // 该候选只有在地址/数据已经写好时才允许 enqueue；否则必须继续阻塞 commit。
-  val commitMatchVec = Wire(Vec(depth, Bool()))
-  for (i <- 0 until depth) {
-    commitMatchVec(i) := commit.valid && buffer(i).valid && (buffer(i).storeSeq === commit.storeSeq)
-  }
+  // ===================== Commit 候选查询（Phase A.2：Vec(K) 独立端口）=====================
+  // ROB head 是 Store 时，每个 commit(m) 端口按 storeSeq 在 SB 中精确找到唯一候选。
+  // 各端口完全独立（不同 storeSeq 必然映射到不同 buffer 槽位，无冲突）；
+  // 只有在地址/数据已经写好时才允许 enqueue，否则继续阻塞该 store 的 commit。
+  for (m <- 0 until LaneCapability.storeLanes.size) {
+    val commitMatchVec = Wire(Vec(depth, Bool()))
+    for (i <- 0 until depth) {
+      commitMatchVec(i) := commit(m).valid && buffer(i).valid && (buffer(i).storeSeq === commit(m).storeSeq)
+    }
 
-  val commitHit = commitMatchVec.asUInt.orR
-  val commitIdx = PriorityEncoder(commitMatchVec.asUInt)
-  val commitEntry = Wire(new StoreBufferEntry)
-  commitEntry := 0.U.asTypeOf(new StoreBufferEntry)
-  when(commitHit) {
-    commitEntry := buffer(commitIdx)
-  }
+    val commitHit = commitMatchVec.asUInt.orR
+    val commitIdx = PriorityEncoder(commitMatchVec.asUInt)
+    val commitEntry = Wire(new StoreBufferEntry)
+    commitEntry := 0.U.asTypeOf(new StoreBufferEntry)
+    when(commitHit) {
+      commitEntry := buffer(commitIdx)
+    }
 
-  commit.entryValid := commitHit && commitEntry.addrValid
-  commit.addr := commitEntry.addr
-  commit.data := commitEntry.data
-  commit.mask := commitEntry.mask
-  // commit.wordAddr 已不再被任何下游消费（AXIStoreQueue 自行从 addr 派生），故移除该冗余输出。
-  commit.wstrb := commitEntry.byteMask
-  commit.wdata := commitEntry.byteData
+    commit(m).entryValid := commitHit && commitEntry.addrValid
+    commit(m).addr := commitEntry.addr
+    commit(m).data := commitEntry.data
+    commit(m).mask := commitEntry.mask
+    commit(m).wstrb := commitEntry.byteMask
+    commit(m).wdata := commitEntry.byteData
 
-  // 只有 enqueue 握手成功的同拍，才允许释放 SB 表项。
-  when(commit.valid && commit.enqSuccess && commitHit) {
-    buffer(commitIdx).valid := false.B
+    // 只有 enqueue 握手成功的同拍，才允许释放 SB 表项。
+    when(commit(m).valid && commit(m).enqSuccess && commitHit) {
+      buffer(commitIdx).valid := false.B
+    }
   }
 
   // ===================== 精确回滚逻辑 =====================

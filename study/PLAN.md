@@ -10,7 +10,7 @@
 | 项 | 状态 |
 |---|---|
 | **微架构** | 4 发射乱序，BPU+ROB+IQ+SB+AXISB+MSHR+BCT+βwake |
-| **回归（功能正确性）** | sim-basic **39/39 PASS** + sim-regressive **70/70 PASS** |
+| **回归（功能正确性）** | sim-basic **39/39 PASS** + sim-regressive **64/64 PASS** |
 | **IPC（性能指标）** | 多用例超 v18 baseline；峰值 `kernels_dep_chain_ooo4_unroll = 2.063` |
 | **文档** | PLAN/STUDY/TASK/BUG/LOG 五件套齐全；历次任务书备份完整 |
 | **代码清晰度** | v21 完成 stale 注释/死 scaffolding 清理；imports/wires 调查通过 |
@@ -33,7 +33,7 @@
 **验收**：
 ```
 sim-basic   : 39/39 PASS
-sim-regressive: 70/70 PASS
+sim-regressive: 64/64 PASS
 IPC diff vs v20 baseline: 0 differences (120 TC 完全一致)
 ```
 
@@ -74,7 +74,7 @@ kernels_sum_unroll_ooo4_unroll                1.471502
 
 校准命令：
 ```bash
-cd /home/litian/Documents/stageFiles/studyplace/difftest
+cd /nfs/home/zhanghang/Documents/difftest
 for f in build/sim-data/*.csv; do
   name=$(basename "$f" .csv); ipc=$(tail -1 "$f" | awk -F',' '{print $8}')
   printf "%-55s ipc=%s\n" "$name" "$ipc"
@@ -92,11 +92,12 @@ diff /tmp/ipc_v20_baseline.txt /tmp/ipc_v21.txt   # 0 diff ✅
 2. **v15**：FetchBuffer ≥3 预测分支截断；
 3. **TD-D**：`mshrComplete` IO Vec(2) per-slot 独立 ack；MyCPU 双 j 仲裁；
 4. **v18**：difftest emu.lua / xmake.lua / main.lua 三件套；
-5. **TD-E (v19.3)**：
+5. **TD-E (v19.3) + stale-base 修复**：
    - I-A：Memory bundle 原子性；
    - I-B：双 capture all-or-none；
-   - I-C：βwake 三重门控不可拆；
-6. **v20**：βwake 范围 = lane0 + lane2 + lane3，lane1 仍禁用。
+   - I-C：βwake 四重门控不可拆（exAdvance 三重 + `!downstreamLoadStall`）；
+6. **当前实际版本**：βwake 范围 = lane2 + lane3，lane0 / lane1 全部禁用（lane0 因 Full lane 含 Load 风险保守关闭，lane1 未独立验证）。
+7. **v22 (Phase A.2)**：2-store/拍 commit 端到端升级 —— SB/AXISQ/sqEnq/debug_commit 全 Vec(K=2)；ROB `storeMustBeLane0Only` 放宽为"store 仅在 storeLanes={0,1}"+ per-lane `commitBlocked: Vec(K)` 反压。
 
 ---
 
@@ -106,31 +107,31 @@ diff /tmp/ipc_v20_baseline.txt /tmp/ipc_v21.txt   # 0 diff ✅
 
 | 优先 | 任务 | 备注 |
 |---|---|---|
-| P1 | lane1 βwake 启用 | 补 `algo_array_ops_ooo4_unroll` −4% gap |
+| P1 | lane0 / lane1 βwake 启用 | 补 `algo_array_ops_ooo4_unroll` 剩余 gap |
 | P2 | 精确 lookahead 门控 | 替换粗粒度 `!anyLoadInExBundle` |
 | P3 | Bug B 根因深挖 | algo_list_reverse_ooo4_unroll 在 βwake 全禁场景的异常 |
 | P4 | TD-F 双发 Branch | 解除 doubleBrStall |
 | P5 | BTB/RAS 升级 | indirect_call IPC 仅 0.41 |
-| P6 | lane2/3 全功能 | 远期 / TD-G |
+| P6 | AXI 写多 outstanding | Phase A.2 后 2-store/拍 commit 已就位，但 AXI 写仍单 outstanding，store-heavy 用例提升受限 |
+| P7 | lane2/3 全功能 | 远期 / TD-G |
 
 ---
 
 ## 5. 命令速查（毕设演示用）
 
 ```bash
-cd /home/litian/Documents/stageFiles/studyplace/difftest
+cd /nfs/home/zhanghang/Documents/difftest
 
 # 全量编译
 SIM=verilator xmake b rtl
 SIM=verilator xmake b Core
 
-# 全量回归
+# 全量回归（200 并发 JOBS）
 SIM=verilator xmake r sim-basic        # 39 例 ~30s
-SIM=verilator xmake r sim-regressive   # 70 例 ~5min
+SIM=verilator xmake r sim-regressive   # 64 例 ~5min
 
-# 单测 + 波形
-SIM=verilator TC=<tc_name> DUMP=1 xmake r Core
-# 波形输出：build/verilator/Core/<tc_name>.vcd
+# 单测 + 落盘日志：build/sim-log/<tc>.log + build/sim-data/<sweep>/<tc>.csv
+SIM=verilator TC=<tc_name> xmake r sim-single
 ```
 
 ---
@@ -149,7 +150,7 @@ SIM=verilator TC=<tc_name> DUMP=1 xmake r Core
 ## 7. 毕设交付确认
 
 ✅ 设计：4 发射乱序处理器，全流程已实现；
-✅ 验证：109 个测试用例全 PASS（39 sim-basic + 70 sim-regressive）；
+✅ 验证：103 个测试用例全 PASS（39 sim-basic + 64 sim-regressive）；
 ✅ 性能：峰值 IPC 2.063，多个 baseline 用例 ≥ 1.5；
 ✅ 文档：五件套齐全 + 全部历史任务书备份；
 ✅ 代码清晰度：经 v21 stale 注释清理，"代码与文档表述一致"。
@@ -181,7 +182,7 @@ SIM=verilator TC=<tc_name> DUMP=1 xmake r Core
 | `study/10_rob.md` | ROB（128 项）+ 提交规则 |
 | `study/11_branch_checkpoint.md` | BCT + 投机回滚路径 |
 | `study/12_storage_subsystem.md` | StoreBuffer / AXIStoreQueue / DRAM / IROM |
-| `study/13_wakeup_model.md` | α / β / γ 三档 wakeup + 三重门控 |
+| `study/13_wakeup_model.md` | α / β / γ 三档 wakeup + 四重门控 |
 | `study/14_invariants_and_hazards.md` | 不变量清单 + Hazard 规则速查 |
 
 每个模块文档统一结构：**源文件 → 接口 / 数据通路 → 关键 Chisel 实现 → 不变量 → 调试切入点**。

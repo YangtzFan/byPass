@@ -265,6 +265,86 @@ target("sta", function()
     end)
 end)
 
+-- 并行扫频：等价于 scripts/run_sta_parallel.sh，但纳入 xmake 调度
+-- 用法：
+--   xmake run sta-parallel
+--   FREQS="20 25 30" xmake run sta-parallel
+--   JOBS=10 xmake run sta-parallel
+--   O=/tmp/sta_sweep xmake run sta-parallel
+-- 机制：
+--   1) 各频率结果天然按 result_dir = <O>/<DESIGN>-<freq>MHz 隔离，无写入冲突；
+--   2) 用 GNU parallel 调度，每个 worker 内部串行跑 sv2v→yosys→iSTA→iPA；
+--   3) 每个频率的完整日志落盘 <O>/sta-<freq>.log，便于事后回看；
+--   4) 汇总 PASS/FAIL 表格打印到 stdout，并把状态写到 <O>/sta-<freq>.status。
+target("sta-parallel", function()
+    set_kind("phony")
+    set_default(false)
+    on_run(function()
+        local p = _sta_params()
+        if p.rtl_files == "" then
+            raise("找不到 RTL 文件，请先 `xmake run rtl` 或显式设置 RTL_FILES")
+        end
+        local freqs = os.getenv("FREQS")
+                      or "28 29 30 31"
+        local jobs  = os.getenv("JOBS") or "30"
+        local out_root = p.out_root
+        os.mkdir(out_root)
+
+        -- 把 worker 逻辑写到 wrapper.sh，避免内联 quoting 的转义噩梦。
+        -- 注意：xmake 子进程会污染 stdout/stderr 颜色码，统一重定向到日志文件。
+        local wrapper = path.join(out_root, "sta-parallel-worker.sh")
+        local script = string.format([[#!/usr/bin/env bash
+set -euo pipefail
+freq="$1"
+out_root="%s"
+log="$out_root/sta-${freq}.log"
+status="$out_root/sta-${freq}.status"
+script_dir="%s"
+# 子进程继承当前 xmake 环境（XMAKE_GLOBALDIR 等），保证 `xmake run sta` 能定位项目
+cd "$script_dir"
+echo "[STA-PAR] start freq=${freq}MHz log=${log}" >&2
+if CLK_FREQ_MHZ="$freq" O="$out_root" xmake run sta > "$log" 2>&1; then
+    echo "PASS" > "$status"
+    echo "[STA-PAR] PASS freq=${freq}MHz" >&2
+else
+    rc=$?
+    echo "FAIL rc=$rc" > "$status"
+    echo "[STA-PAR] FAIL freq=${freq}MHz rc=$rc (see $log)" >&2
+fi
+]], out_root, os.scriptdir())
+        io.writefile(wrapper, script)
+        os.execv("chmod", {"+x", wrapper})
+
+        cprint("${green underline}[STA-PAR]${clear} freqs=%s jobs=%s out=%s",
+               freqs, jobs, out_root)
+
+        -- 入口：GNU parallel 调度 wrapper.sh。--halt soon,fail=0 表示
+        -- 不因单个频率失败而中断整批；最终用 status 文件汇总。
+        local par_cmd = string.format(
+            'parallel --will-cite -j %s --halt soon,fail=0 "%s" {} ::: %s',
+            jobs, wrapper, freqs)
+        os.execv("bash", {"-c", par_cmd})
+
+        -- 汇总报告
+        local pass, fail = 0, 0
+        local rows = {}
+        for tok in freqs:gmatch("%S+") do
+            local st_path = path.join(out_root, "sta-" .. tok .. ".status")
+            local st = "MISSING"
+            if os.isfile(st_path) then
+                st = (io.readfile(st_path) or ""):gsub("%s+$", "")
+            end
+            if st == "PASS" then pass = pass + 1 else fail = fail + 1 end
+            table.insert(rows, string.format("  %-6s %s", tok .. "MHz", st))
+        end
+        cprint("${green underline}[STA-PAR]${clear} 汇总：PASS=%d FAIL=%d", pass, fail)
+        for _, r in ipairs(rows) do print(r) end
+        if fail > 0 then
+            raise(string.format("sta-parallel 有 %d 个频率失败，详见各 sta-<freq>.log", fail))
+        end
+    end)
+end)
+
 -- 清理后端产物（不影响 RTL / Chisel 构建）
 target("sta-clean", function()
     set_kind("phony")

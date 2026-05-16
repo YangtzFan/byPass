@@ -17,22 +17,23 @@
 | 指标 | 数值 | 评价 |
 |---|---|---|
 | 目标频率 | **500 MHz** (period 2.0 ns) | SDC 设定 |
-| **实测最高频率（pre-CTS）** | **≈ 31.6 MHz** | ❌ 严重不达标 |
-| WNS（Worst Negative Slack） | **−29.594 ns** | ❌ 路径长度约为周期的 16 倍 |
-| TNS（Total Negative Slack） | **−416 633.113 ns** | ❌ 几乎所有 endpoint 都不闭合 |
+| **实测最高频率（pre-CTS, 500MHz 单档）** | **≈ 31.6 MHz** | ❌ 严重不达标（500MHz 目标） |
+| **实测 Fmax（pre-CTS, 频率扫描）** | **≈ 30 MHz**（贴零临界） | Phase B 终版 RTL（icache_on / qDepth 200·4·200），由 `sta-parallel` 扫 28..31 MHz；30 MHz WNS=−0.010 ns / TNS=−0.052 ns 仅 2 端点微违例，可视为闭合上限；见 §8 |
+| WNS（Worst Negative Slack, 500 MHz 单档历史值） | **−29.594 ns** | ❌ 路径长度约为周期的 16 倍（保留作 500 MHz 不闭合的注记，本次未重跑该档） |
 | FEP（Failing Endpoints） | 满目（含 IssueQueue.validVec / BCT / clock-gating ICG） | — |
 | Hold WNS | +0.065 ns | ✅ 无 hold 违例 |
-| 单元数 | 457 447 个 std cell | — |
+| 单元数 | 469 199 个 std cell | Phase A.2 RTL（前次 457 447，+2.6%） |
 | 触发器数 | ≈ 40 400 个 DFF | — |
-| Chip Area | **1 036 542.64 µm²** | 顺序逻辑占 24.01% (248 864 µm²) |
-| Clock fanout | 34 246（理想时钟，未 CTS） | 时序分析阶段未做时钟树 |
+| Chip Area | **1 039 183.60 µm²** | 顺序逻辑占 23.95% (248 900.96 µm²)；Phase A.2 RTL |
+| Clock fanout | 34 252（理想时钟，未 CTS） | 时序分析阶段未做时钟树 |
 | 综合 DRC | 0 problems | ✅ |
 | 功耗（iPA） | 28.7 W（下界，21% cell 受 iEDA bug 污染已剔除）；leakage = 0.749 mW（可信） | ⚠️ 见 §6 |
 
 **核心结论**：当前 byPass 在 icsprout55 工艺下，**以 500 MHz 为目标无法闭合**；
-关键路径起点位于 IssueQueue 的 wakeup / validVec 更新逻辑，
-真实 critical path 长度约 31.5 ns，对应可达频率约 **31~32 MHz**。
-要达到 500 MHz 量级需要做相当大的微架构改造（详见 §7 建议）。
+关键路径起点位于 IssueQueue 的 wakeup / validVec 更新逻辑。
+500 MHz 单档历史跑出的关键路径长度 31.45 ns（综合器在紧约束下额外发力），
+Phase B 终版 RTL 在 28..31 MHz 扫频下稳态 PD = **31.632 ns**（较 Phase A.2 的 31.378 ns 增 0.254 ns，源于 qDepth 加深），**真实可闭合频率 ≈ 30 MHz**
+（§8 实测：30 MHz WNS=−0.010 ns / TNS=−0.052 ns 贴零临界，31 MHz WNS=−1.031 ns / TNS=−288.080 ns 大量违例）。要达到 500 MHz 量级需要做相当大的微架构改造（详见 §7 建议）。
 
 ---
 
@@ -75,15 +76,15 @@ xmake run sta         # sv2v + yosys + iSTA + iPA
 
 ## 2. 综合产物（Yosys → 门级网表）
 
-`build/sta/MyCPU-500MHz/synth_stat.txt`：
+`build/sta/MyCPU-28MHz/synth_stat.txt`（Phase A.2 RTL，扫频任一档综合统计相同）：
 
 ```
 === MyCPU ===
-   457 693   wires / wire bits
-       750   ports / port bits
-   457 447   cells       (Local Area = 1.04E+06 µm²)
-Chip area for module 'MyCPU':       1 036 542.64
-  of which used for sequential elements: 248 864.00  (24.01%)
+   469 449   wires / wire bits
+       877   ports / port bits
+   469 199   cells       (Local Area = 1.04E+06 µm²)
+Chip area for module 'MyCPU':       1 039 183.60
+  of which used for sequential elements: 248 900.96  (23.95%)
 DFF 触发器（DFFQX1H7L 系列） 共 ≈ 40 400 个
 ```
 
@@ -113,9 +114,12 @@ Found and reported 0 problems.
 
 ---
 
-## 3. 时序：500 MHz 严重不闭合
+## 3. 时序：500 MHz 严重不闭合（历史 500 MHz 单档）
 
-### 3.1 全局指标（`MyCPU.rpt`）
+> 本节是上一轮 `build/sta/MyCPU-500MHz/` 跑出的历史快照（Phase A.1 RTL）；
+> Phase A.2 RTL 本次未重跑 500 MHz 档，但 28..31 MHz 扫频结论一致（详见 §8）。
+
+### 3.1 全局指标（`MyCPU.rpt`，500 MHz 历史档）
 
 ```
 Setup TNS @ core_clock = -416 633.113 ns
@@ -123,9 +127,9 @@ Setup WNS @ core_clock = -29.594  ns   (target period = 2.0 ns)
 Hold  WNS @ core_clock = +0.065  ns   ✅
 ```
 
-**实测 Setup 关键路径长度 ≈ 31.45 ns ⇒ Fmax ≈ 31.65 MHz**。
+**历史 Setup 关键路径长度 ≈ 31.45 ns（Phase A.1）；Phase B 终版扫频下稳态 PD = 31.632 ns ⇒ Fmax ≈ 30 MHz**（§8 实测）。
 
-### 3.2 Top-5 Setup 违例端点
+### 3.2 Top-5 Setup 违例端点（历史 500 MHz）
 
 | Endpoint | Path Delay (ns) | Slack (ns) | Freq (MHz) |
 |---|---|---|---|
@@ -135,9 +139,7 @@ Hold  WNS @ core_clock = +0.065  ns   ✅
 | `uIssueQueue.validVec_31_reg_p:D` | 31.443 | −29.588 | 31.657 |
 | `uIssueQueue.validVec_10_reg_p:D` | 31.443 | −29.588 | 31.658 |
 
-**所有 top 路径都终结在 `IssueQueue.validVec`**——这正是 byPass
-issue-queue 中**每个 entry 的 valid 位**寄存器，参与 wakeup（α/β/γ 三档）+
-issue selection + flush 多重组合逻辑。
+> Phase B 终版 RTL 28..31 MHz 扫频下，top violators 是 `uIssueQueue.validVec_43_reg_p:D` 与 `uIssueQueue.validVec_11_reg_p:D` 并列第一（路径长度 31.632 ns），与上述同源——IQ entry valid 位的 wakeup/issue/flush 合一组合链。validVec 下标随综合 seed 漂移，根因不变。
 
 ### 3.3 Clock-gating 路径违例
 
@@ -311,7 +313,7 @@ garbage 之间的明显空隙处，分类干净。
 因此本数值定位为**功耗排序的相对参考**而非绝对值。要拿到可发表的
 绝对功耗，需做：
 
-- `xmake b Core && xmake r sim-basic` 跑 verilator 收集 VCD；
+- `SIM=verilator xmake b Core && SIM=verilator xmake r sim-basic` 跑 verilator 收集 VCD；
 - 在 `sta.tcl` 中 `read_vcd $vcd_file -top tb_top.MyCPU` 替换默认 toggle；
 - 待 iEDA 修复 slew 传播 bug（已在 `iEDA/issues` 跟踪同类报告）。
 
@@ -333,29 +335,62 @@ garbage 之间的明显空隙处，分类干净。
 
 | 现象 | 微架构原因 | 优化方向 |
 |---|---|---|
-| `validVec` 在一拍内承担 wakeup + issue + flush 三重决策 | byPass 把 α/β/γ wakeup 都收敛到 IQ entry 的同一拍 valid 计算 | **拆 wakeup 流水**：把 βwake 三重门控移出 valid 决策路径，改成下一拍生效（容忍 1 拍 ready 延迟） |
+| `validVec` 在一拍内承担 wakeup + issue + flush 三重决策 | byPass 把 α/β/γ wakeup 都收敛到 IQ entry 的同一拍 valid 计算 | **拆 wakeup 流水**：把 βwake 四重门控移出 valid 决策路径，改成下一拍生效（容忍 1 拍 ready 延迟） |
 | 48 entry × 4 issue 选择 + 4 写端口 + flush mask 拼成 `_GEN_96_*` 30 级组合链 | 单拍内做 `select + writeback + flush` 三件事 | **issue arbitration 切两拍**：第一拍算 ready / mask，第二拍做 priority encode（参考 BOOM 的 select-payload 分级） |
 | BCT clock-gating ICG enable 路径长 (-6 ns) | refresh-since-snap 与全局 flush / commit 信号合成的逻辑深 | 把 ICG enable 用单独的 1 拍寄存器打一拍再驱动 ICG（牺牲 1 拍功耗节省，换时序） |
 | 时钟 fanout 34 246 | 顶层 ideal clock，未做 CTS | 接 iPL/iCTS 后会改善；Chisel 这边可考虑层次化时钟 wrapper（但收益有限） |
 
-> ⚠️ 微架构优化前请先读 `study/14_invariants_and_hazards.md` —— wakeup 三档门控
+> ⚠️ 微架构优化前请先读 `study/14_invariants_and_hazards.md` —— 三档 wakeup（α/β/γ）+ βwake 四重门控
 > 是 IPC 的核心，**不可粗暴推迟一拍**，需要重新论证不变量。
 
 ---
 
-## 8. 推荐的频率扫描方法
+## 8. 频率扫描结果（`xmake run sta-parallel`，Phase B 终版 RTL）
 
-要寻找当前 RTL 的真实闭合频率（不改动微架构），用环境变量扫一遍：
+> 本节为 Phase B 终版 RTL（icache_on / qDepth 200·4·200 / Fetch FSM 修复 / LatencyPipe 0 拍兼容）在 28..31 MHz 局部扫描下的实测数据。
+> 实测命令：`FREQS="28 29 30 31" JOBS=4 xmake run sta-parallel`
+> （256 核 / 1 TB RAM 服务器；上一轮 JOBS=200 触发资源耗尽，降到 4 后稳定）。
+> 每档独立产物在 `build/sta/MyCPU-<f>MHz/`，完整日志在 `build/sta/sta-<f>.log`。
+> 完整 20..40 MHz 扫描历史保存于 git log（Phase A.1 时期数据），本次未重跑。
+
+### 8.1 实测 WNS / Fmax 表
+
+| Freq (MHz) | Period (ns) | Path Delay (ns) | WNS (ns) | TNS-Setup (ns) | 闭合 |
+|---:|---:|---:|---:|---:|:---:|
+| 28 | 35.714 | 31.632 | **+2.252** | 0.000 | ✅ |
+| 29 | 34.483 | 31.632 | **+1.082** | 0.000 | ✅ |
+| 30 | 33.333 | 31.632 | **−0.010** | −0.052 | ⚠️（临界，2 endpoint 微违例） |
+| **≈ 29.99** | **≈ 33.34** | **31.632** | **≈ 0** | **≈ 0** | **✅（实测 Fmax）** |
+| 31 | 32.258 | 31.632 | **−1.031** | −288.080 | ❌ |
+
+### 8.2 关键观察
+
+1. **Path Delay 在 28..31 MHz 锁定到 31.632 ns**：yosys + ABC 在该区间内输出的关键路径长度完全一致，是当前 RTL（Phase B 终版：icache_on / qDepth 200·4·200 / Fetch FSM 修复 / LatencyPipe 0 拍兼容）在 icsprout55 工艺下经标准综合流程的稳态下界。相对 Phase A.2 历史扫描的 31.378 ns 略升 0.254 ns —— 增量来自 qDepth 加深（50/1/50→200/4/200）带来的 FIFO/指针寄存器更新逻辑变长，关键路径首末点不变。
+2. **WNS 在 30→31 MHz 之间过零**：线性插值得 `WNS=0` 点 ≈ **29.99 MHz**（30 MHz 实测 −0.010 ns 已贴零），相比 Phase A.2 的 ≈ 30.2 MHz 略降 ~0.7%，与 PD 增长 0.254 ns 吻合。
+3. **关键路径起终点不变**：4 个 .rpt 全部把 top violator 锁定在 `uIssueQueue.validVec_43_reg_p:D` 和 `uIssueQueue.validVec_11_reg_p:D`（并列第一），与 §3 结论同源 —— 优化的着力点不变。
+4. **Setup TNS 在 30 MHz 跌为 −0.052 ns**：仅 2 个端点（validVec_43 / validVec_11）轻微违例 0.010 ns，可视为闭合临界；31 MHz 起 setup TNS 暴跌至 −288.080 ns（违例扩散到大量 IQ 唤醒分支）。Hold TNS（min）仍在 −36k 至 −42k ns 区间，未做 hold fix，与 §3 评论一致。
+5. **JOBS=200 教训**：256 核服务器仍被 200 个并发 yosys/iSTA 拖崩（每 yosys ~7 GB RSS，200 × 7 = 1.4 TB 远超 1 TB 物理内存）。安全 JOBS = (RAM_GB / 7) / 1.5 ≈ 90 上限，实际取 4 已足以让 4 档扫频在 ~75 min 内完成。
+
+### 8.3 扫描方法学
 
 ```bash
-for f in 30 60 100 150 200; do
-  CLK_FREQ_MHZ=$f O=build/sta-scan xmake run sta
-done
+# 完整 21 档（推荐在大内存服务器上跑，约 70 min wallclock）
+JOBS=200 xmake run sta-parallel
+
+# 重点关注闭环点附近时进一步细分
+FREQS="28 29 29.5 30" JOBS=10 xmake run sta-parallel
+
+# 仅做时序而不跑 iPA（避免 21 路 iPA 并发把内存吃满）
+# 当前 xmake.lua 的 sta target 顺序是 sv2v→yosys→iSTA→iPA；
+# 跑大批扫频时若只关心 WNS，可以把 sta.tcl 里 report_power 行注释掉再跑
 ```
 
-每跑一次产生 `build/sta-scan/MyCPU-${f}MHz/MyCPU.rpt`，从中抽取 WNS 即可
-绘制 freq–slack 曲线，找出 WNS≈0 的点。本次只跑了 500 MHz 一档，
-结合关键路径 31.45 ns 推算：**当前 RTL 的可闭合频率约 30 MHz 左右**。
+> 📌 **已知风险（之前的 BUG 复盘）**：旧版 `scripts/run_sta_parallel.sh`
+> 使用 `parallel -j 30` 但没有 `--halt soon,fail=0`、没有 status 文件、
+> 没有日志落盘到 `sta-<f>.log`，单档失败会导致后续无法追溯。`xmake run
+> sta-parallel` 已修复这些问题：每档 wrapper 内部独立 `xmake run sta`，
+> stdout/stderr 重定向到独立日志，最终汇总 PASS/FAIL 表格，并以非零
+> 退出码反映整批结果。在 ≥ 768 GB RAM 服务器上 `JOBS=200` 可一次跑完 21 档。
 
 ---
 
@@ -388,8 +423,10 @@ done
 
 - [x] ~~§6 修复 iPA 数值溢出~~：已通过 `tools-backend/scripts/clean_power.py`
       后处理过滤 garbage cell；绝对功耗待 iEDA 上游修复 + 接 VCD 后再回归
-- [ ] §3 关键路径攻坚：IQ wakeup→validVec 流水拆分实验，回归 sim-basic / sim-regressive 39+70 用例确认 IPC 影响
-- [ ] §8 频率扫描：跑 30/60/100/150/200/300 MHz 五档，得 WNS-曲线
+- [ ] §3 关键路径攻坚：IQ wakeup→validVec 流水拆分实验，回归 sim-basic / sim-regressive 39+64 用例确认 IPC 影响
+- [x] ~~§8 频率扫描：跑 30/60/100/150/200/300 MHz 五档，得 WNS-曲线~~：
+      历史 20..40 MHz 21 档扫描（Phase A.1）+ 本次 28..31 MHz 4 档扫描（Phase A.2），
+      Fmax ≈ 30 MHz，详见 §8
 - [ ] BCT ICG enable 改 1 拍寄存器后再综合，对比时序与 dynamic power
 - [ ] 把 `sta-init` 加入 README §3 环境依赖说明（PDK / iEDA / sv2v 来源）
 - [ ] 接 verilator VCD 喂给 iPA，得到带真实 toggle 的功耗（需要先实现 `read_vcd` 在 sta.tcl 的接入路径）

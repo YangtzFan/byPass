@@ -26,14 +26,21 @@ import mycpu.memory._
 //   7. 数据旁路使用物理寄存器编号 pdst 进行匹配
 // ============================================================================
 class MyCPU extends Module {
-  // ---- IROM 指令存储器接口 ----
-  val inst_addr_o = IO(Output(UInt(14.W)))
-  val inst_i = IO(Input(UInt(128.W)))
+  // ---- 取指存储访问接口（替代旧的 IROM 直连）----
+  // SoC_Top 根据 icacheSize 选择两种实现：
+  //   1) icacheSize=0：reqQ/respQ 直接接到 IROM（旁路）
+  //   2) icacheSize>0：reqQ/respQ 接到 I-Cache 前端，I-Cache 后端再走另一对 Queue 到 IROM
+  // 两种实现均符合 Decoupled 协议，CPU 内部统一抽象。
+  val fetchMem = IO(new Bundle {
+    val reqAddr  = Decoupled(UInt(14.W))
+    val respData = Flipped(Decoupled(UInt(128.W)))
+  })
 
   // ---- AXIStoreQueue 前端接口 ----
   // myCPU 只暴露“commit enqueue / committed-query / load req&resp”前端协议，
   // 由 SoC_Top 在核外实例化 AXIStoreQueue 并统一连接 DRAM。
-  val sqEnq = IO(Decoupled(new SQEnqPayload))
+  // Phase A.2：sqEnq 升级为 Vec(K) 多端口，K = storeLanes.size = 2。
+  val sqEnq = IO(Vec(LaneCapability.storeLanes.size, Decoupled(new SQEnqPayload)))
   // TD-B：sqQuery 升级为 Vec(N) 多查询口（Memory 阶段每个 Load lane 独立查询）。
   val sqQuery = IO(Vec(LaneCapability.loadLanes.size, new AXISQQueryIO))
   val sqLoadAddr = IO(Decoupled(UInt(32.W)))
@@ -54,6 +61,9 @@ class MyCPU extends Module {
       val reg_wen   = Bool()
       val reg_waddr = UInt(5.W)
       val reg_wdata = UInt(32.W)
+      // Phase A.2：该 lane 的 store 序号（0..K-1）；当 is_store=false 时为 0。
+      // SoC_Top 用该值从 axiMasterDebug Vec(K) 中选出对应 enq lane 的 ram_* 观测。
+      val store_ordinal = UInt(log2Ceil(LaneCapability.storeLanes.size + 1).W)
     }))
   })
 
@@ -79,8 +89,9 @@ class MyCPU extends Module {
   // =====================================================
   val uFetch = Module(new Fetch)
   uFetch.in <> uPc.out
-  inst_addr_o := uFetch.irom.inst_addr_o
-  uFetch.irom.inst_i := inst_i
+  fetchMem.reqAddr <> uFetch.mem.reqAddr
+  uFetch.mem.respData <> fetchMem.respData
+  uFetch.flush := memRedirectValid // Memory 重定向时丢弃在飞取指请求，避免错误数据进入 FetchBuffer
   // ---- BHT 顶层实例化并连接到 Fetch ----
   val uBHT = Option.when(CPUConfig.useBHT)(Module(new BHT(CPUConfig.bhtEntries)))
   if (CPUConfig.useBHT) {
@@ -622,30 +633,43 @@ class MyCPU extends Module {
     uBCT.io.refreshAddr(k)  := effRefPdst(k)
   }
 
-  // Store 提交路径：
-  //   当前 AXI 单事务在飞 + ROB.commitMask 保证本拍至多一个 Store 被允许提交，
-  //   且该 Store 必然位于 lane0（ROB 若 lane0 非 Store、lane1 为 Store，commitMask
-  //   同样会允许 lane1 提交 —— 但由于 lane1 永不产 Store（IQ 仲裁规则），这条路径
-  //   在当前配置下不会发生；为保险起见，这里仍只读取 uROB.commit(0)，后续若允许
-  //   lane1 Store 需要把下方连线改为"选首个 Store 的 lane"）
-  val headIsStore = uROB.commit(0).isStore
-  val headStoreLookupValid = uROB.headReady && headIsStore
+  // Store 提交路径（Phase A.2：Vec(K) 多端口，K = storeLanes.size = 2）：
+  //   ROB 暴露 headIsStoreVec / headStoreSeqVec / commitStoreOrdinal，
+  //   MyCPU 从 commitWidth 个 ROB lane 中按顺序挑出最多 K 个 store 候选（ordinal 0..K-1），
+  //   分别送到 sqEnq(0..K-1) 与 SB.commit(0..K-1)。
+  //   ROB.commitBlocked(m) 反馈第 m 个 store 是否被 AXISQ 拒收。
+  val storeLanesK = LaneCapability.storeLanes.size
 
-  uStoreBuffer.commit.valid := headStoreLookupValid
-  uStoreBuffer.commit.storeSeq := uROB.commit(0).storeSeq
-  sqEnq.valid := headStoreLookupValid && uStoreBuffer.commit.entryValid
-  sqEnq.bits.addr := uStoreBuffer.commit.addr
-  sqEnq.bits.data := uStoreBuffer.commit.data
-  sqEnq.bits.mask := uStoreBuffer.commit.mask
-  sqEnq.bits.wstrb := uStoreBuffer.commit.wstrb
-  sqEnq.bits.wdata := uStoreBuffer.commit.wdata
-  sqEnq.bits.storeSeq := uROB.commit(0).storeSeq
+  // 对每个 store ordinal m，找出 ROB 中"本拍是该 ordinal 的那条 lane"，把其 storeSeq 送入 SB / AXISQ。
+  // headIsStoreVec(i) 已包含 headLaneReadyHere(i)；其语义是"该 lane 是 store 且已通过 commit 候选条件（忽略 AXISQ 反压）"。
+  val storeCandidateSeq   = Wire(Vec(storeLanesK, UInt(CPUConfig.storeSeqWidth.W)))
+  val storeCandidateValid = Wire(Vec(storeLanesK, Bool()))
+  for (m <- 0 until storeLanesK) {
+    val matchVec = VecInit((0 until CPUConfig.commitWidth).map { i =>
+      uROB.headIsStoreVec(i) && (uROB.commitStoreOrdinal(i) === m.U)
+    })
+    storeCandidateValid(m) := matchVec.asUInt.orR
+    val pickIdx = PriorityEncoder(matchVec.asUInt)
+    storeCandidateSeq(m) := uROB.headStoreSeqVec(pickIdx)
+  }
 
-  val sqEnqFire = sqEnq.fire
-  uStoreBuffer.commit.enqSuccess := sqEnqFire
+  for (m <- 0 until storeLanesK) {
+    uStoreBuffer.commit(m).valid    := storeCandidateValid(m)
+    uStoreBuffer.commit(m).storeSeq := storeCandidateSeq(m)
+    sqEnq(m).valid    := storeCandidateValid(m) && uStoreBuffer.commit(m).entryValid
+    sqEnq(m).bits.addr := uStoreBuffer.commit(m).addr
+    sqEnq(m).bits.data := uStoreBuffer.commit(m).data
+    sqEnq(m).bits.mask := uStoreBuffer.commit(m).mask
+    sqEnq(m).bits.wstrb := uStoreBuffer.commit(m).wstrb
+    sqEnq(m).bits.wdata := uStoreBuffer.commit(m).wdata
+    sqEnq(m).bits.storeSeq := storeCandidateSeq(m)
+    uStoreBuffer.commit(m).enqSuccess := sqEnq(m).fire
 
-  // P0 语义：head store 只有成功进入 AXIStoreQueue 才算提交，否则持续阻塞 ROB head。
-  uROB.commitBlocked := uROB.headReady && headIsStore && !sqEnqFire
+    // commitBlocked(m): 第 m 个 store 候选存在（valid 已经过 SB.entryValid 检查）但未被 AXISQ 接受。
+    // 注意：若 storeCandidateValid(m)=true 但 SB.entryValid=false（地址未就绪），sqEnq.valid=false → 永远不 fire。
+    // 这种情况下也必须阻塞 ROB commit；故 commitBlocked 用 candidate 是否 fire 来判定，而不只看 sqEnq.valid。
+    uROB.commitBlocked(m) := storeCandidateValid(m) && !sqEnq(m).fire
+  }
 
   // Commit 观测信号（供 difftest 使用）—— 多 lane 对外输出
   io.commit_count := uROB.commitCount
@@ -655,6 +679,7 @@ class MyCPU extends Module {
     io.commit(i).reg_wen   := uROB.commit(i).regWen
     io.commit(i).reg_waddr := uROB.commit(i).rd
     io.commit(i).reg_wdata := uROB.commit(i).regWBData
+    io.commit(i).store_ordinal := uROB.commitStoreOrdinal(i)
   }
 
   // =====================================================

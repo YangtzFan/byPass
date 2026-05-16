@@ -78,8 +78,7 @@ class Execute extends Module {
   //      组合旁路给同拍的 lane1+ 源操作数 mux。Load（lType）类指令的结果
   //      要等到下一拍 Memory 阶段才产出，无法同拍前递，因此 lane0 为 Load
   //      时仍需在 Issue 阶段禁 pair（由 Issue.scala 的 pairRawConflict 负责）。
-  // 实现：下面的 lane0CanForward/lane0Pdst/lane0Data 由 lane0 迭代赋值（见 for
-  //      循环体尾部），然后 lane>=1 的 actual_rdata1/2 会优先使用它。
+  // 实现：lane>=1 的 actual_rdata1/2 通过 laneFwdValid/Pdst/Data 优先取 lane(j<k) 的同拍结果。
   // ============================================================================
   // Phase C：N² 同拍前递。每个 lane 都暴露"是否能同拍前递 + pdst + data"，
   // 更年轻 lane 的源操作数 mux 优先取最年轻可用的 lane(j<k) 同拍结果。
@@ -90,10 +89,6 @@ class Execute extends Module {
     laneFwdPdst(k) := 0.U
     laneFwdData(k) := 0.U
   }
-  // 兼容旧代码：保留 lane0 的导出别名（部分模块可能仍引用，未来可清理）
-  val lane0CanForward = WireInit(false.B)
-  val lane0FwdPdst    = WireInit(0.U(CPUConfig.prfAddrWidth.W))
-  val lane0FwdData    = WireInit(0.U(32.W))
 
   // TD-C：BHT/BTB 更新本地 Vec —— 每个 lane 各自计算，循环后再 OR/Mux1H 汇聚到单端口。
   // 因 Issue.scala 已强制 "no-double-Branch"，每拍最多 1 条 lane 触发更新，OR 安全。
@@ -227,11 +222,6 @@ class Execute extends Module {
     laneFwdValid(k) := canFwdK
     laneFwdPdst(k)  := outL.pdst
     laneFwdData(k)  := outL.data
-    if (k == 0) {
-      lane0CanForward := canFwdK
-      lane0FwdPdst    := outL.pdst
-      lane0FwdData    := outL.data
-    }
   }
 
   // TD-C：BHT/BTB 单端口聚合。"no-double-Branch" 已保证每拍至多 1 条 lane 触发更新，

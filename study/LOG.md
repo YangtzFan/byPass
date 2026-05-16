@@ -1,5 +1,9 @@
 # 4 发射升级 进展日志
 
+> ⚠️ **历史快照**：本文件记录的是 **从 2-发射升级到 4-发射** 时期的逐阶段进度日志（sim-all 41 用例 → sim-regressive 70 用例时代）。
+> 当前 (Phase A.2 落地后) 测试集已重整为 **sim-basic 39/39 + sim-regressive 64/64 PASS（Verilator）**，构建/回归命令统一为 `SIM=verilator xmake b rtl && SIM=verilator xmake b Core && SIM=verilator xmake r sim-basic / sim-regressive`。
+> 本文以下内容保留作历史参考，**不再代表当前 RTL 状态与命令格式**。
+
 > 任务：将当前 OoO 双发射 RV32I CPU 升级为 4 发射；最终目标 41/41@`issueWidth=4`，平均 IPC ≥ 0.80。
 > 全部进度严格记录于本文件；未达成项及技术债见 `PLAN.md`。
 

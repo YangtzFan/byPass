@@ -500,18 +500,36 @@ yosys 综合后实例名往往很丑（`$auto$alumacc.cc:485:replace_alu$1234`
 | 指标 | 数值 | 说明 |
 |---|---|---|
 | RTL 模块数 | ~50 | `build/rtl/*.sv` |
-| 综合后 cell 数 | **~462,380** | `synth_stat.txt` |
-| 综合后面积 | **~1.04 mm²** @icsprout55 55nm | `Chip area` |
-| 触发器数 | ~45,000 | DFF 占比 ~9.7% |
+| 综合后 cell 数 | **469,199**（Phase A.2） | `synth_stat.txt`（A.1 为 457,447） |
+| 综合后面积 | **~1.04 mm²** @icsprout55 55nm | `Chip area` = 1,039,183.60 µm²（Phase A.2） |
+| 触发器数 | ~40,400 | seq 元件占面积 23.95% |
 | 目标频率 | **500 MHz** | `mycpu.sdc` 中 `create_clock 2.0` |
-| WNS | **-29 ns** | 远未时序闭环，处于**功能正确但不可流片**阶段 |
-| TNS | -数千 ns | 多条路径同时违例 |
-| 实际可达频率 | ≈ **30 MHz** | 1 / (2 + 29) ns ≈ 32 MHz |
+| WNS @500MHz | **-29.594 ns**（Phase A.1 历史） | 远未时序闭环，处于**功能正确但不可流片**阶段 |
+| TNS @500MHz | -416,633 ns（Phase A.1 历史） | 几乎所有 endpoint 都不闭合 |
+| **实测可闭合频率** | **≈ 30 MHz**（pre-CTS, Phase A.2） | `sta-parallel` 扫 28..31MHz 得 WNS 零点；A.1 为 29.3 MHz |
 | 综合时间 | **~42 min** | sv2v 加 `--top=MyCPU` 后 |
-| 总功耗（toggle 0.1） | ~186 mW | 估算值 |
+| 总功耗（toggle 0.1） | ~28.7 W（下界，iEDA bug 影响 21% cell） | 见 doc 17 §6 |
+
+### 10.1 频率扫描曲线（来自 `xmake run sta-parallel`，Phase B 终版 RTL）
+
+| Freq (MHz) | Path Delay (ns) | WNS (ns) | TNS-Setup (ns) | 闭合 |
+|---:|---:|---:|---:|:---:|
+| 28 | 31.632 | +2.252 | 0.000 | ✅ |
+| 29 | 31.632 | +1.082 | 0.000 | ✅ |
+| 30 | 31.632 | −0.010 | −0.052 | ⚠️（贴零临界） |
+| **≈ 29.99** | **31.632** | **≈ 0** | **≈ 0** | **✅（Fmax）** |
+| 31 | 31.632 | −1.031 | −288.080 | ❌ |
+
+观察：
+
+- 28..31 MHz 区间 yosys+ABC 把关键路径稳定到 **31.632 ns 的下界**（Phase A.2 为 31.378 ns；本轮回到 icache_on 终版后 qDepth 加深 50/1/50→200/4/200 把 FIFO 更新逻辑略撑长 0.254 ns）；
+- WNS 在 30→31 MHz 之间过零，线性插值 **真实 Fmax ≈ 29.99 MHz**（30 MHz 实测 −0.010 ns 已贴零，2 个端点微违例 0.010 ns 可视作闭合临界）；
+- 历史 20..40 MHz 21 档扫描（Phase A.1）保留于 git log；本轮仅做 28..31 MHz 局部精扫；
+- 与 doc 17 §3 中 "500 MHz 目标下的 31.45 ns" 对比，差距 0.18 ns —— sta-parallel 稳态 PD 仍紧贴"500 MHz 目标极限优化结果"。
 
 > 📌 **怎么使用这张表**：
-> 你做了一次改动后再跑一遍 `xmake run sta`，把新数据对比这里。
+> 你做了一次改动后再跑一遍 `xmake run sta` 或 `xmake run sta-parallel`，
+> 把新数据对比这里。
 > 单元数 ±5% 内、WNS 变好或不变 → ✅；
 > WNS 退化 > 1 ns → 🟡 排查改动；
 > 综合时间 > 60 min → 🔴 看是否引入了组合环或巨大 case 表。

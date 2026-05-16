@@ -67,6 +67,66 @@ object CPUConfig {
   val axiSqEntries: Int = 16                // AXIStoreQueue 深度：保存已提交但尚未写回 DRAM 的 store
   val axiSqStoreBurstLimit: Int = 8         // 在有 load miss 等待时，最多连续优先处理的 store 数量，避免 load 饥饿
 
+  // ============================================================================
+  // Cache 与访存延迟队列参数（Phase 1：D-Cache）
+  // ----------------------------------------------------------------------------
+  // 设计要点（详见 TASK.md）：
+  //   1. icacheSize / dcacheSize 为 0 时旁路对应 Cache，走原始路径；
+  //   2. CacheLine 固定 64B（写死，对应一行 16 word / 4 个 128bit fetch 槽）；
+  //   3. cacheAssoc 默认 4-way 组相联，可选 1/2/4/8；
+  //   4. 三档 Queue 模拟访问延迟：
+  //        qDepthCpuToCache : CPU↔Cache 路径深度（命中路径，pipe=true，避免吞吐降低）
+  //        qDepthCacheToMem : Cache↔主存 路径深度（miss 填充 / 回写）
+  //        qDepthCpuToMem   : CPU↔主存 直连路径深度（关 Cache 时 AXIStoreQueue↔DRAM 也启用）
+  //   5. Write-Back + Write-Allocate 写策略写死，由 DCache 实现保证。
+  // ============================================================================
+  // icache_on 工况配置：开启 I-Cache 与 D-Cache 各 4 KB / 4-way；qDepthCpuToMem=200 / CpuToCache=4 / CacheToMem=200。
+  // 用于综合 / STA / sta-parallel 等后端流程，及缓存子系统对比实验。
+  // 0 拍 baseline 工况为 icacheSize=0 / dcacheSize=0 / qDepth 三个均为 0，详见 study/18_cache_microarch.md。
+  val icacheSize:     Int = 4096 // I-Cache 容量字节，4 KB
+  val dcacheSize:     Int = 4096 // D-Cache 容量字节，4 KB
+  val cacheLineBytes: Int = 64   // CacheLine 大小（写死 64B = 16 word = 4 × 128bit）
+  val cacheAssoc:     Int = 4    // Cache 路数（参数化，默认 4-way，可选 1/2/4/8）
+
+  // 性能参数：所有路径走 mycpu.memory.LatencyPipe（N 拍硬延迟，N=0 退化为组合直通）。
+  // icache_on 工况：命中路径 4 拍、miss / 主存路径 200 拍。
+  val qDepthCpuToMem:   Int = 200  // CPU 直连主存路径硬延迟拍数（关 Cache 旁路时使用，本配置未启用）
+  val qDepthCpuToCache: Int = 4    // CPU↔Cache 路径硬延迟拍数（命中路径）
+  val qDepthCacheToMem: Int = 200  // Cache↔主存 路径硬延迟拍数（miss refill / dirty writeback）
+
+  // ---- Cache 派生量 ----
+  val cacheLineWords: Int = cacheLineBytes / 4   // 一行 word 数（= 16）
+  val cacheOffsetWidth: Int = log2Ceil(cacheLineBytes)        // 行内字节偏移位宽（= 6）
+  val cacheWordOffsetWidth: Int = log2Ceil(cacheLineWords)    // 行内字偏移位宽（= 4）
+
+  // dcacheSize=0 时下面派生量取 1，避免 log2Ceil(0) 异常；实际不会被使用。
+  private def safeLog2(n: Int): Int = if (n <= 1) 1 else log2Ceil(n)
+
+  val dcacheNumSets: Int =
+    if (dcacheSize == 0) 1 else dcacheSize / cacheLineBytes / cacheAssoc
+  val dcacheSetIdxWidth: Int = safeLog2(dcacheNumSets)        // D-Cache index 位宽
+  val dcacheTagWidth:    Int = 32 - cacheOffsetWidth - dcacheSetIdxWidth
+
+  val icacheNumSets: Int =
+    if (icacheSize == 0) 1 else icacheSize / cacheLineBytes / cacheAssoc
+  val icacheSetIdxWidth: Int = safeLog2(icacheNumSets)
+  val icacheTagWidth:    Int = 32 - cacheOffsetWidth - icacheSetIdxWidth
+
+  // ---- Cache 参数合法性校验 ----
+  // 这些 require 在生成 Verilog 时才会触发；保持在 object 体内即可。
+  require(cacheLineBytes == 64,
+    s"cacheLineBytes must be 64 (got $cacheLineBytes)")
+  require(cacheLineWords == 16,
+    s"cacheLineWords derived value must be 16 (got $cacheLineWords)")
+  require(Set(1, 2, 4, 8).contains(cacheAssoc),
+    s"cacheAssoc must be one of {1,2,4,8} (got $cacheAssoc)")
+  require(dcacheSize == 0 || (dcacheSize % (cacheLineBytes * cacheAssoc) == 0),
+    s"dcacheSize ($dcacheSize) must be multiple of cacheLineBytes*cacheAssoc (${cacheLineBytes * cacheAssoc})")
+  require(icacheSize == 0 || (icacheSize % (cacheLineBytes * cacheAssoc) == 0),
+    s"icacheSize ($icacheSize) must be multiple of cacheLineBytes*cacheAssoc (${cacheLineBytes * cacheAssoc})")
+  require(qDepthCpuToMem >= 0 && qDepthCpuToCache >= 0 && qDepthCacheToMem >= 0,
+    "queue depths must be >= 0 (0 = combinational passthrough)")
+
   // ---- PRF（物理寄存器堆）参数 ----
   val prfEntries: Int = 128                    // 物理寄存器数量（p0~p127）
   val prfAddrWidth: Int = log2Ceil(prfEntries) // 物理寄存器编号位宽（7 位）

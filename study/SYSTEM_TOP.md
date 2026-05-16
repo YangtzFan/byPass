@@ -18,7 +18,7 @@
 | [`10_rob.md`](10_rob.md) | ROB（128 项）+ 4 lane dispatch / commit | `device/ROB.scala` |
 | [`11_branch_checkpoint.md`](11_branch_checkpoint.md) | BCT + 重定向冲刷路径 | `device/BranchCheckpointTable.scala`、`MyCPU.scala:370-406` |
 | [`12_storage_subsystem.md`](12_storage_subsystem.md) | StoreBuffer / AXIStoreQueue / DRAM / IROM | `dataLane/StoreBuffer.scala`、`memory/AXIStoreQueue.scala`、`memory/DRAM_AXIInterface.scala`、`memory/IROM.scala` |
-| [`13_wakeup_model.md`](13_wakeup_model.md) | α / β / γ 三档 wakeup 时序 + βwake 三重门控 | `MyCPU.scala:545-572`、`IssueQueue.scala:153-186` |
+| [`13_wakeup_model.md`](13_wakeup_model.md) | α / β / γ 三档 wakeup 时序 + βwake 四重门控 | `MyCPU.scala:580-612`、`IssueQueue.scala:153-186` |
 | [`14_invariants_and_hazards.md`](14_invariants_and_hazards.md) | 不变量清单 + 多发射 hazard 规则 | 各模块综合 |
 
 ## 阅读建议
@@ -31,8 +31,8 @@
 
 > 本文件聚焦"**当前是什么样**"，不记录历史演进。历史里程碑见 `../scripts/LOG.md`，BUG 复盘见 `../scripts/BUG.md`，里程碑路线图见 `../scripts/PLAN.md`，当前迭代任务见 `../TASK.md`。
 >
-> **基准时间点**：v20 IPC 回收闭环（lane2/3 βwake 启用 + 三重门控保留），v21 代码清理已完成。
-> **回归状态**：sim-basic 39/39 PASS、sim-regressive 70/70 PASS（双绿）。
+> **基准时间点**：v22 Phase A.2 落地（2-store/拍 commit），βwake 收敛到 lane2/3 + downstreamLoadStall 四重门控；v21 代码清理 + 当前两轮死代码清理已完成。
+> **回归状态**：sim-basic 39/39 PASS、sim-regressive 64/64 PASS（双绿）。
 > **历史快照备份**：`../scripts/STUDY.md.v19_3bak`（含 v13~v19 全部历史章节，仅作归档）。
 
 ---
@@ -96,7 +96,7 @@ Fetch(4W) → [FetchBuffer(32)] → Decode(4W) → [DecRenDff]
 ### 4.2 ReadReg —— PRF 读 + 同拍写优先 bypass（`dataLane/ReadReg.scala` + `device/PRF.scala`）
 
 - 8 读口（= `2 × issueWidth`）/ 4 写口（= `refreshWidth`）；
-- 同拍 Refresh 写优先 bypass：读端检测 `wen[i] && waddr[i] === raddr` 时返回 wdata —— 这是 βwake N+3 时序得以工作的关键基础设施。
+- 同拍 Refresh 写优先 bypass：读端检测 `wen[i] && waddr[i] === raddr` 时返回 wdata —— 这是 βwake N+3 时序得以工作的关键基础设施（详 §五）。
 
 ### 4.3 Execute —— 双 ALU + EX-in-EX 旁路（`dataLane/Execute.scala`）
 
@@ -140,28 +140,30 @@ Fetch(4W) → [FetchBuffer(32)] → Decode(4W) → [DecRenDff]
 |---|---|---|---|---|
 | α | Refresh 同拍 | N | N+1 | 最保险（Refresh 在写）|
 | γ | Memory 级 | N+1 | N+2 | per-lane mshrCaptureFire 抑制（Load 走 MSHR 那拍不广播 γ）|
-| β | Execute 级 | N+3 | N+3（同拍写优先 bypass）| **三重门控**（v19 TD-E）|
+| β | Execute 级 | N+3 | N+3（同拍写优先 bypass）| **四重门控**（v19 TD-E + stale-base 修复）|
 
-**βwake 三重门控**（`MyCPU.scala:545-572`）：
+**βwake 四重门控**（`MyCPU.scala:580-612`）：
 ```scala
-val anyLoadInExBundle = (0 until executeWidth).map { k =>
-  uRRExDff.out.bits.validMask(k) && uRRExDff.out.bits.lanes(k).type_decode_together(4)
-}.reduce(_ || _)
+val anyLoadInExBundle = ...    // 同 bundle 任意 Load
+val anyLoadInMemDff   = ...    // 下游 ExMemDff/Memory 是否有 Load 在飞行
+val downstreamLoadStall = anyLoadInMemDff
 val exAdvance = uRRExDff.out.fire && uMemory.in.ready && !anyLoadInExBundle
+val betaEnable = (k == 2 || k == 3).B && !downstreamLoadStall
 ```
 - 第 1 重 `RRExDff.out.fire`：确保生产者本拍真推进；
 - 第 2 重 `Memory.in.ready`：确保当前 ExMemDff→Memory 通路无反压；
-- 第 3 重 `!anyLoadInExBundle`：消除"同 bundle Load 触发 memStall 把 ALU 生产者一并卡在 ExMemDff"路径，从源头保证 N+3 抵达 Refresh。
-- **βwake 范围（v20 P0+P1 安全版）**：lane0 + lane2 + lane3 启用；lane1 仍禁用（保留 v19.3 不变量 I-D，留待独立验证）。
-  - lane2/3 是 ALU-only，本身永不可能是 Load；但仍受第 3 重门控保护，因 bundle 原子推进 → 同 bundle 任意 Load 触发 memStall 时 lane2/3 ALU 生产者也会被卡。
+- 第 3 重 `!anyLoadInExBundle`：消除"同 bundle Load 触发 memStall 把 ALU 生产者一并卡在 ExMemDff"路径；
+- 第 4 重 `!downstreamLoadStall`：下游有 Load 在飞行（可能被 MSHR/older-unknown 反压）时禁 β，避免 PRF 写时点从 N+3 滑到 N+4。
+- **βwake 范围（当前实际版本）**：仅 lane2 + lane3 启用；lane0 / lane1 全部禁用（lane0 因 Full lane 含 Load 风险保守关闭，lane1 未独立验证）。
+  - lane2/3 是 ALU-only，本身永不可能是 Load —— 是最安全的 β-wake 释放面。
 
-> ✅ **v20 收益**：lane2/3 βwake 释放后，对"bundle 不含 Load"的 ALU-heavy 路径有显著 IPC 提升（详见 §11.4）。原"βwake 第 3 重一刀切"导致 v19.3 IPC 回退已修复。
+> ✅ **当前收益**：lane2/3 βwake 释放后，对"bundle 不含 Load 且下游无 Load 在飞行"的 ALU-heavy 路径有显著 IPC 提升（详见 §11.4）。
 
 ---
 
 ## 六、乱序保留与投机回滚
 
-- **ROB**（`device/ROB.scala`）：128 项；4 lane 并发 dispatch（4 个连续 tail）；4 lane Refresh 标 done；提交按 head 顺序，Store 仅 lane0 可提交。
+- **ROB**（`device/ROB.scala`）：128 项；4 lane 并发 dispatch（4 个连续 tail）；4 lane Refresh 标 done；提交按 head 顺序，Store 允许出现在 lane0 / lane1 任一路（同拍 ≤ K=2 个 Store commit，由 `commitBlocked: Vec(K)` 反压）。
 - **BCT (Branch Checkpoint Table)**（`device/BranchCheckpointTable.scala`）：8 项；保存 RAT 全表 + FreeList.head + ReadyTable 128-bit；`refreshedSinceSnap[idx]` 维护快照后已 ready 的 pdst 位向量，恢复时 OR 回快照防 stale。
 - **重定向冲刷路径**（`MyCPU.scala:370-406`）：
   - `laneFlush` 函数对每个 Dff 逐 lane 比较 `robIdx > memRedirectRobIdx` 清 validMask；全 0 整 bundle 丢；
@@ -174,11 +176,13 @@ val exAdvance = uRRExDff.out.fire && uMemory.in.ready && !anyLoadInExBundle
 
 ## 七、存储子系统
 
-- **StoreBuffer**（`dataLane/StoreBuffer.scala`，深度 16）：投机 Store；字节级；commit 时把数据搬到 AXIStoreQueue。
-- **AXIStoreQueue**（`memory/AXIStoreQueue.scala`，深度 16）：committed-store 等待 DRAM 写入；committed-store forward 接口供 Memory 转发；`loadInflightCnt` 配合 AXI outstanding=2。
-- **DRAM 接口**（`memory/DRAM_AXIInterface.scala`）：AXI outstanding=2；`readReqFifo / readRespFifo` 各 2 项。
+- **StoreBuffer**（`dataLane/StoreBuffer.scala`，深度 16）：投机 Store；字节级；commit 接口 `Vec(K=2)`，同拍可同时 commit 至多 2 个 Store 到 AXIStoreQueue（Phase A.2）。
+- **AXIStoreQueue**（`memory/AXIStoreQueue.scala`，深度 16）：committed-store 等待 DRAM 写入；committed-store forward 接口供 Memory 转发；enq 端口 `Vec(K=2)` + PriorityEncoderOH 紧凑写入；AXI 写端仍单 outstanding（B 串行）；`loadInflightCnt` 配合 AXI 读 outstanding=2。
+- **DRAM 接口**（`memory/DRAM_AXIInterface.scala`）：AXI 读 outstanding=2；`readReqFifo / readRespFifo` 各 2 项。
+- **I-Cache / D-Cache**（`memory/ICache.scala`、`memory/DCache.scala`）：当前 `icacheSize=4096`、`dcacheSize=4096`，写直通；I-Cache 命中 `qDepthCpuToCache=4` 拍，miss refill 走 `LatencyPipe(qDepthCacheToMem=200)` —— 关 Cache 旁路（`icacheSize=0`）时 Fetch 直连 IROM 通过 `LatencyPipe(qDepthCpuToMem=200)`。详见 §18（`study/18_cache_microarch.md`）。
 - **IROM**（`memory/IROM.scala`）：取指 ROM；通过 difftest xmake.lua `$readmemh` 注入 hex 内容。
 - **Load 字节合并**（`Memory.scala mergeLoadSources` ~ line 130）：优先级 SB > AXIStoreQueue > DRAM；按 mask 字节级合并。
+- **观察口对齐（v22）**：`io.debug_commit(k).ram_*` 由 `axiMasterDebug.lane(storeOrdinal(k))` 直接驱动 —— 即把 difftest 观察点从"原 SB commit"前移到了"AXIStoreQueue 入口（同拍 enq.fire）"，与 ROB.commit(k) 的 store 派生严格同拍。详见 §10（ROB）+ §12（存储子系统）。
 
 ---
 
@@ -188,11 +192,12 @@ val exAdvance = uRRExDff.out.fire && uMemory.in.ready && !anyLoadInExBundle
 2. **v15**：FetchBuffer ≥3 预测分支截断；
 3. **TD-D**：`mshrComplete` IO=Vec(2) per-slot 独立 ack；MyCPU 双 j 仲裁；
 4. **v18**：difftest emu.lua dmem 启动从 .bin 预载 + xmake.lua 注入 `mem_65536x32.sv $readmemh dram.hex` + main.lua mismatch 用 `or` 累加；
-5. **TD-E（v19.3）**：
+5. **TD-E（v19.3）+ stale-base 修复**：
    - **I-A** Memory bundle 原子性：`in.ready=false` 时禁止 fresh MSHR alloc / fresh AR fire / mshrInFlightFifo enq；
    - **I-B** 双 capture all-or-none：`numNeedDram=2 && freeCnt<2` 必整拍 stall；
-   - **I-C** βwake 三重门控不可拆：任一缺失即破坏 N+3 PRF 写时序假设；
-   - **I-D** βwake 范围（v20 已扩展）：lane0 + lane2 + lane3 启用，lane1 仍禁用（lane1 βwake 未独立验证，留 P1 后续）。
+   - **I-C** βwake 四重门控不可拆：任一缺失即破坏 N+3 PRF 写时序假设；
+   - **I-D** βwake 范围（当前实际）：仅 lane2 + lane3 启用，lane0 / lane1 全部禁用。
+6. **v22 (Phase A.2)**：2-store/拍 commit 端到端升级 —— SB / AXISQ / sqEnq / debug_commit 全 Vec(K=2)；`io.debug_commit(k).ram_*` 由 `axiMasterDebug.lane(storeOrdinal(k))` 直接驱动，与 AXISQ 入口同拍。
 
 ---
 
@@ -204,7 +209,7 @@ val exAdvance = uRRExDff.out.fire && uMemory.in.ready && !anyLoadInExBundle
 | `doubleBrStall` | lane j (j<k) 与 lane k 都是 Branch/JALR | Issue.scala:118-141 | Memory.redirect 单端口；TD-F 解除 |
 | `doubleLoadStall` | （v19 已删除） | - | Memory 已支持双 capture |
 | Memory bundle 原子 | in.ready=0 时禁所有 fresh 行为 | Memory.scala:478-486, 671-744 | 断言守护 |
-| Store commit 仅 lane0 | lane0 非 head 或非 Store 时整拍不提交 Store | ROB.scala:69-78, MyCPU.scala:589-600 | 简化 SB→AXISQ 路径 |
+| Store commit ≤ K=2/拍 | store 仅允许位于 `storeLanes={0,1}`，且 lane k 反压时不退役 | ROB.scala, MyCPU.scala (Phase A.2) | 同拍可同时退役 2 个 Store；commitBlocked: Vec(K) 反压每路 enq |
 | Branch 仅 lane0 验证 | lane0 计算 actual target | Execute.scala:38-52 | TD-C 后 lane1 也可执行 Branch，但仍受 doubleBrStall 单仲裁约束 |
 
 ---
@@ -236,14 +241,14 @@ val exAdvance = uRRExDff.out.fire && uMemory.in.ready && !anyLoadInExBundle
 | `prfWritePorts` | 4 | - | = refreshWidth |
 | `memoryWidth` | 4 | - | Memory bundle 通道数 |
 | `loadLanes` | `Seq(0,1)` | - | TD-B 后 lane1 升 Full |
-| `storeLanes` | `Seq(0,1)` | - | lane1 永不产 Store（IQ 仲裁规则）|
+| `storeLanes` | `Seq(0,1)` | - | Phase A.2 后两路并发 commit Store（每拍 ≤ 2）|
 | `branchLanes` | `Seq(0,1)` | - | TD-C 后 lane1 接 Branch/JALR |
 
 ---
 
-## 十一、当前 IPC 实测快照（v20，lane0/2/3 βwake 启用后）
+## 十一、当前 IPC 实测快照（v22 Phase A.2 落地后，lane2/3 βwake 启用）
 
-> 数据源：`difftest/build/sim-data/<case>.csv` 末行 ipc 字段（sim-regressive 70/70 PASS 后落盘）。
+> 数据源：`difftest/build/sim-data/{basic,regressive}/<case>.csv` 末行 ipc 字段（sim-regressive 64/64 PASS 后落盘）。
 
 ### 11.1 高 IPC 用例（数据并行 + 弱依赖）
 | TC | IPC |
@@ -299,12 +304,12 @@ val exAdvance = uRRExDff.out.fire && uMemory.in.ready && !anyLoadInExBundle
 
 ## 十二、v21+ 优化路径（按 IPC 杠杆排序）
 
-### P1：lane1 βwake 启用（中杠杆 / 中风险）
-- 现状：`betaEnable = (k.U === 0.U) || (k.U === 2.U) || (k.U === 3.U)`；lane1 仍禁用；
-- 改动：`betaEnable = (k.U =/= 1.U) || true.B`（=全开）或独立验证 lane1 ALU producer N+3 假设；
-- 风险：lane1 ALU 生产者→消费者 RAW 时序需独立波形验证（lane1 在 Issue/RR 阶段的下游路径 vs lane0 是否有差异）；
-- 预期增益：算 algo_array_ops_ooo4_unroll 剩余 −4% gap 是否能补；
-- 前置：建议先 P3（Bug B 深挖），避免 lane1 βwake 暴露隐藏 bug。
+### P1：lane0 / lane1 βwake 启用（中杠杆 / 中风险）
+- 现状：`betaEnable = (k == 2 || k == 3).B && !downstreamLoadStall`；lane0 / lane1 全禁；
+- 改动：放开 lane0（仍受 anyLoadInExBundle / downstreamLoadStall 双门控保护）；之后再独立验证 lane1；
+- 风险：lane0 / lane1 是 Full lane（可发 Load），即便 bundle 内 Load 被 `!anyLoadInExBundle` 拦掉，下游 stall 路径需重新形式化推导；
+- 预期增益：算 algo_array_ops_ooo4_unroll 剩余 gap 是否能补；
+- 前置：建议先 P3（Bug B 深挖），避免 βwake 范围扩张暴露隐藏 bug。
 
 ### P2：精确 lookahead 替换 `!anyLoadInExBundle`（高杠杆 / 高风险）
 - 思路：把第 3 重门控替换为 `!willMemStallNextCycle`，仅在"该 bundle 实际会触发 memStall"时禁 βwake；
@@ -314,8 +319,8 @@ val exAdvance = uRRExDff.out.fire && uMemory.in.ready && !anyLoadInExBundle
 - 风险：lookahead 时序路径长，可能影响综合频率。
 
 ### P3：Bug B 根因深挖
-- `algo_list_reverse_ooo4_unroll` 在 βwake 全禁场景 FAIL（PC=910 vs REF=6e4）；
-- 当前 v20 βwake on (lane0/2/3) 不暴露；P1 全开后可能再次暴露；
+- `algo_list_reverse_ooo4_unroll` 历史上在 βwake 全禁场景 FAIL（PC=910 vs REF=6e4）；
+- 当前 v22 βwake on (lane2/3) 不暴露；P1 全开后可能再次暴露；
 - 解决后才能放心 P1/P2。
 
 ### P4：TD-F 双发 Branch（高杠杆 / 高风险）
@@ -328,7 +333,13 @@ val exAdvance = uRRExDff.out.fire && uMemory.in.ready && !anyLoadInExBundle
 - 候选：BTB 升 64/128 + RAS（Return Address Stack）8 项；
 - 预期增益：kernels_indirect_call_ooo4_unroll 0.41 → 0.6+。
 
-### P6：lane2/lane3 启用全功能（远期 / TD-G）
+### P6：AXI 写多 outstanding（针对 store-heavy）
+- Phase A.2 把 commit 端宽度从 1 提到 2，但 AXI 写仍单 outstanding；
+- store-heavy 用例（memcpy / array_ops / list_sort）实测 IPC 提升不明显，瓶颈仍在 DRAM 写背压；
+- 候选：把 AXIToDCacheBridge 写端从 1-outstanding 扩到 2~4，配合 AXISQ depth 同步上调；
+- 预期增益：memcpy_ooo4 0.199 → 0.25+，array_ops 0.196 → 0.24+。
+
+### P7：lane2/lane3 启用全功能（远期 / TD-G）
 - 当前 ALU-only；改 Full 需扩 loadLanes/storeLanes/branchLanes 到 4，影响面巨大；
 - 不在当前周期考虑。
 
@@ -338,15 +349,15 @@ val exAdvance = uRRExDff.out.fire && uMemory.in.ready && !anyLoadInExBundle
 
 ```bash
 # 编译/测试目录（必须）
-cd /home/litian/Documents/stageFiles/studyplace/difftest
+cd /nfs/home/zhanghang/Documents/difftest
 
 SIM=verilator xmake b rtl              # ~16s 生成并后处理 SV
 SIM=verilator xmake b Core             # ~140s 全量 / ~40s 增量
 SIM=verilator xmake r sim-basic        # 39 例 ~150s
-SIM=verilator xmake r sim-regressive   # 70 例 ~5min
+SIM=verilator xmake r sim-regressive   # 64 例 ~5min
 
-# 单测：DUMP=1 出 .vcd 到 build/verilator/Core/<TC>.vcd
-SIM=verilator TC=<name> [DUMP=1 TIMEOUT=N] xmake r Core
+# 单测：TC=<name> 把 stdout+stderr 落盘到 build/sim-log/<case>.log
+SIM=verilator TC=<name> [TIMEOUT=N] xmake r sim-single
 ```
 
 ---

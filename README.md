@@ -5,7 +5,7 @@
 - **微架构**：10 级流水 + 4 路乱序发射；前端 4-wide Fetch / Decode / Rename / Dispatch；后端单端口 bundle，bundle 内 4 lane 并行；
 - **lane 能力**：lane0 / lane1 = Full（ALU + Load + Store + Branch + JALR）；lane2 / lane3 = ALU-only；
 - **关键特性**：BPU（BHT64 + BTB32）/ 48 项 IssueQueue / 128 项 ROB / 16 项 StoreBuffer / 双 capture MSHR / 三档 wakeup（α / β / γ）+ βwake 三重门控；
-- **回归状态**：sim-basic 39/39 PASS、sim-regressive 70/70 PASS；
+- **回归状态**：sim-basic 39/39 PASS、sim-regressive 64/64 PASS；
 - **IPC 峰值**：`kernels_dep_chain_ooo4_unroll = 2.063`。
 
 ## 2. 关键参数（`src/main/scala/CPUConfig.scala`）
@@ -58,6 +58,12 @@ xmake run sta-syn
 # 完整后端：sv2v + yosys 综合 + iSTA 时序 + iPA 功耗
 xmake run sta
 
+# 频率扫描：并行扫描多档时钟频率，每档独立产出 build/sta/MyCPU-<f>MHz/
+# 适合在大内存服务器上一次性绘 freq–WNS 曲线，定位真实 Fmax
+xmake run sta-parallel              # 默认扫 20..40MHz 共 21 档，JOBS=30
+FREQS="20 30 40" xmake run sta-parallel
+JOBS=21 xmake run sta-parallel     # 大服务器上一次性并发 21 个频率
+
 # 清理 build/sta 与 tools-backend/result
 xmake run sta-clean
 ```
@@ -73,6 +79,8 @@ xmake run sta-clean
 | `SDC_FILE` | `tools-backend/scripts/mycpu.sdc` | 约束文件 |
 | `RTL_FILES` | `build/rtl/*.sv` | 综合输入 RTL 列表 |
 | `O` | `build/sta` | 结果输出根目录 |
+| `FREQS` | `20 21 … 40` | `sta-parallel` 扫描的频率列表（空格分隔） |
+| `JOBS` | `30` | `sta-parallel` 同时并发的频率档数（大内存服务器建议 200） |
 
 报告位于 `build/sta/<DESIGN>-<CLK_FREQ_MHZ>MHz/`，关键产物：
 
@@ -97,9 +105,9 @@ xmake run sta-clean
 ```bash
 cd ../difftest
 xmake b rtl            # 生成并后处理 SV
-xmake b Core           # verilator 编译
-xmake r sim-basic      # 39 例
-xmake r sim-regressive # 70 例
+xmake b Core           # 默认 VCS 编译 SIM=verilator 则使用 Verilator 编译
+xmake r sim-basic      # 39 例 默认 VCS 运行仿真 SIM=verilator 则使用 Verilator 运行仿真
+xmake r sim-regressive # 64 例 默认 VCS 运行仿真 SIM=verilator 则使用 Verilator 运行仿真
 ```
 
 ## 6. 目录结构

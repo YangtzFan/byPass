@@ -201,12 +201,43 @@ xmake run clean            # 清整个 build/（含 RTL）
 
 ### 4.6 频率扫描
 
+串行扫描（适合调试单档）：
+
 ```bash
 for f in 300 400 500 600 700; do
   CLK_PORT_NAME=clock CLK_FREQ_MHZ=$f xmake run sta
 done
 # 各档结果落到 build/sta/MyCPU-<f>MHz/
 ```
+
+**并行扫描**（推荐，已纳入 `xmake.lua` 的 `sta-parallel` target）：
+
+```bash
+# 默认扫 20..40MHz 共 21 档，JOBS=30
+xmake run sta-parallel
+
+# 自定义频率列表 + 并发度（大内存服务器：256 核 / 1 TB RAM 可上 200）
+FREQS="20 25 30 35 40 50 80 100 200 500" JOBS=200 xmake run sta-parallel
+```
+
+实现要点（见 `xmake.lua` `sta-parallel` target）：
+
+1. 每档结果按 `result_dir = <O>/<DESIGN>-<freq>MHz` 天然隔离，无写入冲突；
+2. 用 GNU `parallel --halt soon,fail=0` 调度，单档失败不中断整批；
+3. 每档完整日志落盘 `<O>/sta-<freq>.log`、状态写 `<O>/sta-<freq>.status`，
+   便于事后回看；
+4. 子进程显式 `cd "$script_dir"` 并继承 `XMAKE_GLOBALDIR` 等关键环境变量，
+   避免 `xmake run sta` 找不到项目根；
+5. 跑完打印 `PASS=N FAIL=M` 汇总表格；任一档失败终态非零。
+
+> ⚠️ **资源提示**：每个 yosys 综合约 ≈ 60 min 单核 + 几 GB；iSTA 约 2 min；
+> iPA 跑 OoO 设计的 wakeup 反馈环时图节点会膨胀到 30 M+，单档峰值内存可达 ~30 GB。
+> 21 档同时跑 iPA 总内存约 600 GB，需在 ≥ 768 GB RAM 服务器上运行。
+> 仅做频率扫描可以用 `sta-syn` + 单独跑 iSTA 来跳过 iPA（详见 §4.2）。
+
+> 旧 shell 版 `scripts/run_sta_parallel.sh` 仅做了 21 档 yosys+iSTA+iPA 并行，
+> 没有汇总、没有 `--halt soon,fail=0`、没有日志落盘到 `sta-<f>.log`，已被
+> `xmake run sta-parallel` 完全替代，保留仅作历史参考。
 
 ---
 
