@@ -5,7 +5,7 @@
 - **微架构**：10 级流水 + 4 路乱序发射；前端 4-wide Fetch / Decode / Rename / Dispatch；后端单端口 bundle，bundle 内 4 lane 并行；
 - **lane 能力**：lane0 / lane1 = Full（ALU + Load + Store + Branch + JALR）；lane2 / lane3 = ALU-only；
 - **关键特性**：BPU（BHT64 + BTB32）/ 48 项 IssueQueue / 128 项 ROB / 16 项 StoreBuffer / 双 capture MSHR / 三档 wakeup（α / β / γ）+ βwake 三重门控；
-- **回归状态**：sim-basic 39/39 PASS、sim-regressive 70/70 PASS；
+- **回归状态**：sim-basic 39/39 PASS、sim-regressive 64/64 PASS；
 - **IPC 峰值**：`kernels_dep_chain_ooo4_unroll = 2.063`。
 
 ## 2. 关键参数（`src/main/scala/CPUConfig.scala`）
@@ -32,7 +32,7 @@
 - Verilator
 - [Verilua]()
 
-## 6. 快速开始
+## 4. 快速开始
 
 ```bash
 # 1. 初始化子模块
@@ -45,18 +45,72 @@ xmake run comp
 xmake run rtl
 ```
 
-## 7. 验证框架
+后端流程基于 `tools-backend/`（内置 yosys-sta 脚本）+ `iEDA` + `sv2v` + `icsprout55` PDK，
+顶层入口在根目录 `xmake.lua`，提供 4 个 target：
+
+```bash
+# 一次性环境准备：下载预编译 iEDA + sv2v + 克隆 icsprout55 PDK
+xmake run sta-init
+
+# 仅跑 yosys 综合（sv2v + yosys → 门级网表 + 面积报告）
+xmake run sta-syn
+
+# 完整后端：sv2v + yosys 综合 + iSTA 时序 + iPA 功耗
+xmake run sta
+
+# 频率扫描：并行扫描多档时钟频率，每档独立产出 build/sta/MyCPU-<f>MHz/
+# 适合在大内存服务器上一次性绘 freq–WNS 曲线，定位真实 Fmax
+xmake run sta-parallel              # 默认扫 20..40MHz 共 21 档，JOBS=30
+FREQS="20 30 40" xmake run sta-parallel
+JOBS=21 xmake run sta-parallel     # 大服务器上一次性并发 21 个频率
+
+# 清理 build/sta 与 tools-backend/result
+xmake run sta-clean
+```
+
+可选环境变量（均有默认值）：
+
+| 变量 | 默认值 | 说明 |
+|---|---|---|
+| `DESIGN` | `MyCPU` | 顶层模块名 |
+| `PDK` | `icsprout55` | 工艺库 |
+| `CLK_PORT_NAME` | `clock` | 时钟端口（byPass 顶层为 `clock`） |
+| `CLK_FREQ_MHZ` | `500` | 目标频率，用于 SDC `create_clock` |
+| `SDC_FILE` | `tools-backend/scripts/mycpu.sdc` | 约束文件 |
+| `RTL_FILES` | `build/rtl/*.sv` | 综合输入 RTL 列表 |
+| `O` | `build/sta` | 结果输出根目录 |
+| `FREQS` | `20 21 … 40` | `sta-parallel` 扫描的频率列表（空格分隔） |
+| `JOBS` | `30` | `sta-parallel` 同时并发的频率档数（大内存服务器建议 200） |
+
+报告位于 `build/sta/<DESIGN>-<CLK_FREQ_MHZ>MHz/`，关键产物：
+
+- `MyCPU.netlist.v` / `synth_stat.txt` / `synth_check.txt`：综合网表 + 面积 + DRC
+- `MyCPU.rpt`：iSTA 时序总报告（WNS / TNS / 关键路径）
+- `MyCPU.cap` / `.fanout` / `.trans`：电容 / 扇出 / 转换违例
+- `MyCPU_setup.skew` / `MyCPU_hold.skew`：时钟偏斜
+- `MyCPU.pwr`：iPA 功耗原始报告（**注意**：当前 iEDA 版本对约 ~10% 组合
+  cell 的 internal slew 未正确传播，导致 `combinational total` 出现
+  1e+150 数量级 garbage，使全芯片总功耗失真，参见 `study/17` §6）
+- `MyCPU.pwr.clean` / `MyCPU.pwr.broken`：`xmake run sta` 自动调用
+  `tools-backend/scripts/clean_power.py` 后处理生成；前者过滤 garbage
+  cell 后给出可信下界，后者列出受影响 cell
+- `MyCPU_instance.csv`：每个 cell 的 internal/switch/leakage 明细，可
+  自行做更复杂的统计
+
+详细解读见 `study/15_yosys_sta_backend.md` 与 `study/16_backend_analysis_basics.md`。
+
+## 5. 验证框架
 
 详见仓库[difftest](https://github.com/YangtzFan/difftest)
 ```bash
 cd ../difftest
 xmake b rtl            # 生成并后处理 SV
-xmake b Core           # verilator 编译
-xmake r sim-basic      # 39 例
-xmake r sim-regressive # 70 例
+xmake b Core           # 默认 VCS 编译 SIM=verilator 则使用 Verilator 编译
+xmake r sim-basic      # 39 例 默认 VCS 运行仿真 SIM=verilator 则使用 Verilator 运行仿真
+xmake r sim-regressive # 64 例 默认 VCS 运行仿真 SIM=verilator 则使用 Verilator 运行仿真
 ```
 
-## 8. 目录结构
+## 6. 目录结构
 
 ```
 byPass/
@@ -70,7 +124,7 @@ byPass/
 └── build.sc / xmake.lua           构建脚本
 ```
 
-## 9. 阅读建议
+## 7. 阅读建议
 
 - **微架构原理**：从 `study/SYSTEM_TOP.md` 起步，按 14 个模块文档逐项读，每个文档都对应 Chisel 源码锚点；
 - **关键不变量**：`study/14_invariants_and_hazards.md`（改 RTL 前必读）；

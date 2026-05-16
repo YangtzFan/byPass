@@ -34,11 +34,16 @@ class AXISQQueryIO extends Bundle {
   val fwdData   = Input(UInt(32.W))
 }
 
-class AXISQDebugIO extends Bundle {
+// 单 lane 的 debug 观测口（每拍一个 store enq 的视角）
+class AXISQDebugLaneIO extends Bundle {
   val commitRamWen   = Output(Bool())
   val commitRamWaddr = Output(UInt(32.W))
   val commitRamWdata = Output(UInt(32.W))
   val commitRamWmask = Output(UInt(3.W))
+}
+// 多 lane 聚合 debug 口：与 enq Vec 长度一致；lane k 对应 enq(k).fire 的瞬时观测。
+class AXISQDebugIO extends Bundle {
+  val lane = Vec(mycpu.dataLane.LaneCapability.storeLanes.size, new AXISQDebugLaneIO)
 }
 
 // ============================================================================
@@ -77,8 +82,10 @@ class AXIStoreQueue(val depth: Int = CPUConfig.axiSqEntries) extends Module {
   private val storeBurstLimit = CPUConfig.axiSqStoreBurstLimit
   private val burstCntWidth = log2Ceil(storeBurstLimit + 1)
 
-  // 与 myCPU 的握手接口
-  val enq      = IO(Flipped(Decoupled(new SQEnqPayload)))
+  // 与 myCPU 的握手接口（Phase A.2：enq 升级为 Vec(K)，K = storeLanes.size = 2）。
+  // preserve_rob_lane_position 语义：enq(k) 严格对应 ROB.commit 的"本拍第 k 个 store"。
+  private val K = mycpu.dataLane.LaneCapability.storeLanes.size
+  val enq      = IO(Flipped(Vec(K, Decoupled(new SQEnqPayload))))
   // TD-B：query 升级为 Vec(N) 多查询口（loadLanes 大小，当前 N=2）。
   val query    = IO(Flipped(Vec(mycpu.dataLane.LaneCapability.loadLanes.size, new AXISQQueryIO)))
   val loadAddr = IO(Flipped(Decoupled(UInt(32.W))))
@@ -104,19 +111,48 @@ class AXIStoreQueue(val depth: Int = CPUConfig.axiSqEntries) extends Module {
   val tailIdx   = idx(tail)
   val headEntry = entries(headIdx)
 
-  // ===================== Enqueue 接口 =====================
-  enq.ready := !queueFull
-  val enqFire = enq.fire
-  val enqWordAddr = enq.bits.addr(31, 2)
-
-  when(enqFire) {
-    entries(tailIdx).valid    := true.B
-    entries(tailIdx).wordAddr := enqWordAddr
-    entries(tailIdx).wstrb    := enq.bits.wstrb
-    entries(tailIdx).wdata    := enq.bits.wdata
-    entries(tailIdx).storeSeq := enq.bits.storeSeq
+  // ===================== Enqueue 接口（Phase A.2：Vec(K) 多端口紧凑写入）=====================
+  // K = storeLanes.size = 2。每个端口对应 ROB.commit 第 k 个 store 的提交请求；
+  // 不同端口同拍 fire 时，按 0→1 优先级紧凑写入 entries(tail) 与 entries(tail+1)。
+  // ready 保守判定：count + k < depth（lane k 可被采纳所需的最小余量）。
+  // 这样最坏情况下保留 K=2 个槽位即可避免溢出；对深度 16 的影响仅 1 项利用率。
+  for (k <- 0 until K) {
+    enq(k).ready := count + k.U < depth.U
   }
+  val enqFireVec = VecInit((0 until K).map(k => enq(k).fire))
+  val enqCount   = PopCount(enqFireVec)
 
+  // 紧凑写入：把活跃 lane 按顺序映射到 tail+0 / tail+1
+  // 对 K=2 共 4 种组合（00/01/10/11）逐一处理；其余 K 值需要更通用的 PriorityMux 逻辑。
+  for (slot <- 0 until K) {
+    // slot 是相对 tail 的偏移；lane=活跃端口中下标第 slot 个
+    // 用 PriorityEncoder 序列从 enqFireVec 中挑出第 slot 个 1
+    val maskFire = enqFireVec.asUInt
+    // 把前 slot 个已选 lane 屏蔽掉
+    val pickIdx = Wire(UInt(log2Ceil(K + 1).W))
+    if (slot == 0) {
+      pickIdx := PriorityEncoder(maskFire)
+    } else {
+      // K=2 时 slot=1 只需选第二个，等价于：若 lane0&&lane1 都 fire，则选 1；否则无效
+      // 通用写法：依次剥离已选 OH。
+      var maskRem = maskFire
+      for (_ <- 0 until slot) {
+        maskRem = maskRem & ~PriorityEncoderOH(maskRem)
+      }
+      pickIdx := PriorityEncoder(maskRem)
+    }
+    val slotActive = enqCount > slot.U
+    val payloadVec = VecInit(enq.map(_.bits))
+    val payload = payloadVec(pickIdx)
+    val writeIdx = idx(tail + slot.U)
+    when(slotActive) {
+      entries(writeIdx).valid    := true.B
+      entries(writeIdx).wordAddr := payload.addr(31, 2)
+      entries(writeIdx).wstrb    := payload.wstrb
+      entries(writeIdx).wdata    := payload.wdata
+      entries(writeIdx).storeSeq := payload.storeSeq
+    }
+  }
   // ===================== Committed-store 查询（TD-B：Vec(N) 多查询口）=====================
   // AXIStoreQueue 的查询同样无状态，可任意复制。每个 Load lane 独立提供一份组合电路。
   for (q <- 0 until mycpu.dataLane.LaneCapability.loadLanes.size) {
@@ -252,25 +288,28 @@ class AXIStoreQueue(val depth: Int = CPUConfig.axiSqEntries) extends Module {
     }
   }
 
-  // ===================== 队列头释放 / 指针更新 =====================
+  // ===================== 队列头释放 / 指针更新（Phase A.2：支持多 enq）=====================
+  // 每拍：count 增加 enqCount（0..K），若 storeRespFire 则减 1；tail 前进 enqCount。
   when(storeRespFire) {
     entries(headIdx).valid := false.B
   }
 
-  when(enqFire && !storeRespFire) {
-    tail := tail + 1.U
-    count := count + 1.U
-  }.elsewhen(!enqFire && storeRespFire) {
-    head := head + 1.U
-    count := count - 1.U
-  }.elsewhen(enqFire && storeRespFire) {
-    tail := tail + 1.U
+  when(enqCount =/= 0.U) {
+    tail := tail + enqCount
+  }
+  when(storeRespFire) {
     head := head + 1.U
   }
+  // 实际取值保证 count + enqCount >= storeRespFire（storeRespFire 仅在 hasStore 时为真），
+  // 故组合 count + enqCount - storeRespFire 不会下溢；Chisel 的位宽推断会自动加 1 位。
+  count := count + enqCount - storeRespFire.asUInt
 
-  // ===================== difftest 调试口 =====================
-  debug.commitRamWen   := enqFire
-  debug.commitRamWaddr := enq.bits.addr
-  debug.commitRamWdata := enq.bits.data
-  debug.commitRamWmask := enq.bits.mask
+  // ===================== difftest 调试口（Phase A.2：Vec(K) 多 lane 视角）=====================
+  // 每个 lane 独立输出对应 enq 端口的入队瞬时观测；上层 SoC_Top 按 ROB commit lane 映射回去。
+  for (k <- 0 until K) {
+    debug.lane(k).commitRamWen   := enq(k).fire
+    debug.lane(k).commitRamWaddr := enq(k).bits.addr
+    debug.lane(k).commitRamWdata := enq(k).bits.data
+    debug.lane(k).commitRamWmask := enq(k).bits.mask
+  }
 }

@@ -24,6 +24,13 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   // ---- Store 写入接口（Memory 阶段；阶段 D' 升级为 Vec：lane0 + lane1 同拍各写一条）----
   val write = IO(Input(Vec(LaneCapability.storeLanes.size, new SBWriteIO)))
 
+  // ---- Execute 阶段提前通知地址写入接口（解决 anyOlderUnk 死锁）----
+  // 当 store 卡在 Execute.out（ExMemDff.in.ready=0）时，通过此端口提前把 addrValid 设为 true，
+  // 使年轻 load 不再看到 olderUnknown=1，从而打破 memStall → ExMemDff 满 → store 进不去的死锁。
+  // 优先级：write（Memory 阶段）比 earlyAddrWrite（Execute 阶段）优先级更高——
+  // 因为 write 代码块位于 earlyAddrWrite 之后，Chisel 寄存器赋值以最后赋值为准。
+  val earlyAddrWrite = IO(Input(Vec(LaneCapability.storeLanes.size, new SBEarlyAddrWriteIO)))
+
   // ---- Load 查询接口（Memory 阶段；TD-B 升级为 Vec：lane0 / lane1 同拍各发起一次查询）----
   val query = IO(Flipped(Vec(LaneCapability.loadLanes.size, new SBQueryIO)))
 
@@ -31,7 +38,9 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
   val rollback = IO(Flipped(new SBRollbackIO))
 
   // ---- Commit 候选接口（ROB head store -> AXIStoreQueue）----
-  val commit = IO(Flipped(new SBCommitIO))
+  // Phase A.2：升级为 Vec(K) 多端口，K = storeLanes.size = 2。
+  // 不同端口对应同拍提交的"第 m 个 store"（按 ROB lane 顺序由 MyCPU 选出），彼此独立查表。
+  val commit = IO(Flipped(Vec(LaneCapability.storeLanes.size, new SBCommitIO)))
 
   // 存储阵列：所有仍处于 speculative 状态的 store 都保存在这里。
   val buffer = RegInit(VecInit(Seq.fill(depth)(0.U.asTypeOf(new StoreBufferEntry))))
@@ -82,6 +91,18 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
       }
     }
     nextStoreSeq := nextStoreSeq + alloc.request
+  }
+
+  // ===================== Execute 阶段提前写入地址（解决 anyOlderUnk 死锁）=====================
+  // 当 store 卡在 Execute.out 无法进入 ExMemDff 时，提前将 addrValid 设为 true 并写入地址，
+  // 使年轻 load 不再看到 olderUnknown=1，从而解除 memStall 死锁。
+  // 仅写 addrValid 和 addr，data/mask/byteMask/byteData 将在 store 正常通过 Memory 阶段后由 write 写入。
+  // 优先级：write（下方代码块）在 Chisel 中排序在后，因此 write 覆盖 earlyAddrWrite（同拍写同槽时 write 胜出）。
+  for (p <- 0 until LaneCapability.storeLanes.size) {
+    when(earlyAddrWrite(p).valid) {
+      buffer(earlyAddrWrite(p).idx).addrValid := true.B
+      buffer(earlyAddrWrite(p).idx).addr      := earlyAddrWrite(p).addr
+    }
   }
 
   // ===================== Store 写入逻辑（阶段 D'：双口） =====================
@@ -144,33 +165,35 @@ class StoreBuffer(val depth: Int = CPUConfig.sbEntries) extends Module {
     query(q).fullCover := query(q).valid && ((query(q).fwdMask & query(q).loadMask) === query(q).loadMask)
   }
 
-  // ===================== Commit 候选查询 =====================
-  // ROB head 是 Store 时，通过 storeSeq 在 SB 中精确找到唯一候选。
-  // 该候选只有在地址/数据已经写好时才允许 enqueue；否则必须继续阻塞 commit。
-  val commitMatchVec = Wire(Vec(depth, Bool()))
-  for (i <- 0 until depth) {
-    commitMatchVec(i) := commit.valid && buffer(i).valid && (buffer(i).storeSeq === commit.storeSeq)
-  }
+  // ===================== Commit 候选查询（Phase A.2：Vec(K) 独立端口）=====================
+  // ROB head 是 Store 时，每个 commit(m) 端口按 storeSeq 在 SB 中精确找到唯一候选。
+  // 各端口完全独立（不同 storeSeq 必然映射到不同 buffer 槽位，无冲突）；
+  // 只有在地址/数据已经写好时才允许 enqueue，否则继续阻塞该 store 的 commit。
+  for (m <- 0 until LaneCapability.storeLanes.size) {
+    val commitMatchVec = Wire(Vec(depth, Bool()))
+    for (i <- 0 until depth) {
+      commitMatchVec(i) := commit(m).valid && buffer(i).valid && (buffer(i).storeSeq === commit(m).storeSeq)
+    }
 
-  val commitHit = commitMatchVec.asUInt.orR
-  val commitIdx = PriorityEncoder(commitMatchVec.asUInt)
-  val commitEntry = Wire(new StoreBufferEntry)
-  commitEntry := 0.U.asTypeOf(new StoreBufferEntry)
-  when(commitHit) {
-    commitEntry := buffer(commitIdx)
-  }
+    val commitHit = commitMatchVec.asUInt.orR
+    val commitIdx = PriorityEncoder(commitMatchVec.asUInt)
+    val commitEntry = Wire(new StoreBufferEntry)
+    commitEntry := 0.U.asTypeOf(new StoreBufferEntry)
+    when(commitHit) {
+      commitEntry := buffer(commitIdx)
+    }
 
-  commit.entryValid := commitHit && commitEntry.addrValid
-  commit.addr := commitEntry.addr
-  commit.data := commitEntry.data
-  commit.mask := commitEntry.mask
-  // commit.wordAddr 已不再被任何下游消费（AXIStoreQueue 自行从 addr 派生），故移除该冗余输出。
-  commit.wstrb := commitEntry.byteMask
-  commit.wdata := commitEntry.byteData
+    commit(m).entryValid := commitHit && commitEntry.addrValid
+    commit(m).addr := commitEntry.addr
+    commit(m).data := commitEntry.data
+    commit(m).mask := commitEntry.mask
+    commit(m).wstrb := commitEntry.byteMask
+    commit(m).wdata := commitEntry.byteData
 
-  // 只有 enqueue 握手成功的同拍，才允许释放 SB 表项。
-  when(commit.valid && commit.enqSuccess && commitHit) {
-    buffer(commitIdx).valid := false.B
+    // 只有 enqueue 握手成功的同拍，才允许释放 SB 表项。
+    when(commit(m).valid && commit(m).enqSuccess && commitHit) {
+      buffer(commitIdx).valid := false.B
+    }
   }
 
   // ===================== 精确回滚逻辑 =====================

@@ -217,6 +217,16 @@ class SBAllocIO extends Bundle {
   val nextStoreSeq = Input(UInt(CPUConfig.storeSeqWidth.W))         // 当前 nextStoreSeq 快照（Load 用于 storeSeqSnap）
 }
 
+// ---- 早期地址通知接口（Execute 阶段提前写入 Store 地址，用于解决 anyOlderUnk 死锁）----
+// 仅包含 valid / sbIdx / addr 三个字段，不含 data / mask / byteMask / byteData。
+// 目的：在 store 卡在 Execute.out 无法进入 ExMemDff 时，提前把 addrValid 设为 true，
+// 使年轻 load 不再看到 olderUnknown=1，从而打破"anyOlderUnk → memStall → ExMemDff 满 → store 进不去"的循环死锁。
+class SBEarlyAddrWriteIO extends Bundle {
+  val valid = Bool()                       // 使能：Execute 阶段该 lane 是有效 store 且已分配 SB 槽位
+  val idx   = UInt(CPUConfig.sbIdxWidth.W) // SB 物理槽位索引
+  val addr  = UInt(32.W)                   // Execute 阶段已计算出的有效地址（base + offset）
+}
+
 // ---- 写入接口（Memory 阶段写入 Store 地址和数据）----
 class SBWriteIO extends Bundle {
   val valid    = Bool()                       // 写入使能

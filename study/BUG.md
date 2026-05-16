@@ -1,5 +1,9 @@
 # sim-regressive BUG 调研登记（首次发现）
 
+> ⚠️ **历史快照**：本文件记录的是 **TD-C 时代 (sim-regressive 56/70 用例集)** 的 BUG 调研历史。
+> 当前 (Phase A.2 落地后)：测试集已重整为 **sim-regressive 64 用例**，全部 PASS（Verilator）。
+> 本文以下内容保留作历史参考，**不再代表当前 RTL 状态**。
+
 > 本文件记录 sim-regressive 56 用例集合中**预先存在**（非本次会话引入）的失败用例。
 > 此前所有 LOG / STUDY / PLAN / TASK 文档仅验证了 sim-all 41/41 PASS，sim-regressive
 > 从未在文档中体现。本次会话首次跑全 sim-regressive 才发现下列问题。

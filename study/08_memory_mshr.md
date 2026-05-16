@@ -18,7 +18,7 @@ StoreBuffer.write：byte mask + data + storeSeqSnap
 ```
 
 - 仅 lane0 / lane1 可产 Store；
-- **Store 提交仅 lane0**（ROB.scala:69-78）—— 简化 SB→AXISQ 时序。
+- **Store 提交：lane0 / lane1 双路**（Phase A.2 起 K=`storeLanes.size`=2）—— ROB 同拍最多退役 K 条 Store，每条 Store 同步进入 SB 对应 commit lane 与 AXIStoreQueue `enq(k)`。详见 `study/10_rob.md` §3 / §12 §3.4。
 
 ## 3. Load 路径（line 218-450）—— 多源合并
 

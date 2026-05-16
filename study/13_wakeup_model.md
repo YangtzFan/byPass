@@ -8,7 +8,7 @@
 |---|---|---|---|---|
 | **α** | Refresh 同拍 | N | N+1 | 最保险（Refresh 在写）|
 | **γ** | Memory 级 | N+1 | N+2 | per-lane `mshrCaptureFire` 抑制（Load 走 MSHR 那拍不广播）|
-| **β** | Execute 级 | N+3 | N+3（同拍写优先 bypass）| **三重门控**（v19 TD-E）|
+| **β** | Execute 级 | N+3 | N+3（同拍写优先 bypass）| **四重门控**（v19 TD-E + v20 stale-base 修复，详见 §4.2）|
 
 ## 2. αwake（Refresh 同拍）
 
@@ -36,12 +36,16 @@ N+3：消费者读 PRF（靠同拍写优先 bypass 拿值）
 
 距离压缩到 **3 拍**（vs αwake 的 5 拍）。
 
-### 4.2 三重门控（`MyCPU.scala:545-572`）—— v19 TD-E 不变量 I-C
+### 4.2 四重门控（`MyCPU.scala:580-612`）—— v19 TD-E 不变量 I-C + stale-base 修复
 
 ```scala
 val anyLoadInExBundle = (0 until executeWidth).map { k =>
   uRRExDff.out.bits.validMask(k) && uRRExDff.out.bits.lanes(k).type_decode_together(4)  // 4 = Load
 }.reduce(_ || _)
+
+// stale-base 修复：下游 ExMemDff / Memory 任意 Load 在飞行时禁 β
+val anyLoadInMemDff = ...
+val downstreamLoadStall = anyLoadInMemDff
 
 val exAdvance = uRRExDff.out.fire && uMemory.in.ready && !anyLoadInExBundle
 ```
@@ -51,16 +55,18 @@ val exAdvance = uRRExDff.out.fire && uMemory.in.ready && !anyLoadInExBundle
 | `RRExDff.out.fire` | 确保生产者本拍真推进 |
 | `Memory.in.ready` | 确保当前 ExMemDff→Memory 通路无反压 |
 | `!anyLoadInExBundle` | 消除"同 bundle Load 触发 memStall 把 ALU 生产者一并卡在 ExMemDff"路径，从源头保证 N+3 抵达 Refresh |
+| `!downstreamLoadStall` | 下游（ExMemDff/Memory）有 Load 在飞行时禁 β —— MSHR/older-unknown 反压可能把 PRF 写时点从 N+3 推迟到 N+4，破坏 N+3 PRF-write 不变量 |
 
-### 4.3 βwake 启用范围（v20 P0+P1 安全版）
+### 4.3 βwake 启用范围（当前实际版本）
 
 ```scala
-val betaEnable = (k.U === 0.U) || (k.U === 2.U) || (k.U === 3.U)
-// lane0 + lane2 + lane3 启用；lane1 仍禁用（不变量 I-D，留 P1 后续验证）
+val betaEnable = (k == 2 || k == 3).B && !downstreamLoadStall
+// 仅 lane2 / lane3 启用；lane0 / lane1 全部禁用
 ```
 
-- **lane2/3 是 ALU-only**，本身永不可能是 Load；但仍受第 3 重门控保护（bundle 原子推进，同 bundle 任意 Load 触发 memStall 时 lane2/3 ALU 生产者也会被卡）；
-- **lane1 仍禁用**：lane1 ALU 生产者→消费者 RAW 时序需独立波形验证，留 v22+ P1。
+- **lane2/3 是 ALU-only**，本身永不可能是 Load —— 是最安全的 β-wake 释放面；
+- **lane0 已关闭**：Full lane（可发 Load），即便 `anyLoadInExBundle` 已隔离本 bundle，stale-base 修复后仍保守关闭以彻底回避边界场景；
+- **lane1 已关闭**：lane1 βwake 未独立波形验证（不变量 I-D 保留），保持禁用。
 
 ## 5. βwake 收益（v20 实测）
 
@@ -72,7 +78,7 @@ val betaEnable = (k.U === 0.U) || (k.U === 2.U) || (k.U === 3.U)
 
 ## 6. 关键不变量
 
-1. **βwake 三重门控不可拆**（I-C）：任一缺失即破坏 N+3 PRF 写时序假设；
+1. **βwake 四重门控不可拆**（I-C / stale-base 修复）：`exAdvance(三重)` + `!downstreamLoadStall` 任一缺失即破坏 N+3 PRF 写时序假设；
 2. **γwake mshrCaptureFire 抑制**：capture lane 不广播 γ；
 3. **αwake 是基线**：永远启用，所有时序假设以 αwake 为基。
 
@@ -80,4 +86,4 @@ val betaEnable = (k.U === 0.U) || (k.U === 2.U) || (k.U === 3.U)
 
 - 怀疑 βwake 取错值：dump βwake 广播拍 + N+3 拍 PRF 写口 + 消费者读 raddr；
 - 怀疑 γwake 取错值：检查 mshrCaptureFire 是否在 capture 拍真为 1；
-- IPC 不达预期：先关 βwake（注释 line 560-568）跑 sim-regressive，比较 IPC 差。
+- IPC 不达预期：先关 βwake（`MyCPU.scala:608` 把 `betaEnable` 改 false.B）跑 sim-regressive，比较 IPC 差。

@@ -42,7 +42,7 @@ io.readyTable.set(k).addr := effRef(k).pdst
 ## 5. ROB done
 
 - per-lane 标 `rob[robIdx].done := true`；
-- ROB 提交时按 head 顺序检查 done（Store 仅 lane0 提交）。
+- ROB 提交时按 head 顺序检查 done（Phase A.2 起 Store 可在 lane0 / lane1 任一路，且同拍最多 K=2 个 Store commit）。
 
 ## 6. αwake 关系
 

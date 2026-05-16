@@ -44,6 +44,12 @@ class Memory extends Module {
   val sbQuery = IO(Vec(LaneCapability.loadLanes.size, new SBQueryIO))
   val sbWrite = IO(Output(Vec(LaneCapability.storeLanes.size, new SBWriteIO)))
 
+  // ---- Execute 阶段快照输入 + 早期地址写口（解决 anyOlderUnk 死锁）----
+  // inExecOut：接收 Execute.out（即 ExMemDff.in）的内容快照，用于在 store 卡在 Execute.out 时
+  // 提前把地址写入 StoreBuffer，避免年轻 load 看到 olderUnknown=1 而导致 memStall 死锁。
+  val inExecOut    = IO(Input(Valid(new Execute_Memory_Payload)))
+  val sbWriteEarly = IO(Output(Vec(LaneCapability.storeLanes.size, new SBEarlyAddrWriteIO)))
+
   // ---- AXIStoreQueue 前端接口 ----
   // committed-store 查询为纯组合接口；外部读请求/响应统一改为 Decoupled。
   // TD-B：sqQuery 升级为 Vec(loadLanes.size) 多口查询。
@@ -215,6 +221,23 @@ class Memory extends Module {
   }
 
   // ============================================================================
+  // StoreBuffer 早期地址写口（来自 Execute 阶段，解决 anyOlderUnk 死锁）
+  // ----------------------------------------------------------------------------
+  // 当 store 卡在 Execute.out（ExMemDff.in.ready=0，无法进入流水线寄存器）时，
+  // 提前把 addrValid 写入 StoreBuffer，避免年轻 load 因 olderUnknown=1 而永久 stall。
+  // 此处仅通知 addr 和 addrValid；data/mask/byteMask/byteData 仍由 sbWrite（Memory 阶段）填入。
+  // ============================================================================
+  for ((laneIdx, sIdx) <- LaneCapability.storeLanes.zipWithIndex) {
+    val inLk       = inExecOut.bits.lanes(laneIdx)
+    val tdK        = inLk.type_decode_together
+    val sTypeK     = LaneCapability.isSType(tdK)
+    val laneValidK = inExecOut.valid && inExecOut.bits.validMask(laneIdx)
+    sbWriteEarly(sIdx).valid := laneValidK && sTypeK && inLk.isSbAlloc
+    sbWriteEarly(sIdx).idx   := inLk.sbIdx
+    sbWriteEarly(sIdx).addr  := inLk.data  // Execute 阶段已计算出的有效地址（base + offset）
+  }
+
+  // ============================================================================
   // 每个 Load lane：本地 decode + sbQuery / sqQuery 端口绑定 + fullCover 计算
   // ----------------------------------------------------------------------------
   // 1. sbQuery/sqQuery 是无状态查表，可任意复制；每个 Load lane 独立查询；
@@ -368,7 +391,6 @@ class Memory extends Module {
 
   // ---- TD-D：每个 MSHR slot 独立驱动 mshrComplete(i) ----
   // 完成条件：slot i 已分配（mshrValid）、未被 flush、且 R 已回（mshrResultValid）。
-  // ackSlot/ackAny 改为 per-slot 的 ackVec/ackAny（沿用其它逻辑的复用变量名以最小化改动）。
   val ackVec = VecInit((0 until numMshr).map(i =>
     mshrValid(i) && !mshrFlushed(i) && mshrResultValid(i)
   ))
@@ -381,10 +403,6 @@ class Memory extends Module {
   }
   // per-slot 是否本拍被 ack（由 MyCPU 顶层拉低）
   val ackFireVec = VecInit((0 until numMshr).map(i => mshrComplete(i).ack))
-  val ackAny     = ackFireVec.asUInt.orR
-  // 兼容旧名（用于 alloc 路径选择 isAckSlot 的判定）：保留 ackSlot 作 PriorityEncoder（仅
-  // 在"alloc 重用 ack 槽位"时使用，且新分配走"任意先 ack 的 slot"，故这里只取最低位）。
-  val ackSlot    = PriorityEncoder(ackFireVec.asUInt)
 
   val freeMask    = VecInit((0 until numMshr).map(i =>
     !mshrValid(i) || ackFireVec(i)

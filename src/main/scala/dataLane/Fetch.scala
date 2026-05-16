@@ -26,11 +26,19 @@ class Fetch extends Module {
   val in = IO(Flipped(Decoupled(UInt(32.W)))) // 输入：PC 值
   val out = IO(Decoupled(Vec(CPUConfig.fetchWidth, new FetchBufferEntry))) // 输出：4 个取指结果包（含预测信息）
 
-  // ---- 读 IROM 接口 ----
-  val irom = IO(new Bundle {
-    val inst_addr_o = Output(UInt(14.W)) // 输出到 IROM 的地址（128-bit 字地址 = PC[17:4]）
-    val inst_i      = Input(UInt(128.W)) // IROM 返回的 128 位数据（4 条指令拼接）
+  // ---- 取指存储访问接口（接 I-Cache 或 IROM 旁路延时队列）----
+  // reqAddr  : 14-bit 128-bit-word 地址（= PC[17:4]），Decoupled 发起取指请求
+  // respData : 128-bit 数据响应（4 条指令拼接），Flipped Decoupled
+  // 单 outstanding 设计：任意时刻最多 1 个在飞请求；通过 inflight/discard 两个寄存器
+  // 实现 flush 时丢弃在飞响应，避免错误数据进入 FetchBuffer。
+  val mem = IO(new Bundle {
+    val reqAddr  = Decoupled(UInt(14.W))
+    val respData = Flipped(Decoupled(UInt(128.W)))
   })
+
+  // flush 输入：连接 memRedirectValid。拉高时：
+  //   1) 阻止本拍发起新请求；2) 若有在飞请求且响应未到，标记 discard。
+  val flush = IO(Input(Bool()))
 
   // ---- BHT 接口（由 myCPU 顶层连接到 BHT 模块）----
   val bht = Option.when(useBHT){IO(new Bundle {
@@ -56,13 +64,54 @@ class Fetch extends Module {
   val basePC = pc(31, 4) ## 0.U(4.W) // 这是 16 字节对齐的基址 PC
   val startSlot = pc(3, 2) // 在 4 条指令中的起始槽位索引（0~3）
 
+  // ============================================================================
+  // 单 MSHR 状态机
+  // ----------------------------------------------------------------------------
+  // inflight : 是否已发出取指请求但响应未到（含已到本拍但未消费的情况，由 respFire 本拍清零）
+  // discard  : 当前 inflight 的请求由于 flush 已经作废，下一次到达的响应直接丢弃
+  // 不变量：inflight ⇒ 唯一一个 outstanding；canIssue 要求 !inflight && !flush。
+  // ============================================================================
+  val inflight = RegInit(false.B)
+  val discard  = RegInit(false.B)
+
+  // ---- 发起请求 ----
+  val canIssue = in.valid && !inflight && !flush
+  mem.reqAddr.valid := canIssue
+  mem.reqAddr.bits  := pc(17, 4)
+
+  // ---- 响应吸收 / 正常消费 ----
+  // 当处于 discard 状态、或本拍 flush，且响应到达：无条件吸收并丢弃。
+  val absorbDiscard = mem.respData.valid && (discard || flush)
+  // 正常路径：响应有效、未被丢弃、未 flush，本拍可用于 BPU 计算与下游交付。
+  val respUsable    = mem.respData.valid && !discard && !flush
+  val instData128   = mem.respData.bits
+
+  // respData.ready 由两条路径合成：吸收丢弃 或 正常路径下游接收
+  mem.respData.ready := absorbDiscard || (respUsable && out.ready)
+  val respFire = mem.respData.fire
+
+  // 请求成功发出时置 inflight
+  when(mem.reqAddr.fire) {
+    inflight := true.B
+  }
+  // 响应完成时（无论是被丢弃还是正常消费）清零 inflight / discard
+  // 注意：放在 reqAddr.fire 之后，使用最后连接语义保证“同拍 req+resp（0 拍访存延迟工况）”
+  // 时 inflight 最终为 false，避免单 MSHR 在 0 延迟模型下卡死。
+  when(respFire) {
+    inflight := false.B
+    discard  := false.B
+  }
+  // flush 时若 inflight 但响应尚未到达本拍，标记 discard 等待后续响应消化
+  when(flush && inflight && !mem.respData.valid) {
+    discard := true.B
+  }
+
   // ---- 解包 4 条指令并求对应 PC 值 ----
-  irom.inst_addr_o := pc(17, 4) // 输出到 IROM 地址
   val pcs = Wire(Vec(CPUConfig.fetchWidth, UInt(32.W)))
   val insts = Wire(Vec(CPUConfig.fetchWidth, UInt(32.W)))
-  for (i <- 0 until CPUConfig.fetchWidth) {      
+  for (i <- 0 until CPUConfig.fetchWidth) {
     pcs(i) := (basePC(31, 2) + i.U) ## 0.U(2.W) // 求每条指令的 PC 值（即使非对齐，也会取相应对齐地址向后 4 条指令）
-    insts(i) := irom.inst_i(32 * i + 31, 32 * i) // 将 128 位数据解包为 4 × 32 位指令
+    insts(i) := instData128(32 * i + 31, 32 * i) // 将 128 位数据解包为 4 × 32 位指令
   }
 
   // ---- 轻量预译码 + BPU 预测 ----
@@ -124,6 +173,6 @@ class Fetch extends Module {
     out.bits(i).valid := (i.U >= startSlot) && (!hasTaken || i.U <= firstTakenSlot)
   }
 
-  in.ready  := out.ready // 反压：下游不接收时，PC 也暂停
-  out.valid := in.valid  // PC 有效时，取指结果就有效
+  in.ready  := respUsable && out.ready // 仅当响应已到且下游可收，PC 才前进
+  out.valid := in.valid && respUsable  // PC 有效且响应可用时输出
 }

@@ -9,4 +9,8 @@ build/
 tmp
 AGENTS.md
 TASK.md
-scripts
+/scripts
+# yosys-sta 后端：大文件不入仓，由 `xmake run sta-init` 在本地拉取
+tools-backend/bin/
+tools-backend/pdk/
+tools-backend/result/
