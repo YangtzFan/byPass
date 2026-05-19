@@ -31,8 +31,8 @@
 
 > 本文件聚焦"**当前是什么样**"，不记录历史演进。历史里程碑见 `../scripts/LOG.md`，BUG 复盘见 `../scripts/BUG.md`，里程碑路线图见 `../scripts/PLAN.md`，当前迭代任务见 `../TASK.md`。
 >
-> **基准时间点**：v22 Phase A.2 落地（2-store/拍 commit），βwake 收敛到 lane2/3 + downstreamLoadStall 四重门控；v21 代码清理 + 当前两轮死代码清理已完成。
-> **回归状态**：sim-basic 39/39 PASS、sim-regressive 64/64 PASS（双绿）。
+> **基准时间点**：裸核 0 拍配置（`icacheSize=0`、`dcacheSize=0`、`qDepthCpuToMem=qDepthCpuToCache=qDepthCacheToMem=0`），βwake 收敛到 lane2/3 + downstreamLoadStall 四重门控。
+> **回归状态**：Verilator 下 `sim-basic` 39 个基础指令用例 PASS，额外 `test_all` timeout；`sim-regressive` 64/64 PASS。
 > **历史快照备份**：`../scripts/STUDY.md.v19_3bak`（含 v13~v19 全部历史章节，仅作归档）。
 
 ---
@@ -179,7 +179,7 @@ val betaEnable = (k == 2 || k == 3).B && !downstreamLoadStall
 - **StoreBuffer**（`dataLane/StoreBuffer.scala`，深度 16）：投机 Store；字节级；commit 接口 `Vec(K=2)`，同拍可同时 commit 至多 2 个 Store 到 AXIStoreQueue（Phase A.2）。
 - **AXIStoreQueue**（`memory/AXIStoreQueue.scala`，深度 16）：committed-store 等待 DRAM 写入；committed-store forward 接口供 Memory 转发；enq 端口 `Vec(K=2)` + PriorityEncoderOH 紧凑写入；AXI 写端仍单 outstanding（B 串行）；`loadInflightCnt` 配合 AXI 读 outstanding=2。
 - **DRAM 接口**（`memory/DRAM_AXIInterface.scala`）：AXI 读 outstanding=2；`readReqFifo / readRespFifo` 各 2 项。
-- **I-Cache / D-Cache**（`memory/ICache.scala`、`memory/DCache.scala`）：当前 `icacheSize=4096`、`dcacheSize=4096`，写直通；I-Cache 命中 `qDepthCpuToCache=4` 拍，miss refill 走 `LatencyPipe(qDepthCacheToMem=200)` —— 关 Cache 旁路（`icacheSize=0`）时 Fetch 直连 IROM 通过 `LatencyPipe(qDepthCpuToMem=200)`。详见 §18（`study/18_cache_microarch.md`）。
+- **I-Cache / D-Cache**（`memory/ICache.scala`、`memory/DCache.scala`）：当前为**无 Cache 裸核 0 拍**配置，`icacheSize=0`、`dcacheSize=0`，I-Cache / D-Cache 全旁路；`qDepthCpuToMem=qDepthCpuToCache=qDepthCacheToMem=0`，`LatencyPipe(0)` 退化为组合直通，不额外注入取指、Load miss 或 Store 写回等待。详见 `study/tmp/006.md`。
 - **IROM**（`memory/IROM.scala`）：取指 ROM；通过 difftest xmake.lua `$readmemh` 注入 hex 内容。
 - **Load 字节合并**（`Memory.scala mergeLoadSources` ~ line 130）：优先级 SB > AXIStoreQueue > DRAM；按 mask 字节级合并。
 - **观察口对齐（v22）**：`io.debug_commit(k).ram_*` 由 `axiMasterDebug.lane(storeOrdinal(k))` 直接驱动 —— 即把 difftest 观察点从"原 SB commit"前移到了"AXIStoreQueue 入口（同拍 enq.fire）"，与 ROB.commit(k) 的 store 派生严格同拍。详见 §10（ROB）+ §12（存储子系统）。
@@ -246,59 +246,53 @@ val betaEnable = (k == 2 || k == 3).B && !downstreamLoadStall
 
 ---
 
-## 十一、当前 IPC 实测快照（v22 Phase A.2 落地后，lane2/3 βwake 启用）
+## 十一、当前 IPC 实测快照（无 Cache 裸核 0 拍）
 
-> 数据源：`difftest/build/sim-data/{basic,regressive}/<case>.csv` 末行 ipc 字段（sim-regressive 64/64 PASS 后落盘）。
+> 数据源：`difftest/build/sim-data/{basic,regressive}/<case>.csv` 末行 ipc 字段。完整表见 `study/tmp/006.md`。
+> 配置：`icacheSize=0`、`dcacheSize=0`、`qDepthCpuToMem=qDepthCpuToCache=qDepthCacheToMem=0`。
 
-### 11.1 高 IPC 用例（数据并行 + 弱依赖）
-| TC | IPC |
-|---|---|
-| kernels_dep_chain_ooo4_unroll | **2.0631** |
-| kernels_load_latency_hide_ooo4_unroll | 1.8053 |
-| kernels_load_latency_hide_baseline | 1.7266 |
-| kernels_dep_chain_baseline | ~1.61 |
-| kernels_sum_unroll_ooo4_unroll | 1.4715 |
-| kernels_memcpy_like_ooo4_unroll | 1.3680 |
-| kernels_memcpy_like_baseline | 1.2733 |
-| kernels_aos_vs_soa_ooo4_unroll | 1.2625 |
+### 11.1 回归状态与总体统计
 
-### 11.2 中等 IPC 用例（混合负载）
-| TC | IPC |
-|---|---|
-| kernels_sum_unroll_baseline | ~1.25 |
-| algo_array_ops_baseline | 1.1146 |
-| algo_bst_ops_baseline | ~1.26 |
-| algo_array_ops_ooo4_unroll | 0.8553 |
-| algo_bst_ops_ooo4_unroll | 0.8593 |
-| algo_list_dedup_ooo4_unroll | 0.8217 |
-| algo_list_search_ooo4_unroll | 0.8388 |
+| 范围 | 通过数 | 非通过数 | 平均 IPC | 最高 IPC | 最低 IPC |
+|---|---:|---:|---:|---|---|
+| `basic` | 39 | 1 timeout (`test_all`) | 0.760576 | `addi` = 1.079787 | `simple` = 0.200000 |
+| `regressive` | 64 | 0 | 1.061644 | `kernels_dep_chain_baseline` = 2.408843 | `kernels_indirect_call_ooo4_unroll` = 0.385732 |
+| 合计通过用例 | 103 | 1 timeout | 0.947647 | `kernels_dep_chain_baseline/ooo4/no_libcall` = 2.408843 | `simple` = 0.200000 |
 
-### 11.3 低 IPC 用例（控制流 / 间接跳转 / 长依赖）
+`test_all` 是 `test_cases_basic/` 中额外存在的长程序，在 600 秒超时窗口内未遇到 ECALL；日志末尾仍在持续提交，最后观测约 `2,085,934` commits / `2,823,686` cycles，因此不计入通过用例 IPC 均值。
+
+### 11.2 高 IPC 用例（裸核下核心吞吐释放）
+
+| TC | IPC | 说明 |
+|---|---:|---|
+| `kernels_dep_chain_baseline` | **2.408843** | 当前最高；依赖链中仍有足够 ILP 可供 OoO 调度。 |
+| `kernels_dep_chain_ooo4` | **2.408843** | 与 baseline 指令形态接近，达到同等吞吐。 |
+| `kernels_dep_chain_ooo4_no_libcall` | **2.408843** | 无 libcall 后仍保持最高吞吐。 |
+| `kernels_load_latency_hide_ooo4_unroll` | 1.820033 | 裸核 0 拍后，load 延迟隐藏类用例受益明显。 |
+| `kernels_dep_chain_ooo4_unroll` | 1.792073 | unroll 降低 commits，但指令排布不一定比 baseline 更适配当前 lane。 |
+| `kernels_load_latency_hide_baseline` | 1.763646 | 无固定访存延迟后，Load 吞吐主要受 lane 和 RAW 约束。 |
+| `kernels_aos_vs_soa_ooo4` | 1.563964 | 数据访问规律较好，裸核下前后端供给较稳定。 |
+| `kernels_sum_unroll_ooo4_unroll` | 1.450657 | 循环展开降低分支密度，释放部分 ILP。 |
+
+### 11.3 低 IPC 用例（控制流 / 间接跳转 / 小程序）
+
 | TC | IPC | 主要瓶颈推测 |
-|---|---|---|
-| kernels_indirect_call_ooo4_unroll | 0.4141 | JALR mispredict（BTB 容量小，无 RAS） |
-| algo_list_sort_ooo4_unroll | 0.6143 | 长指针追逐 + Branch heavy |
-| algo_list_reverse_ooo4_unroll | 0.7489 | 同上（也是 Bug B 触发用例）|
-| kernels_branch_reduce_ooo4_unroll | 0.8089 | 高密度 B-type，doubleBrStall 阻塞 |
-| beq/bge/bne 单测 | 0.45~0.49 | 单测自带 mispredict |
+|---|---:|---|
+| `simple` | 0.200000 | 仅 4 条 commit，复位/启动/填充成本占比过高。 |
+| `jalr` | 0.370166 | JALR 间接目标预测与 redirect 成本高。 |
+| `kernels_indirect_call_ooo4_unroll` | 0.385732 | 间接调用密集，BTB/JALR 预测限制明显。 |
+| `jal` | 0.447368 | 小程序 + 跳转控制流，不能代表峰值吞吐。 |
+| `bge` | 0.454090 | 分支单测，重定向/冲刷成本占比高。 |
+| `bne` | 0.462659 | 同上。 |
+| `kernels_indirect_call_debug` | 0.535642 | debug 编译形态 + 间接跳转，前端连续供给不足。 |
+| `kernels_load_latency_hide_debug` | 0.573945 | debug 代码量大、调度差，裸核 0 拍也难释放 ILP。 |
 
-### 11.4 v18 / v19.3 / v20 关键 TC 对比
-| TC | v18 | v19.3 | **v20** | v20 vs v18 | v20 vs v19.3 |
-|---|---|---|---|---|---|
-| algo_array_ops_ooo4_unroll | 0.8910 | 0.7919 | **0.8553** | −4.0% | **+8.0%** |
-| algo_array_ops_baseline | 1.0982 | 1.0946 | **1.1146** | +1.5% | +1.8% |
-| kernels_load_latency_hide_ooo4_unroll | 1.7616 | 1.6883 | **1.8053** | **+2.5%** | +6.9% |
-| kernels_load_latency_hide_baseline | 1.5444 | 1.5153 | **1.7266** | **+11.8%** | +14.0% |
-| kernels_memcpy_like_ooo4_unroll | 1.2478 | 1.2201 | **1.3680** | **+9.6%** | +12.1% |
-| kernels_memcpy_like_baseline | 1.1498 | 1.1468 | **1.2733** | **+10.7%** | +11.0% |
-| kernels_dep_chain_ooo4_unroll | — | 1.3961 | **2.0631** | — | **+47.8%** |
-| kernels_sum_unroll_ooo4_unroll | — | 1.3183 | **1.4715** | — | +11.6% |
-| kernels_aos_vs_soa_ooo4_unroll | 1.2642 | 1.2642 | **1.2625** | −0.1% | −0.1% |
+### 11.4 裸核数据的主要结论
 
-> **v20 关键收获**：
-> - 大多数 load-latency / memcpy / dep_chain 类用例不仅恢复 v18 水平，还**显著超越** v18。
-> - `algo_array_ops_ooo4_unroll` 仍 −4% vs v18（从 −11.1% 缩到 −4.0%）：剩余差距推测来自 lane1 βwake 仍禁用，待 P1。
-> - `kernels_dep_chain_ooo4_unroll` +47.8% vs v19.3：长依赖链 ALU 生产者→消费者 RAW 路径直接受益于 lane2/3 βwake（典型场景）。
+- 无 Cache / 0 延迟后，load-heavy 用例不再被固定主存等待主导，`kernels_load_latency_hide_*` 进入高 IPC 区间；
+- 当前最高 IPC 为 `2.408843`，来自 `kernels_dep_chain_baseline/ooo4/no_libcall`；
+- 间接跳转仍是明显短板，`kernels_indirect_call_ooo4_unroll` 只有 `0.385732`，瓶颈在 JALR 目标预测、redirect 冲刷和 Full lane/branch lane 约束，而不是访存延迟；
+- basic 小程序 IPC 不适合代表核心峰值，因指令数太少，复位、前端填充、ECALL 终止开销占比高。
 
 ---
 
@@ -329,15 +323,15 @@ val betaEnable = (k == 2 || k == 3).B && !downstreamLoadStall
 - 预期增益：kernels_branch_reduce / algo_list_* 类（B-type 密集）+10~20%。
 
 ### P5：BTB / BHT 容量与 RAS（针对 indirect_call）
-- 现 BTB=32 项 PC 低位索引；indirect_call IPC 仅 0.41；
+- 现 BTB=32 项 PC 低位索引；裸核 0 拍下 `kernels_indirect_call_ooo4_unroll` IPC 仅 0.385732；
 - 候选：BTB 升 64/128 + RAS（Return Address Stack）8 项；
-- 预期增益：kernels_indirect_call_ooo4_unroll 0.41 → 0.6+。
+- 预期增益：`kernels_indirect_call_ooo4_unroll` 0.385732 → 0.6+。
 
 ### P6：AXI 写多 outstanding（针对 store-heavy）
 - Phase A.2 把 commit 端宽度从 1 提到 2，但 AXI 写仍单 outstanding；
-- store-heavy 用例（memcpy / array_ops / list_sort）实测 IPC 提升不明显，瓶颈仍在 DRAM 写背压；
-- 候选：把 AXIToDCacheBridge 写端从 1-outstanding 扩到 2~4，配合 AXISQ depth 同步上调；
-- 预期增益：memcpy_ooo4 0.199 → 0.25+，array_ops 0.196 → 0.24+。
+- 裸核 0 拍下 `kernels_memcpy_like_ooo4=1.248362`、`algo_array_ops_ooo4=1.101595`，固定 DRAM 延迟已不是主瓶颈；
+- 若后续重新打开 Cache / 长访存延迟，仍可考虑把 AXIToDCacheBridge 写端从 1-outstanding 扩到 2~4，配合 AXISQ depth 同步上调；
+- 当前裸核配置下，store-heavy 优化优先级低于 JALR/Branch 前端改进。
 
 ### P7：lane2/lane3 启用全功能（远期 / TD-G）
 - 当前 ALU-only；改 Full 需扩 loadLanes/storeLanes/branchLanes 到 4，影响面巨大；
@@ -353,8 +347,8 @@ cd /nfs/home/zhanghang/Documents/difftest
 
 SIM=verilator xmake b rtl              # ~16s 生成并后处理 SV
 SIM=verilator xmake b Core             # ~140s 全量 / ~40s 增量
-SIM=verilator xmake r sim-basic        # 39 例 ~150s
-SIM=verilator xmake r sim-regressive   # 64 例 ~5min
+SIM=verilator xmake r sim-basic        # 39 个基础单测 PASS；额外 test_all 可能 timeout
+SIM=verilator xmake r sim-regressive   # 64/64 PASS
 
 # 单测：TC=<name> 把 stdout+stderr 落盘到 build/sim-log/<case>.log
 SIM=verilator TC=<name> [TIMEOUT=N] xmake r sim-single
